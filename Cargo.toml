@@ -1,0 +1,12 @@
+[package]
+name = "udarnik"
+version = "0.1.0"
+authors = ["Ding Xiang Fei <dingxiangfei2009@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+curve25519-dalek = "1"
+lazy_static = "1"
+rand = "0.6.5"
+failure = "0.1.5"
+sha3 = "0.8.1"
