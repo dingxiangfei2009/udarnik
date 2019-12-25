@@ -1,11 +1,11 @@
 use curve25519_dalek::{constants::ED25519_BASEPOINT_POINT, traits::Identity};
 
 use super::*;
-use rand::rngs::OsRng;
+use rand::{rngs::StdRng, SeedableRng};
 
 #[test]
 fn it_works() {
-    let mut rng = OsRng::new().unwrap();
+    let mut rng = StdRng::from_entropy();
     let custodian_base = ED25519_BASEPOINT_POINT * u64_to_scalar(2);
     let ids = vec![1, 2, 3];
     let private_keys = vec![u64_to_scalar(3), u64_to_scalar(4), u64_to_scalar(5)];
@@ -53,7 +53,7 @@ fn it_works() {
 
 #[test]
 fn polynomial() {
-    let mut rng = OsRng::new().unwrap();
+    let mut rng = StdRng::from_entropy();
     let mut secret = [0u8; 32];
     rng.fill_bytes(&mut secret);
     let polynomial = Polynomial::new(&mut rng, 5, secret).unwrap();

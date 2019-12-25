@@ -106,6 +106,7 @@ impl std::cmp::Ord for Custodian {
 impl Verifiable for Vec<Custodian> {
     type Error = Error;
     type Proof = ();
+    type Output = Self;
     fn verify(mut self, _: ()) -> Result<Self, Self::Error> {
         if self.len() == 0 {
             return Err(Error::ZeroCustodian);
@@ -278,6 +279,7 @@ impl ShardsWithProof {
 impl Verifiable for ShardWithProof {
     type Error = Error;
     type Proof = DealerProof;
+    type Output = Self;
 
     fn verify(self, proof: Self::Proof) -> Result<Self, Error> {
         let mut h1 = EdwardsPoint::identity();
@@ -385,6 +387,8 @@ impl Verifiable for CustodianDecryption {
     type Error = Error;
     /// Proof is a product between custodian base, custodian public key and custodian decryption proof
     type Proof = (EdwardsPoint, EdwardsPoint, CustodianProof);
+    type Output = Self;
+
     fn verify(self, proof: Self::Proof) -> Result<Self, Error> {
         let (custodian_base, custodian_key, proof) = proof;
         let dleq_proof = dleq::Proof {
@@ -412,11 +416,10 @@ pub struct Poll {
 impl Verifiable for Poll {
     type Error = Error;
     type Proof = Verified<Vec<Custodian>>;
+    type Output = Self;
+
     fn verify(self, custodians: Self::Proof) -> Result<Self, Error> {
-        let Self {
-            threshold,
-            mut poll,
-        } = self;
+        let Self { threshold, poll } = self;
         if threshold > poll.len() {
             return Err(Error::NoEnoughCustodian {
                 requested: threshold,

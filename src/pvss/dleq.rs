@@ -38,6 +38,8 @@ pub enum Error {
 impl Verifiable for Proof {
     type Error = Error;
     type Proof = ();
+    type Output = Self;
+
     fn verify(self, _: ()) -> Result<Self, Self::Error> {
         let a1 = self.g1 * self.response + self.h1 * self.challenge;
         let a2 = self.g2 * self.response + self.h2 * self.challenge;
@@ -54,9 +56,7 @@ mod tests {
     use super::super::u64_to_scalar;
     use super::*;
 
-    use curve25519_dalek::{
-        constants::ED25519_BASEPOINT_POINT, edwards::EdwardsPoint, scalar::Scalar, traits::Identity,
-    };
+    use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
     #[test]
     fn it_works() {
         let g1 = ED25519_BASEPOINT_POINT;
