@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     mem::{transmute, MaybeUninit},
     num::Wrapping,
     ops::{Deref, DerefMut},
@@ -9,21 +9,13 @@ use std::{
 
 use aead::{Aead, NewAead, Payload};
 use aes_gcm_siv::Aes256GcmSiv;
-use async_std::sync::{Mutex, RwLock};
+use async_std::sync::{Arc, Mutex, RwLock, Weak};
 use crossbeam::queue::ArrayQueue;
 use failure::{Backtrace, Fail};
-use futures::{
-    channel::mpsc::{channel, Sender},
-    prelude::*,
-    select,
-};
+use futures::{channel::mpsc::unbounded, future::BoxFuture, prelude::*, select};
 use generic_array::GenericArray;
 use lazy_static::lazy_static;
-use rand::{
-    distributions::{Distribution, Uniform},
-    rngs::StdRng,
-    RngCore, SeedableRng,
-};
+use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 use rayon::prelude::*;
 use sha3::{Digest, Sha3_512};
@@ -33,7 +25,10 @@ use sss::{
     reed_solomon::{DecodeError, ReedSolomon},
 };
 
-use crate::common::{Verifiable, Verified};
+use crate::{
+    common::{Verifiable, Verified},
+    GenericError,
+};
 
 lazy_static! {
     static ref RS_255_223: ReedSolomon<GF2561D> =
@@ -60,11 +55,11 @@ pub struct Code([u8; 255]);
 impl Code {
     fn from_vec(v: Vec<u8>) -> Self {
         assert_eq!(v.len(), 255);
-        let mut code: [MaybeUninit<u8>; 255] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut code = [0u8; 255];
         for (c, v) in code.iter_mut().zip(v) {
-            unsafe { c.as_mut_ptr().write(v) }
+            *c = v;
         }
-        unsafe { Self(transmute(code)) }
+        Self(code)
     }
 }
 
@@ -247,6 +242,7 @@ impl Shard {
 
 #[derive(Default)]
 pub struct Quorum {
+    serial: Option<u64>,
     quorum: HashSet<u8>,
     data: Option<Vec<PartialCode>>,
 }
@@ -254,9 +250,11 @@ pub struct Quorum {
 #[derive(Fail, Debug)]
 pub enum QuorumError {
     #[fail(display = "duplicate shard")]
-    Duplicate(u8),
+    Duplicate(u8, u8),
     #[fail(display = "mismatch shard")]
     Mismatch(u8),
+    #[fail(display = "mismatch shard content")]
+    MismatchContent(u8),
     #[fail(display = "threshold not met")]
     Absent(Option<usize>),
     #[fail(display = "malformed input")]
@@ -270,8 +268,15 @@ pub enum QuorumError {
 impl Quorum {
     /// ###Panic###
     /// Panics if `id` is out of range, ie. `id > 254`
-    pub fn insert(&mut self, shard: Verified<Shard>) -> Result<(u8, u8), QuorumError> {
+    pub fn insert(&mut self, serial: u64, shard: Verified<Shard>) -> Result<(u8, u8), QuorumError> {
         let Shard { id, data } = shard.into_inner();
+        if let Some(serial_) = &self.serial {
+            if *serial_ != serial {
+                return Err(QuorumError::Mismatch(id));
+            }
+        } else {
+            self.serial = Some(serial)
+        }
         if self.quorum.insert(id) {
             for (code, data) in self
                 .data
@@ -289,14 +294,14 @@ impl Quorum {
             }
             for (code, data) in quorum_data.iter().zip(data) {
                 if code[id as usize].expect("to be filled at this moment") != data {
-                    return Err(QuorumError::Mismatch(id));
+                    return Err(QuorumError::MismatchContent(id));
                 }
             }
-            Err(QuorumError::Duplicate(id))
+            Err(QuorumError::Duplicate(id, quorum_data.len() as u8))
         }
     }
 
-    pub fn poll(&self, codec: &RSCodec) -> Result<(Vec<u8>, HashSet<u8>), QuorumError> {
+    pub fn poll(&self, codec: &RSCodec) -> Result<(u64, Vec<u8>, HashSet<u8>), QuorumError> {
         if self.quorum.len() < codec.data as usize {
             return Err(QuorumError::Absent(Some(codec.data as usize)));
         }
@@ -329,7 +334,7 @@ impl Quorum {
                 }
             }
         }
-        Ok((result, all_errors))
+        Ok((self.serial.expect("should be set"), result, all_errors))
     }
 }
 
@@ -399,8 +404,10 @@ impl Verifiable for RawShard {
 pub struct RawShardId {
     pub id: u8,
     pub serial: u64,
+    pub stream: u8,
 }
 
+#[derive(Default, Copy, Clone)]
 pub struct ShardState {
     pub key: [u8; 32],
     pub stream_key: [u8; 32],
@@ -452,7 +459,7 @@ impl<'a> Verifiable for (RawShardId, &'a ShardState) {
     type Proof = ();
     type Output = ShardId;
     fn verify(self, _: Self::Proof) -> Result<Self::Output, Self::Error> {
-        let (RawShardId { id, serial }, proof) = self;
+        let (RawShardId { id, serial, .. }, proof) = self;
         let ShardNounce(nounce) = ShardNounce::new(&proof, id, serial);
         let ShardState { key, .. } = proof;
         Ok(ShardId {
@@ -477,7 +484,12 @@ impl Shard {
         }
     }
 
-    pub fn encode_shard(&self, serial: u64, state: &ShardState) -> (RawShard, RawShardId) {
+    pub fn encode_shard(
+        &self,
+        stream: u8,
+        serial: u64,
+        state: &ShardState,
+    ) -> (RawShard, RawShardId) {
         let proof = self.generate_shard_id(serial, state);
         let aead = Aes256GcmSiv::new(GenericArray::clone_from_slice(&proof.key));
         let aad = proof.to_aad();
@@ -502,6 +514,7 @@ impl Shard {
             RawShardId {
                 id: self.id,
                 serial: serial,
+                stream,
             },
         )
     }
@@ -521,6 +534,8 @@ pub enum ReceiveError {
     Full(usize),
     #[fail(display = "shard recovery: {}", _0)]
     Shard(#[cause] ShardError),
+    #[fail(display = "out of bounds, size={}", _0)]
+    OutOfBound(u64, usize),
 }
 
 impl ReceiveQueue {
@@ -540,7 +555,7 @@ impl ReceiveQueue {
     ) -> Result<(u8, u8), ReceiveError> {
         let serial = raw_shard_id.serial;
         let shard_id = (raw_shard_id, shard_state).verify_proof(())?;
-        let shard = raw_shard.verify_proof(shard_id.into_inner())?;
+        let shard = raw_shard.clone().verify_proof(shard_id.into_inner())?;
 
         let window = self.window.unwrap_or(256) as usize;
         let start = self.start.read().await;
@@ -556,14 +571,17 @@ impl ReceiveQueue {
             }
             let queue = self.queue.read().await;
             let mut q = queue[idx].lock().await;
-            let result = q.insert(shard)?;
+            let result = q.insert(serial, shard)?;
             if idx > window {
                 Err(ReceiveError::Full(queue.len()))
             } else {
                 Ok(result)
             }
         } else {
-            Err(ReceiveError::Full(self.queue.read().await.len()))
+            Err(ReceiveError::OutOfBound(
+                start.0,
+                self.queue.read().await.len(),
+            ))
         }
     }
 
@@ -581,17 +599,21 @@ impl ReceiveQueue {
     pub async fn poll(
         &self,
         codec: &RSCodec,
-    ) -> Result<Option<(Vec<u8>, HashSet<u8>)>, ReceiveError> {
+    ) -> Option<Result<(u64, Vec<u8>, HashSet<u8>), QuorumError>> {
         let mut start = self.start.write().await;
         let mut queue = self.queue.write().await;
-        let mut result = None;
         if let Some(front) = queue.front() {
             let front = front.lock().await;
-            result = Some(front.poll(&codec)?);
+            let result = front.poll(&codec);
+            if result.is_ok() {
+                drop(front);
+                *start += Wrapping(1);
+                queue.pop_front();
+            }
+            Some(result)
+        } else {
+            None
         }
-        *start += Wrapping(1);
-        queue.pop_front();
-        Ok(result)
     }
 
     pub async fn reset(&self) {
@@ -610,6 +632,10 @@ pub enum SendError {
     RemoteLost(Backtrace),
     #[fail(display = "remote: {}", _0)]
     Remote(RemoteRecvError),
+    #[fail(display = "broken pipe")]
+    BrokenPipe,
+    #[fail(display = "exhausted")]
+    Exhausted,
 }
 
 #[derive(Fail, Debug)]
@@ -622,21 +648,36 @@ pub enum RemoteRecvError {
     Decode,
 }
 
+pub type TaskProgressNotifier =
+    Weak<Mutex<dyn Sink<Result<(u8, u8), RemoteRecvError>, Error = GenericError> + Unpin + Send>>;
+
+pub type TaskProgressNotifierSink =
+    Box<dyn Sink<(u64, TaskProgressNotifier), Error = GenericError> + Unpin + Send>;
+
 pub struct SendQueue {
     queue: RwLock<ArrayQueue<(RawShard, RawShardId)>>,
+    stream: u8,
     serial: AtomicU64,
-    send_tasks: RwLock<BTreeMap<u64, Sender<Result<(u8, u8), RemoteRecvError>>>>,
+    task_notifiers: Mutex<TaskProgressNotifierSink>,
     window: usize,
+    block_sending: Mutex<Option<BoxFuture<'static, ()>>>,
 }
 
 impl SendQueue {
-    pub fn new(window: usize) -> Self {
+    pub fn new(stream: u8, window: usize, task_notifiers: TaskProgressNotifierSink) -> Self {
+        let task_notifiers = Mutex::new(task_notifiers);
         Self {
+            stream,
             window,
+            task_notifiers,
             serial: AtomicU64::default(),
             queue: RwLock::new(ArrayQueue::new(window)),
-            send_tasks: <_>::default(),
+            block_sending: <_>::default(),
         }
+    }
+
+    pub async fn block_sending(&self, condition: impl 'static + Future<Output = ()> + Send) {
+        *self.block_sending.lock().await = Some(condition.boxed())
     }
 
     pub async fn reset(&self) {
@@ -649,6 +690,11 @@ impl SendQueue {
         data: (RawShard, RawShardId),
     ) -> Result<(), (RawShard, RawShardId)> {
         use crossbeam::queue::PushError;
+
+        let block_sending = self.block_sending.lock().await.take();
+        if let Some(block_sending) = block_sending {
+            block_sending.await
+        }
         if let Err(PushError(data)) = self.queue.read().await.push(data) {
             Err(data)
         } else {
@@ -663,7 +709,7 @@ impl SendQueue {
     pub async fn send<Timeout>(
         &self,
         data: impl AsRef<[u8]>,
-        shard_state: ShardState,
+        shard_state: &ShardState,
         codec: &RSCodec,
         timeout_generator: impl Fn(Duration) -> Timeout,
         timeout: Duration,
@@ -677,37 +723,23 @@ impl SendQueue {
                 .map_err(|e| SendError::Codec(e, <_>::default()))?,
         );
         let serial = self.serial.fetch_add(1, Ordering::AcqRel);
-        let shards: Vec<_> = shards
+        let mut shards: Vec<_> = shards
             .iter()
-            .map(|shard| shard.encode_shard(serial, &shard_state))
+            .map(|shard| shard.encode_shard(self.stream, serial, &shard_state))
             .collect();
 
-        let status = loop {
-            loop {
-                let send_tasks = self.send_tasks.read().await;
-                match (send_tasks.keys().nth(0), send_tasks.keys().nth_back(0)) {
-                    (Some(min), Some(max)) if self.window > (max - min) as usize => {
-                        // backpressure done
-                        break;
-                    }
-                    (None, None) => break,
-                    _ => panic!("???"),
-                }
-            }
-            let mut send_tasks = self.send_tasks.write().await;
-            if send_tasks.contains_key(&serial) {
-                continue;
-            }
-            let (tx, rx) = channel(256);
-            send_tasks.insert(serial, tx);
-            break rx;
-        };
+        let (tx, rx) = unbounded();
+        let tx = Arc::new(Mutex::new(tx.sink_map_err(|e| Box::new(e) as GenericError)));
+        self.task_notifiers
+            .lock()
+            .await
+            .send((serial, Arc::downgrade(&tx) as _))
+            .await
+            .map_err(|_| SendError::BrokenPipe)?;
+        let mut status = rx.fuse();
 
-        let mut status = status.fuse();
         let threshold = codec.threshold();
-        for (shard, shard_id) in &shards[..threshold] {
-            let mut shard = shard.clone();
-            let mut shard_id = *shard_id;
+        for (mut shard, mut shard_id) in shards.drain(..threshold) {
             loop {
                 if let Err((shard_, shard_id_)) = self.enqueue((shard, shard_id)).await {
                     shard = shard_;
@@ -741,18 +773,15 @@ impl SendQueue {
                 _ = timeout_generator(timeout).fuse() => break,
             }
         }
+
         // and we need to try harder now
-        let mut rng = StdRng::from_entropy();
-        for _ in 0..255 {
-            let (shard, shard_id) = &shards[Uniform::from(0..shards.len()).sample(&mut rng)];
-            let mut shard = shard.clone();
-            let mut shard_id = *shard_id;
+        for (mut shard, mut shard_id) in shards {
             loop {
                 if let Err((shard_, shard_id_)) = self.enqueue((shard, shard_id)).await {
                     shard = shard_;
                     shard_id = shard_id_;
                 } else {
-                    break
+                    break;
                 }
             }
             select! {
@@ -775,9 +804,8 @@ impl SendQueue {
                 _ = timeout_generator(timeout).fuse() => break,
             }
         }
-
-        for shard in shards {}
-        todo!()
+        // okay, maybe we have to drop it
+        Err(SendError::Exhausted)
     }
 }
 
@@ -823,16 +851,18 @@ mod tests {
             stream_key[i as usize] = 32 - i;
         }
         let state = ShardState { key, stream_key };
+        let stream = 0;
         let serial = 0;
         futures::stream::iter(shards.iter().take(193))
             .map(|shard| {
-                let (raw_shard, raw_shard_id) = shard.encode_shard(serial, &state);
+                let (raw_shard, raw_shard_id) = shard.encode_shard(stream, serial, &state);
                 recv_q.admit(raw_shard, raw_shard_id, &state)
             })
             .buffer_unordered(20)
             .try_collect::<Vec<_>>()
             .await?;
-        let (result, _) = recv_q.poll(&codec).await?.unwrap();
+        let (serial_, result, _) = recv_q.poll(&codec).await.unwrap()?;
+        assert_eq!(serial, serial_);
         assert_eq!(result, input_data);
         Ok(())
     }
