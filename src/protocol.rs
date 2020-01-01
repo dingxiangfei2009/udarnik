@@ -367,7 +367,7 @@ impl ShardId {
 
 #[derive(Clone)]
 pub struct RawShard {
-    raw_data: Vec<u8>,
+    pub raw_data: Vec<u8>,
 }
 
 impl Verifiable for RawShard {

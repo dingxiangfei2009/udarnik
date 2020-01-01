@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+package protocal;
+
+service Server {
+  rpc KeyExchange(stream Message) returns (stream Message);
+  rpc Client(stream Message) returns (stream Message);
+}
+
+service Bridge {
+  rpc Channel(stream BridgeMessage) returns (stream BridgeMessage);
+}
+
+message Message {
+  oneof message {
+    KeyExchange key_exchange = 1;
+    bytes params = 2;
+    ClientMessage client = 3;
+  }
+}
+
+message ClientMessage {
+  uint64 serial = 1;
+  string session = 2;
+  bytes variant = 3;
+}
+
+message KeyExchange {
+  oneof variant {
+    Offer offer = 1;
+    Accept accept = 2;
+    Reject reject = 3;
+    AnkePart anke_part = 4;
+    BorisPart boris_part = 5;
+  }
+}
+
+message Offer {
+  string identity = 1;
+  string init_identity = 2;
+}
+
+message Accept {
+  string identity = 1;
+  string init_identity = 2;
+}
+
+message Reject {
+  string identity = 1;
+  string init_identity = 2;
+}
+
+message AnkePart {
+  repeated bytes part = 1;
+}
+
+message BorisPart {
+  repeated bytes part = 1;
+  bytes reconciliator = 2;
+}
+
+message BridgeMessage {
+  oneof variant {
+    Payload payload = 1;
+    PayloadFeedback payload_feedback = 2;
+  }
+}
+
+message Payload {
+  RawShard raw_shard = 1;
+  RawShardId raw_shard_id = 2;
+}
+
+message PayloadFeedback {
+  uint32 stream = 1;
+  PayloadFeedbackInner inner = 2;
+}
+
+message PayloadFeedbackInner {
+  oneof variant {
+    FeedbackOk ok = 1;
+    FeedbackDuplicate duplicate = 2;
+    FeedbackFull full = 3;
+    FeedbackOutOfBound out_of_bound = 4;
+    FeedbackMalformed malformed = 5;
+    FeedbackComplete complete = 6;
+  };
+}
+
+message FeedbackOk {
+  uint32 id_and_quorum = 1;
+  uint64 serial = 2;
+}
+message FeedbackDuplicate {
+  uint32 id_and_quorum = 1;
+  uint64 serial = 2;
+}
+message FeedbackFull {
+  uint64 serial = 1;
+  uint32 queue = 2;
+}
+message FeedbackOutOfBound {
+  uint64 serial = 1;
+  uint64 start = 2;
+  uint32 queue = 3;
+}
+message FeedbackMalformed {
+  uint64 serial = 1;
+}
+message FeedbackComplete {
+  uint64 serial = 1;
+}
+
+message RawShard {
+  bytes raw_data = 1;
+}
+
+message RawShardId {
+  uint32 id_and_stream = 1;
+  uint64 serial = 2;
+}
+
+/// Messages beyond the Pomerium
+message Params {
+  uint32 correction_and_entropy = 1;
+  uint32 window = 2;
+}
+
+message ClientMessageVariant {
+  oneof variant {
+    BridgeNegotiate bridge_negotiate = 1;
+    StreamRequest stream = 2;
+    bool Ok = 3;
+    bool Err = 4;
+  }
+}
+
+message BridgeNegotiate {
+  oneof variant {
+    BridgeAsk ask = 1;
+    BridgeAsk ask_proposal = 2;
+    BridgeRetract retract = 3;
+    bool propose_ask = 4;
+    bool query_health = 5;
+    Health health = 6;
+  }
+}
+
+message BridgeAsk {
+  repeated BridgeSpec asks = 1;
+}
+
+message BridgeSpec {
+  BridgeType bridge_type = 1;
+  string id = 2;
+}
+
+message BridgeType {
+  oneof variant {
+    BridgeGrpc grpc = 1;
+  }
+}
+
+message BridgeGrpc {
+  string endpoint = 1;
+}
+
+message BridgeRetract {
+  repeated string retracts = 1;
+}
+
+message Health {
+  map<string, uint64> report = 1;
+}
+
+message StreamRequest {
+  oneof variant {
+    StreamReset reset = 1;
+  }
+}
+
+message StreamReset {
+  uint32 stream = 1;
+  uint32 window = 2;
+}

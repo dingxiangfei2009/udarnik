@@ -10,6 +10,7 @@ use std::{
 pub mod common;
 pub mod protocol;
 pub mod pvss;
+pub mod server;
 pub mod state;
 
 pub type GenericError = Box<dyn 'static + StdError + Send + Sync>;
