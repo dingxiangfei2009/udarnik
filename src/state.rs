@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+use aead::{Aead, NewAead, Payload};
+use aes_gcm_siv::Aes256GcmSiv;
 use async_std::sync::{Arc, Mutex, RwLock};
 use dyn_clone::{clone_box, DynClone};
 use failure::{Backtrace, Error as TopError, Fail};
@@ -21,6 +23,7 @@ use futures::{
     select,
     stream::repeat,
 };
+use generic_array::GenericArray;
 use log::{error, info};
 use lru::LruCache;
 use rand::{rngs::StdRng, seq::IteratorRandom, CryptoRng, RngCore, SeedableRng};
@@ -29,7 +32,7 @@ use sss::lattice::{
     Anke, AnkeIdentity, AnkePublic, AnkeSessionKeyPart, AnkeSessionKeyPartR, Boris, BorisIdentity,
     BorisPublic, BorisSessionKeyPart, BorisSessionKeyPartR, Init, PrivateKey, PublicKey,
     Reconciliator, SessionKeyPart, SessionKeyPartMix, SessionKeyPartMixParallelSampler,
-    SessionKeyPartParallelSampler,
+    SessionKeyPartParallelSampler, Signature,
 };
 
 use crate::{
@@ -40,7 +43,7 @@ use crate::{
     GenericError, Redact,
 };
 
-pub mod protocol {
+pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/protocal.rs"));
 }
 
@@ -141,6 +144,18 @@ pub enum Message<G> {
     KeyExchange(KeyExchangeMessage),
     Params(Redact<Pomerium<G, Params>>),
     Client(ClientMessage<G>),
+    Session(SessionId),
+    SessionLogOnChallenge(Vec<u8>),
+    SessionLogOn(SessionLogOn),
+}
+
+#[derive(Debug)]
+pub struct SessionLogOn {
+    pub init_identity: InitIdentity,
+    pub identity: Identity,
+    pub session: SessionId,
+    pub challenge: Vec<u8>,
+    pub signature: Signature,
 }
 
 #[derive(Debug)]
@@ -175,7 +190,7 @@ pub enum KeyExchangeMessage {
 }
 
 #[derive(Fail, Debug, From)]
-pub enum Error<G: 'static + Debug> {
+pub enum KeyExchangeError<G: 'static + Debug> {
     #[fail(display = "unknown message received")]
     UnknownMessage(Message<G>, Backtrace),
     #[fail(display = "message decoding: {}", _0)]
@@ -190,48 +205,51 @@ pub enum Error<G: 'static + Debug> {
     UnknownInit(Backtrace),
     #[fail(display = "client key exchange need to supply channel parameters")]
     NoParams,
+    #[fail(display = "session: {}", _0)]
+    Session(GenericError),
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum KeyExchangeRole {
     Anke,
     Boris,
 }
 
 pub struct KeyExchange<R> {
-    role: KeyExchangeRole,
-    retries: Option<u32>,
-    init_db: BTreeMap<InitIdentity, Init>,
-    identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
-    allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
-    identity_sequence: Vec<(InitIdentity, Identity)>,
-    session_key_part_sampler: SessionKeyPartParallelSampler<R>,
-    anke_session_key_part_mix_sampler: SessionKeyPartMixParallelSampler<R, Anke>,
-    boris_session_key_part_mix_sampler: SessionKeyPartMixParallelSampler<R, Boris>,
-    anke_data: Vec<u8>,
-    boris_data: Vec<u8>,
+    pub retries: Option<u32>,
+    pub init_db: BTreeMap<InitIdentity, Init>,
+    pub identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
+    pub allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
+    pub identity_sequence: Vec<(InitIdentity, Identity)>,
+    pub session_key_part_sampler: SessionKeyPartParallelSampler<R>,
+    pub anke_session_key_part_mix_sampler: SessionKeyPartMixParallelSampler<R, Anke>,
+    pub boris_session_key_part_mix_sampler: SessionKeyPartMixParallelSampler<R, Boris>,
+    pub anke_data: Vec<u8>,
+    pub boris_data: Vec<u8>,
 }
 
-pub async fn key_exchange<R, G, MsgStream, MsgSink, MsgStreamErr>(
+pub async fn key_exchange_anke<R, G, MsgStream, MsgSink, MsgStreamErr>(
     kex: KeyExchange<R>,
     message_stream: MsgStream,
     message_sink: MsgSink,
     seeder: impl Fn(&[u8]) -> R::Seed,
-    params: Option<Params>,
-) -> Result<SessionBootstrap, Error<G>>
+    params: Params,
+) -> Result<SessionBootstrap, KeyExchangeError<G>>
 where
     R: RngCore + CryptoRng + SeedableRng,
     G: 'static + Debug + Guard<Params> + for<'a> From<&'a [u8]>,
     G::Error: Debug,
     MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
     MsgSink: Sink<Message<G>> + Unpin,
-    MsgStreamErr: 'static + From<MsgSink::Error> + Send + Sync,
+    MsgStreamErr: 'static + Send + Sync,
     TopError: From<MsgSink::Error> + From<MsgStreamErr>,
 {
     use bitvec::prelude::*;
-    let mut message_stream = message_stream.map_err(|e| Error::Message(e.into(), <_>::default()));
-    let mut message_sink = message_sink.sink_map_err(|e| Error::Message(e.into(), <_>::default()));
+    let mut message_stream =
+        message_stream.map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
+    let mut message_sink =
+        message_sink.sink_map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
     let KeyExchange {
-        role,
         mut retries,
         init_db,
         identity_db,
@@ -239,261 +257,295 @@ where
         identity_sequence,
         session_key_part_sampler,
         anke_session_key_part_mix_sampler,
-        boris_session_key_part_mix_sampler,
         anke_data,
-        boris_data,
+        ..
     } = kex;
-    match role {
-        KeyExchangeRole::Anke => {
-            // Anke initiate negotiation
-            let mut key = None;
-            for (init_ident, ident) in identity_sequence {
-                let key_ = if let Some(key) =
-                    identity_db.get(&init_ident).and_then(|ids| ids.get(&ident))
+    // Anke initiate negotiation
+    let mut key = None;
+    for (init_ident, ident) in identity_sequence {
+        let key_ = if let Some(key) = identity_db.get(&init_ident).and_then(|ids| ids.get(&ident)) {
+            key
+        } else {
+            continue;
+        };
+        message_sink
+            .send(Message::KeyExchange(KeyExchangeMessage::Offer(
+                ident.clone(),
+                init_ident.clone(),
+            )))
+            .await?;
+        match message_stream.next().await {
+            None => return Err(KeyExchangeError::Terminated(<_>::default())),
+            Some(m) => match m? {
+                Message::KeyExchange(KeyExchangeMessage::Accept(ident_, init_ident_))
+                    if ident_ == ident && init_ident_ == init_ident =>
                 {
-                    key
-                } else {
-                    continue;
-                };
-                message_sink
-                    .send(Message::KeyExchange(KeyExchangeMessage::Offer(
-                        ident.clone(),
-                        init_ident.clone(),
-                    )))
-                    .await?;
-                match message_stream.next().await {
-                    None => return Err(Error::Terminated(<_>::default())),
-                    Some(m) => match m? {
-                        Message::KeyExchange(KeyExchangeMessage::Accept(ident_, init_ident_))
-                            if ident_ == ident && init_ident_ == init_ident =>
-                        {
-                            key = Some((init_ident, ident, key_));
-                            break;
-                        }
-                        Message::KeyExchange(KeyExchangeMessage::Reject(ident_, init_ident_))
-                            if ident_ == ident && init_ident_ == init_ident => {}
-                        m => return Err(Error::UnknownMessage(m, <_>::default())),
-                    },
+                    key = Some((init_ident, ident, key_));
+                    break;
                 }
-                if let Some(countdown) = &mut retries {
-                    if *countdown > 0 {
-                        *countdown -= 1
-                    } else {
-                        break;
-                    }
-                }
-            }
-            let (init_ident, anke_ident, anke_key) = key.ok_or_else(|| Error::Authentication)?;
-            let init = init_db
-                .get(&init_ident)
-                .ok_or_else(|| Error::UnknownInit(<_>::default()))?
-                .clone();
-            let anke_pub = anke_key.public_key(&init);
-            // expect Boris to negotiate keys
-            let mut boris_pub = None;
-            while boris_pub.is_none() {
-                match message_stream.next().await {
-                    None => return Err(Error::Terminated(<_>::default())),
-                    Some(m) => match m? {
-                        Message::KeyExchange(KeyExchangeMessage::Offer(ident, init_ident_))
-                            if init_ident_ == init_ident =>
-                        {
-                            if let Some(identites) = allowed_identities.get(&init_ident) {
-                                if let Some(pub_key) = identites.get(&ident) {
-                                    boris_pub = Some((ident, pub_key.clone()))
-                                }
-                            }
-                        }
-                        m => return Err(Error::UnknownMessage(m, <_>::default())),
-                    },
-                }
-                if let Some(countdown) = &mut retries {
-                    if *countdown > 0 {
-                        *countdown -= 1
-                    } else {
-                        break;
-                    }
-                }
-            }
-            let (boris_ident, boris_pub) = boris_pub.ok_or_else(|| Error::Authentication)?;
-            let (anke_session_part, anke_random) =
-                SessionKeyPart::generate(&session_key_part_sampler, &init);
-            message_sink
-                .send(Message::KeyExchange(KeyExchangeMessage::AnkePart(
-                    anke_session_part.clone().into(),
-                )))
-                .await?;
-            let shared_key = match message_stream.next().await {
-                None => return Err(Error::Terminated(<_>::default())),
-                Some(m) => match m? {
-                    Message::KeyExchange(KeyExchangeMessage::BorisPart(
-                        Redact(boris_session_part),
-                        Redact(reconciliator),
-                    )) => {
-                        let (anke_part_mix, _, _) = SessionKeyPartMix::<Anke>::generate::<R, _, _>(
-                            seeder,
-                            &anke_session_key_part_mix_sampler,
-                            AnkePublic(&anke_data, &anke_pub),
-                            BorisPublic(&anke_data, &boris_pub),
-                            AnkeSessionKeyPart(&anke_session_part),
-                            BorisSessionKeyPart(&boris_session_part),
-                            AnkeIdentity(&anke_key),
-                            AnkeSessionKeyPartR(&anke_random),
-                        );
-                        let shared_key = anke_part_mix.reconciliate(&reconciliator);
-                        let mut v = BitVec::<LittleEndian, u8>::new();
-                        v.extend(shared_key.iter().copied());
-                        v.into_vec()
-                    }
-                    m => return Err(Error::UnknownMessage(m, <_>::default())),
-                },
-            };
-            let outbound_guard = G::from(&shared_key);
-            let params = params.ok_or(Error::NoParams)?;
-            let message =
-                Message::Params(Redact(Pomerium::encode(&outbound_guard, params.clone())));
-            message_sink.send(message).await?;
-            Ok(SessionBootstrap {
-                anke_identity: anke_ident,
-                boris_identity: boris_ident,
-                params,
-                session_key: shared_key,
-            })
+                Message::KeyExchange(KeyExchangeMessage::Reject(ident_, init_ident_))
+                    if ident_ == ident && init_ident_ == init_ident => {}
+                m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+            },
         }
-        KeyExchangeRole::Boris => {
-            // Anke offers keys in negotiation
-            let mut anke_pub = None;
-            let mut init_ident = None;
-            while anke_pub.is_none() {
-                match message_stream.next().await {
-                    None => return Err(Error::Terminated(<_>::default())),
-                    Some(m) => match m? {
-                        Message::KeyExchange(KeyExchangeMessage::Offer(ident, init_ident_))
-                            if identity_db.contains_key(&init_ident_)
-                                && init_db.contains_key(&init_ident_) =>
-                        {
-                            if let Some(identites) = allowed_identities.get(&init_ident_) {
-                                if let Some(pub_key) = identites.get(&ident) {
-                                    init_ident = Some(init_ident_);
-                                    anke_pub = Some((ident, pub_key.clone()))
-                                }
-                            }
-                        }
-                        m => return Err(Error::UnknownMessage(m, <_>::default())),
-                    },
-                }
-                if let Some(countdown) = &mut retries {
-                    if *countdown > 0 {
-                        *countdown -= 1
-                    } else {
-                        break;
-                    }
-                }
-            }
-            let (anke_ident, anke_pub) = anke_pub.ok_or_else(|| Error::Authentication)?;
-            let init_ident = init_ident.unwrap();
-            let init = init_db.get(&init_ident).unwrap();
-            // Boris negotiate keys
-            let mut key = None;
-            for (init_ident_, ident) in identity_sequence {
-                if init_ident_ != init_ident {
-                    continue;
-                }
-                let key_ = if let Some(key) =
-                    identity_db.get(&init_ident).and_then(|ids| ids.get(&ident))
-                {
-                    key
-                } else {
-                    continue;
-                };
-                message_sink
-                    .send(Message::KeyExchange(KeyExchangeMessage::Offer(
-                        ident.clone(),
-                        init_ident.clone(),
-                    )))
-                    .await?;
-                match message_stream.next().await {
-                    None => return Err(Error::Terminated(<_>::default())),
-                    Some(m) => match m? {
-                        Message::KeyExchange(KeyExchangeMessage::Accept(ident_, init_ident_))
-                            if ident_ == ident && init_ident_ == init_ident =>
-                        {
-                            key = Some((ident, key_));
-                            break;
-                        }
-                        Message::KeyExchange(KeyExchangeMessage::Reject(ident_, init_ident_))
-                            if ident_ == ident && init_ident_ == init_ident => {}
-                        m => return Err(Error::UnknownMessage(m, <_>::default())),
-                    },
-                }
-                if let Some(countdown) = &mut retries {
-                    if *countdown > 0 {
-                        *countdown -= 1
-                    } else {
-                        break;
-                    }
-                }
-            }
-            let (boris_ident, boris_key) = key.ok_or_else(|| Error::Authentication)?;
-            let boris_pub = boris_key.public_key(&init);
-            let (boris_session_part, boris_random) =
-                SessionKeyPart::generate(&session_key_part_sampler, &init);
-            let anke_session_part = match message_stream.next().await {
-                None => return Err(Error::Terminated(<_>::default())),
-                Some(m) => match m? {
-                    Message::KeyExchange(KeyExchangeMessage::AnkePart(Redact(part))) => part,
-                    m => return Err(Error::UnknownMessage(m, <_>::default())),
-                },
-            };
-            let (boris_part_mix, _, _) = SessionKeyPartMix::<Boris>::generate::<R, _, _>(
-                seeder,
-                &boris_session_key_part_mix_sampler,
-                AnkePublic(&anke_data, &anke_pub),
-                BorisPublic(&boris_data, &boris_pub),
-                AnkeSessionKeyPart(&anke_session_part),
-                BorisSessionKeyPart(&boris_session_part),
-                BorisIdentity(&boris_key),
-                BorisSessionKeyPartR(&boris_random),
-            );
-            let reconciliator = boris_part_mix.reconciliator();
-            let shared_key = boris_part_mix.reconciliate(&reconciliator);
-            let mut v = BitVec::<LittleEndian, u8>::new();
-            v.extend(shared_key.iter().copied());
-            let shared_key = v.into_vec();
-
-            let inbound_guard = G::from(&shared_key);
-            message_sink
-                .send(Message::KeyExchange(KeyExchangeMessage::BorisPart(
-                    Redact(boris_session_part),
-                    Redact(reconciliator),
-                )))
-                .await?;
-            match message_stream.next().await {
-                None => Err(Error::Terminated(<_>::default())),
-                Some(m) => match m? {
-                    Message::Params(Redact(pomerium)) => {
-                        let params = pomerium.decode(&inbound_guard).map_err(|e| {
-                            error!("key_exchange: params: {:?}", e);
-                            Error::NoParams
-                        })?;
-                        Ok(SessionBootstrap {
-                            anke_identity: anke_ident,
-                            boris_identity: boris_ident,
-                            session_key: shared_key,
-                            params,
-                        })
-                    }
-                    m => Err(Error::UnknownMessage(m, <_>::default())),
-                },
+        if let Some(countdown) = &mut retries {
+            if *countdown > 0 {
+                *countdown -= 1
+            } else {
+                break;
             }
         }
     }
+    let (init_ident, anke_ident, anke_key) = key.ok_or_else(|| KeyExchangeError::Authentication)?;
+    let init = init_db
+        .get(&init_ident)
+        .ok_or_else(|| KeyExchangeError::UnknownInit(<_>::default()))?
+        .clone();
+    let anke_pub = anke_key.public_key(&init);
+    // expect Boris to negotiate keys
+    let mut boris_pub = None;
+    while boris_pub.is_none() {
+        match message_stream.next().await {
+            None => return Err(KeyExchangeError::Terminated(<_>::default())),
+            Some(m) => match m? {
+                Message::KeyExchange(KeyExchangeMessage::Offer(ident, init_ident_))
+                    if init_ident_ == init_ident =>
+                {
+                    if let Some(identites) = allowed_identities.get(&init_ident) {
+                        if let Some(pub_key) = identites.get(&ident) {
+                            boris_pub = Some((ident, pub_key.clone()))
+                        }
+                    }
+                }
+                m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+            },
+        }
+        if let Some(countdown) = &mut retries {
+            if *countdown > 0 {
+                *countdown -= 1
+            } else {
+                break;
+            }
+        }
+    }
+    let (boris_ident, boris_pub) = boris_pub.ok_or_else(|| KeyExchangeError::Authentication)?;
+    let (anke_session_part, anke_random) =
+        SessionKeyPart::generate(&session_key_part_sampler, &init);
+    message_sink
+        .send(Message::KeyExchange(KeyExchangeMessage::AnkePart(
+            anke_session_part.clone().into(),
+        )))
+        .await?;
+    let shared_key = match message_stream.next().await {
+        None => return Err(KeyExchangeError::Terminated(<_>::default())),
+        Some(m) => match m? {
+            Message::KeyExchange(KeyExchangeMessage::BorisPart(
+                Redact(boris_session_part),
+                Redact(reconciliator),
+            )) => {
+                let (anke_part_mix, _, _) = SessionKeyPartMix::<Anke>::generate::<R, _, _>(
+                    seeder,
+                    &anke_session_key_part_mix_sampler,
+                    AnkePublic(&anke_data, &anke_pub),
+                    BorisPublic(&anke_data, &boris_pub),
+                    AnkeSessionKeyPart(&anke_session_part),
+                    BorisSessionKeyPart(&boris_session_part),
+                    AnkeIdentity(&anke_key),
+                    AnkeSessionKeyPartR(&anke_random),
+                );
+                let shared_key = anke_part_mix.reconciliate(&reconciliator);
+                let mut v = BitVec::<LittleEndian, u8>::new();
+                v.extend(shared_key.iter().copied());
+                v.into_vec()
+            }
+            m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+        },
+    };
+    let outbound_guard = G::from(&shared_key);
+    let message = Message::Params(Redact(Pomerium::encode(&outbound_guard, params.clone())));
+    message_sink.send(message).await?;
+    let session_id = match message_stream.next().await {
+        None => return Err(KeyExchangeError::Terminated(<_>::default())),
+        Some(m) => match m? {
+            Message::Session(session_id) => session_id,
+            m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+        },
+    };
+    Ok(SessionBootstrap {
+        anke_identity: anke_ident,
+        boris_identity: boris_ident,
+        params,
+        session_key: shared_key,
+        session_id,
+        init_identity: init_ident,
+    })
 }
 
-#[derive(From, Hash, Clone, Debug, Display, PartialEq, Eq, PartialOrd, Ord)]
+pub async fn key_exchange_boris<R, G, MsgStream, MsgSink, MsgStreamErr>(
+    kex: KeyExchange<R>,
+    message_stream: MsgStream,
+    message_sink: MsgSink,
+    seeder: impl Fn(&[u8]) -> R::Seed,
+    session_id: SessionId,
+) -> Result<SessionBootstrap, KeyExchangeError<G>>
+where
+    R: RngCore + CryptoRng + SeedableRng,
+    G: 'static + Debug + Guard<Params> + for<'a> From<&'a [u8]>,
+    G::Error: Debug,
+    MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
+    MsgSink: Sink<Message<G>> + Unpin,
+    MsgStreamErr: 'static + Send + Sync,
+    TopError: From<MsgSink::Error> + From<MsgStreamErr>,
+{
+    use bitvec::prelude::*;
+    let mut message_stream =
+        message_stream.map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
+    let mut message_sink =
+        message_sink.sink_map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
+    let KeyExchange {
+        mut retries,
+        init_db,
+        identity_db,
+        allowed_identities,
+        identity_sequence,
+        session_key_part_sampler,
+        boris_session_key_part_mix_sampler,
+        anke_data,
+        boris_data,
+        ..
+    } = kex;
+    // Anke offers keys in negotiation
+    let mut anke_pub = None;
+    let mut init_ident = None;
+    while anke_pub.is_none() {
+        match message_stream.next().await {
+            None => return Err(KeyExchangeError::Terminated(<_>::default())),
+            Some(m) => match m? {
+                Message::KeyExchange(KeyExchangeMessage::Offer(ident, init_ident_))
+                    if identity_db.contains_key(&init_ident_)
+                        && init_db.contains_key(&init_ident_) =>
+                {
+                    if let Some(identites) = allowed_identities.get(&init_ident_) {
+                        if let Some(pub_key) = identites.get(&ident) {
+                            init_ident = Some(init_ident_);
+                            anke_pub = Some((ident, pub_key.clone()))
+                        }
+                    }
+                }
+                m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+            },
+        }
+        if let Some(countdown) = &mut retries {
+            if *countdown > 0 {
+                *countdown -= 1
+            } else {
+                break;
+            }
+        }
+    }
+    let (anke_ident, anke_pub) = anke_pub.ok_or_else(|| KeyExchangeError::Authentication)?;
+    let init_ident = init_ident.unwrap();
+    let init = init_db.get(&init_ident).unwrap();
+    // Boris negotiate keys
+    let mut key = None;
+    for (init_ident_, ident) in identity_sequence {
+        if init_ident_ != init_ident {
+            continue;
+        }
+        let key_ = if let Some(key) = identity_db.get(&init_ident).and_then(|ids| ids.get(&ident)) {
+            key
+        } else {
+            continue;
+        };
+        message_sink
+            .send(Message::KeyExchange(KeyExchangeMessage::Offer(
+                ident.clone(),
+                init_ident.clone(),
+            )))
+            .await?;
+        match message_stream.next().await {
+            None => return Err(KeyExchangeError::Terminated(<_>::default())),
+            Some(m) => match m? {
+                Message::KeyExchange(KeyExchangeMessage::Accept(ident_, init_ident_))
+                    if ident_ == ident && init_ident_ == init_ident =>
+                {
+                    key = Some((ident, key_));
+                    break;
+                }
+                Message::KeyExchange(KeyExchangeMessage::Reject(ident_, init_ident_))
+                    if ident_ == ident && init_ident_ == init_ident => {}
+                m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+            },
+        }
+        if let Some(countdown) = &mut retries {
+            if *countdown > 0 {
+                *countdown -= 1
+            } else {
+                break;
+            }
+        }
+    }
+    let (boris_ident, boris_key) = key.ok_or_else(|| KeyExchangeError::Authentication)?;
+    let boris_pub = boris_key.public_key(&init);
+    let (boris_session_part, boris_random) =
+        SessionKeyPart::generate(&session_key_part_sampler, &init);
+    let anke_session_part = match message_stream.next().await {
+        None => return Err(KeyExchangeError::Terminated(<_>::default())),
+        Some(m) => match m? {
+            Message::KeyExchange(KeyExchangeMessage::AnkePart(Redact(part))) => part,
+            m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+        },
+    };
+    let (boris_part_mix, _, _) = SessionKeyPartMix::<Boris>::generate::<R, _, _>(
+        seeder,
+        &boris_session_key_part_mix_sampler,
+        AnkePublic(&anke_data, &anke_pub),
+        BorisPublic(&boris_data, &boris_pub),
+        AnkeSessionKeyPart(&anke_session_part),
+        BorisSessionKeyPart(&boris_session_part),
+        BorisIdentity(&boris_key),
+        BorisSessionKeyPartR(&boris_random),
+    );
+    let reconciliator = boris_part_mix.reconciliator();
+    let shared_key = boris_part_mix.reconciliate(&reconciliator);
+    let mut v = BitVec::<LittleEndian, u8>::new();
+    v.extend(shared_key.iter().copied());
+    let shared_key = v.into_vec();
+
+    let inbound_guard = G::from(&shared_key);
+    message_sink
+        .send(Message::KeyExchange(KeyExchangeMessage::BorisPart(
+            Redact(boris_session_part),
+            Redact(reconciliator),
+        )))
+        .await?;
+    let params = match message_stream.next().await {
+        None => return Err(KeyExchangeError::Terminated(<_>::default())),
+        Some(m) => match m? {
+            Message::Params(Redact(pomerium)) => pomerium.decode(&inbound_guard).map_err(|e| {
+                error!("key_exchange: params: {:?}", e);
+                KeyExchangeError::NoParams
+            })?,
+            m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+        },
+    };
+    message_sink
+        .send(Message::Session(session_id.clone()))
+        .await?;
+    Ok(SessionBootstrap {
+        anke_identity: anke_ident,
+        boris_identity: boris_ident,
+        params,
+        session_key: shared_key,
+        session_id,
+        init_identity: init_ident,
+    })
+}
+
+#[derive(From, Hash, Clone, Debug, Display, PartialEq, Eq, PartialOrd, Ord, Deref)]
 pub struct BridgeId(String);
 
-#[derive(From, Hash, Clone, Display, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(From, Hash, Clone, Display, Debug, PartialEq, Eq, PartialOrd, Ord, Deref)]
 pub struct SessionId(String);
 
 pub struct Session<G> {
@@ -512,9 +564,11 @@ pub struct Session<G> {
     error_reports: Sender<(u8, u64, HashSet<u8>)>,
     master_sink: Box<dyn Send + Sync + ClonableSink<Message<G>, GenericError>>,
     bridge_builder: BridgeBuilder<G>,
-    progress: UnboundedReceiver<()>,
-    session_id: SessionId,
-    params: Params,
+    pub session_id: SessionId,
+    pub params: Params,
+    pub anke_identity: Identity,
+    pub boris_identity: Identity,
+    pub init_identity: InitIdentity,
 }
 
 pub struct SessionStream {
@@ -582,8 +636,10 @@ where
 pub struct SessionBootstrap {
     params: Params,
     session_key: Vec<u8>,
+    session_id: SessionId,
     anke_identity: Identity,
     boris_identity: Identity,
+    init_identity: InitIdentity,
 }
 
 pub struct SessionHandle<G> {
@@ -591,6 +647,7 @@ pub struct SessionHandle<G> {
     pub poll: BoxFuture<'static, Result<(), SessionError>>,
     pub input: Sender<Vec<u8>>,
     pub output: Receiver<Vec<u8>>,
+    pub progress: UnboundedReceiver<()>,
 }
 
 impl<G> Session<G>
@@ -604,7 +661,6 @@ where
 {
     pub fn new<Timeout: 'static + Send + Future<Output = ()>>(
         session_bootstrap: SessionBootstrap,
-        session_id: &SessionId,
         master_messages: Receiver<Message<G>>,
         master_sink: Box<dyn Send + Sync + ClonableSink<Message<G>, GenericError>>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
@@ -612,12 +668,15 @@ where
         let SessionBootstrap {
             params,
             session_key,
-            ..
+            anke_identity,
+            boris_identity,
+            init_identity,
+            session_id,
         } = session_bootstrap;
         let (input_tx, input) = channel(4096);
         let (output, output_rx) = channel(4096);
         let (error_reports, error_reports_rx) = channel(4096);
-        let (progress_tx, progress) = unbounded();
+        let (progress, progress_rx) = unbounded();
         let session = Arc::pin(Self {
             local_serial: <_>::default(),
             remote_serial: <_>::default(),
@@ -634,16 +693,18 @@ where
             error_reports,
             master_sink,
             bridge_builder: BridgeBuilder::new(),
-            progress,
             session_id: session_id.clone(),
             params,
+            anke_identity,
+            boris_identity,
+            init_identity,
         });
         let poll = Pin::clone(&session)
             .process_stream(
                 input,
                 error_reports_rx,
                 master_messages,
-                progress_tx,
+                progress,
                 timeout_generator.clone(),
             )
             .boxed();
@@ -652,6 +713,7 @@ where
             poll,
             input: input_tx,
             output: output_rx,
+            progress: progress_rx,
         })
     }
 
@@ -1681,6 +1743,8 @@ pub enum SessionError {
     BrokenPipe(GenericError, Backtrace),
     #[fail(display = "codec: {}", _0)]
     Codec(#[cause] CodecError),
+    #[fail(display = "token: {:?}", _0)]
+    SignOn(String),
 }
 
 #[derive(Default)]

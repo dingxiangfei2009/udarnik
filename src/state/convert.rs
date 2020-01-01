@@ -1,19 +1,19 @@
 use std::convert::{TryFrom, TryInto};
 
 use failure::{Backtrace, Fail};
-use sss::lattice::{Reconciliator, SessionKeyPart};
+use sss::lattice::{Int, Poly, Reconciliator, SessionKeyPart, Signature};
 
 use super::{
-    protocol, BridgeAsk, BridgeId, BridgeMessage, BridgeNegotiationMessage, BridgeType,
-    ClientMessage, ClientMessageVariant, GrpcBridge, KeyExchangeMessage, Message, Params,
-    PayloadFeedback, Pomerium, StreamRequest,
+    wire, BridgeAsk, BridgeId, BridgeMessage, BridgeNegotiationMessage, BridgeType, ClientMessage,
+    ClientMessageVariant, GrpcBridge, KeyExchangeMessage, Message, Params, PayloadFeedback,
+    Pomerium, SessionLogOn, StreamRequest,
 };
 use crate::{
     protocol::{RawShard, RawShardId},
     Redact,
 };
 
-impl<G> From<Message<G>> for protocol::Message {
+impl<G> From<Message<G>> for wire::Message {
     fn from(message: Message<G>) -> Self {
         Self {
             message: Some(<_>::from(message)),
@@ -21,18 +21,44 @@ impl<G> From<Message<G>> for protocol::Message {
     }
 }
 
-impl<G> From<Message<G>> for protocol::message::Message {
+impl<G> From<Message<G>> for wire::message::Message {
     fn from(message: Message<G>) -> Self {
-        use protocol::message::Message as M;
+        use wire::message::Message as M;
         match message {
-            Message::KeyExchange(kex) => M::KeyExchange(protocol::KeyExchange::from(kex)),
+            Message::KeyExchange(kex) => M::KeyExchange(wire::KeyExchange::from(kex)),
             Message::Params(Redact(params)) => M::Params(params.data),
-            Message::Client(msg) => M::Client(protocol::ClientMessage::from(msg)),
+            Message::Client(msg) => M::Client(wire::ClientMessage::from(msg)),
+            Message::Session(session) => M::Session(session.to_string()),
+            Message::SessionLogOn(logon) => M::SessionLogOn(wire::SessionLogOn::from(logon)),
+            Message::SessionLogOnChallenge(challenge) => M::SessionLogOnChallenge(challenge),
         }
     }
 }
 
-impl From<KeyExchangeMessage> for protocol::KeyExchange {
+impl From<SessionLogOn> for wire::SessionLogOn {
+    fn from(logon: SessionLogOn) -> Self {
+        Self {
+            init_identity: logon.init_identity.to_string(),
+            identity: logon.identity.to_string(),
+            session: logon.session.to_string(),
+            challenge: logon.challenge,
+            signature: Some(wire::Signature::from(logon.signature)),
+        }
+    }
+}
+
+impl From<Signature> for wire::Signature {
+    fn from(signature: Signature) -> Self {
+        Self {
+            p: signature.z_1.into_coeff_bytes(),
+            q: signature.z_2.into_coeff_bytes(),
+            r: signature.c.into_coeff_bytes(),
+            k: signature.k.into_bytes(),
+        }
+    }
+}
+
+impl From<KeyExchangeMessage> for wire::KeyExchange {
     fn from(kex: KeyExchangeMessage) -> Self {
         Self {
             variant: Some(<_>::from(kex)),
@@ -40,27 +66,27 @@ impl From<KeyExchangeMessage> for protocol::KeyExchange {
     }
 }
 
-impl From<KeyExchangeMessage> for protocol::key_exchange::Variant {
+impl From<KeyExchangeMessage> for wire::key_exchange::Variant {
     fn from(kex: KeyExchangeMessage) -> Self {
-        use protocol::key_exchange::Variant as V;
+        use wire::key_exchange::Variant as V;
         match kex {
-            KeyExchangeMessage::Offer(ident, init_ident) => V::Offer(protocol::Offer {
+            KeyExchangeMessage::Offer(ident, init_ident) => V::Offer(wire::Offer {
                 identity: ident.to_string(),
                 init_identity: init_ident.to_string(),
             }),
-            KeyExchangeMessage::Accept(ident, init_ident) => V::Accept(protocol::Accept {
+            KeyExchangeMessage::Accept(ident, init_ident) => V::Accept(wire::Accept {
                 identity: ident.to_string(),
                 init_identity: init_ident.to_string(),
             }),
-            KeyExchangeMessage::Reject(ident, init_ident) => V::Reject(protocol::Reject {
+            KeyExchangeMessage::Reject(ident, init_ident) => V::Reject(wire::Reject {
                 identity: ident.to_string(),
                 init_identity: init_ident.to_string(),
             }),
-            KeyExchangeMessage::AnkePart(Redact(part)) => V::AnkePart(protocol::AnkePart {
+            KeyExchangeMessage::AnkePart(Redact(part)) => V::AnkePart(wire::AnkePart {
                 part: part.into_coeff_bytes(),
             }),
             KeyExchangeMessage::BorisPart(Redact(part), Redact(recon)) => {
-                V::BorisPart(protocol::BorisPart {
+                V::BorisPart(wire::BorisPart {
                     part: part.into_coeff_bytes(),
                     reconciliator: recon.into_bytes(),
                 })
@@ -69,7 +95,7 @@ impl From<KeyExchangeMessage> for protocol::key_exchange::Variant {
     }
 }
 
-impl<G> From<ClientMessage<G>> for protocol::ClientMessage {
+impl<G> From<ClientMessage<G>> for wire::ClientMessage {
     fn from(msg: ClientMessage<G>) -> Self {
         Self {
             serial: msg.serial,
@@ -79,7 +105,7 @@ impl<G> From<ClientMessage<G>> for protocol::ClientMessage {
     }
 }
 
-impl From<BridgeMessage> for protocol::BridgeMessage {
+impl From<BridgeMessage> for wire::BridgeMessage {
     fn from(msg: BridgeMessage) -> Self {
         Self {
             variant: Some(<_>::from(msg)),
@@ -87,21 +113,21 @@ impl From<BridgeMessage> for protocol::BridgeMessage {
     }
 }
 
-impl From<BridgeMessage> for protocol::bridge_message::Variant {
+impl From<BridgeMessage> for wire::bridge_message::Variant {
     fn from(msg: BridgeMessage) -> Self {
-        use protocol::bridge_message::Variant as V;
+        use wire::bridge_message::Variant as V;
         match msg {
             BridgeMessage::Payload {
                 raw_shard,
                 raw_shard_id,
-            } => V::Payload(protocol::Payload {
+            } => V::Payload(wire::Payload {
                 raw_shard: Some(<_>::from(raw_shard)),
                 raw_shard_id: Some(<_>::from(raw_shard_id)),
             }),
             BridgeMessage::PayloadFeedback { stream, feedback } => {
-                V::PayloadFeedback(protocol::PayloadFeedback {
+                V::PayloadFeedback(wire::PayloadFeedback {
                     stream: stream as u32,
-                    inner: Some(protocol::PayloadFeedbackInner {
+                    inner: Some(wire::PayloadFeedbackInner {
                         variant: Some(<_>::from(feedback)),
                     }),
                 })
@@ -110,7 +136,7 @@ impl From<BridgeMessage> for protocol::bridge_message::Variant {
     }
 }
 
-impl From<RawShard> for protocol::RawShard {
+impl From<RawShard> for wire::RawShard {
     fn from(raw_shard: RawShard) -> Self {
         Self {
             raw_data: raw_shard.raw_data,
@@ -118,7 +144,7 @@ impl From<RawShard> for protocol::RawShard {
     }
 }
 
-impl From<RawShardId> for protocol::RawShardId {
+impl From<RawShardId> for wire::RawShardId {
     fn from(raw_shard_id: RawShardId) -> Self {
         Self {
             id_and_stream: raw_shard_id.id as u32 | ((raw_shard_id.stream as u32) << 8),
@@ -127,21 +153,21 @@ impl From<RawShardId> for protocol::RawShardId {
     }
 }
 
-impl From<PayloadFeedback> for protocol::payload_feedback_inner::Variant {
+impl From<PayloadFeedback> for wire::payload_feedback_inner::Variant {
     fn from(feedback: PayloadFeedback) -> Self {
-        use protocol::payload_feedback_inner::Variant as V;
+        use wire::payload_feedback_inner::Variant as V;
         match feedback {
-            PayloadFeedback::Ok { serial, id, quorum } => V::Ok(protocol::FeedbackOk {
+            PayloadFeedback::Ok { serial, id, quorum } => V::Ok(wire::FeedbackOk {
                 id_and_quorum: id as u32 | ((quorum as u32) << 8),
                 serial,
             }),
             PayloadFeedback::Duplicate { serial, id, quorum } => {
-                V::Duplicate(protocol::FeedbackDuplicate {
+                V::Duplicate(wire::FeedbackDuplicate {
                     id_and_quorum: id as u32 | ((quorum as u32) << 8),
                     serial,
                 })
             }
-            PayloadFeedback::Full { serial, queue_len } => V::Full(protocol::FeedbackFull {
+            PayloadFeedback::Full { serial, queue_len } => V::Full(wire::FeedbackFull {
                 serial,
                 queue: queue_len as u32,
             }),
@@ -149,17 +175,15 @@ impl From<PayloadFeedback> for protocol::payload_feedback_inner::Variant {
                 serial,
                 start,
                 queue_len,
-            } => V::OutOfBound(protocol::FeedbackOutOfBound {
+            } => V::OutOfBound(wire::FeedbackOutOfBound {
                 serial,
                 start,
                 queue: queue_len as u32,
             }),
             PayloadFeedback::Malformed { serial } => {
-                V::Malformed(protocol::FeedbackMalformed { serial })
+                V::Malformed(wire::FeedbackMalformed { serial })
             }
-            PayloadFeedback::Complete { serial } => {
-                V::Complete(protocol::FeedbackComplete { serial })
-            }
+            PayloadFeedback::Complete { serial } => V::Complete(wire::FeedbackComplete { serial }),
         }
     }
 }
@@ -176,9 +200,9 @@ pub enum WireError {
     SocketAddr(#[cause] std::net::AddrParseError),
 }
 
-impl<G> TryFrom<protocol::Message> for Message<G> {
+impl<G> TryFrom<wire::Message> for Message<G> {
     type Error = WireError;
-    fn try_from(msg: protocol::Message) -> Result<Self, Self::Error> {
+    fn try_from(msg: wire::Message) -> Result<Self, Self::Error> {
         Self::try_from(
             msg.message
                 .ok_or_else(|| WireError::Missing("message".into(), <_>::default()))?,
@@ -186,43 +210,82 @@ impl<G> TryFrom<protocol::Message> for Message<G> {
     }
 }
 
-impl<G> TryFrom<protocol::message::Message> for Message<G> {
+impl<G> TryFrom<wire::message::Message> for Message<G> {
     type Error = WireError;
-    fn try_from(msg: protocol::message::Message) -> Result<Self, Self::Error> {
-        use protocol::message::Message as M;
+    fn try_from(msg: wire::message::Message) -> Result<Self, Self::Error> {
+        use wire::message::Message as M;
         Ok(match msg {
-            M::KeyExchange(protocol::KeyExchange { variant: Some(kex) }) => {
+            M::KeyExchange(wire::KeyExchange { variant: Some(kex) }) => {
                 Self::KeyExchange(<_>::try_from(kex)?)
             }
             M::Params(params) => Self::Params(Redact(Pomerium::from_raw(params))),
             M::Client(msg) => Self::Client(ClientMessage::try_from(msg)?),
+            M::Session(session) => Self::Session(session.into()),
+            M::SessionLogOn(logon) => Self::SessionLogOn(logon.try_into()?),
+            M::SessionLogOnChallenge(challenge) => Self::SessionLogOnChallenge(challenge),
             _ => return Err(WireError::Malformed(<_>::default())),
         })
     }
 }
 
-impl TryFrom<protocol::key_exchange::Variant> for KeyExchangeMessage {
+impl TryFrom<wire::SessionLogOn> for SessionLogOn {
     type Error = WireError;
-    fn try_from(kex: protocol::key_exchange::Variant) -> Result<Self, Self::Error> {
-        use protocol::key_exchange::Variant as V;
+    fn try_from(logon: wire::SessionLogOn) -> Result<Self, Self::Error> {
+        match logon {
+            wire::SessionLogOn {
+                init_identity,
+                identity,
+                session,
+                challenge,
+                signature: Some(signature),
+            } => Ok(Self {
+                init_identity: init_identity.into(),
+                identity: identity.into(),
+                session: session.into(),
+                challenge: challenge,
+                signature: signature.try_into()?,
+            }),
+            _ => return Err(WireError::Malformed(<_>::default())),
+        }
+    }
+}
+
+impl TryFrom<wire::Signature> for Signature {
+    type Error = WireError;
+    fn try_from(sig: wire::Signature) -> Result<Self, Self::Error> {
+        Ok(Self {
+            z_1: Poly::from_coeff_bytes(sig.p)
+                .ok_or_else(|| WireError::Malformed(<_>::default()))?,
+            z_2: Poly::from_coeff_bytes(sig.q)
+                .ok_or_else(|| WireError::Malformed(<_>::default()))?,
+            c: Poly::from_coeff_bytes(sig.r).ok_or_else(|| WireError::Malformed(<_>::default()))?,
+            k: Int::from_bytes(&sig.k),
+        })
+    }
+}
+
+impl TryFrom<wire::key_exchange::Variant> for KeyExchangeMessage {
+    type Error = WireError;
+    fn try_from(kex: wire::key_exchange::Variant) -> Result<Self, Self::Error> {
+        use wire::key_exchange::Variant as V;
         Ok(match kex {
-            V::Offer(protocol::Offer {
+            V::Offer(wire::Offer {
                 identity,
                 init_identity,
             }) => KeyExchangeMessage::Offer(identity.into(), init_identity.into()),
-            V::Accept(protocol::Accept {
+            V::Accept(wire::Accept {
                 identity,
                 init_identity,
             }) => KeyExchangeMessage::Accept(identity.into(), init_identity.into()),
-            V::Reject(protocol::Reject {
+            V::Reject(wire::Reject {
                 identity,
                 init_identity,
             }) => KeyExchangeMessage::Reject(identity.into(), init_identity.into()),
-            V::AnkePart(protocol::AnkePart { part }) => KeyExchangeMessage::AnkePart(Redact(
+            V::AnkePart(wire::AnkePart { part }) => KeyExchangeMessage::AnkePart(Redact(
                 SessionKeyPart::from_coeff_bytes(part)
                     .ok_or_else(|| WireError::Malformed(<_>::default()))?,
             )),
-            V::BorisPart(protocol::BorisPart {
+            V::BorisPart(wire::BorisPart {
                 part,
                 reconciliator,
             }) => KeyExchangeMessage::BorisPart(
@@ -236,9 +299,9 @@ impl TryFrom<protocol::key_exchange::Variant> for KeyExchangeMessage {
     }
 }
 
-impl<G> TryFrom<protocol::ClientMessage> for ClientMessage<G> {
+impl<G> TryFrom<wire::ClientMessage> for ClientMessage<G> {
     type Error = WireError;
-    fn try_from(msg: protocol::ClientMessage) -> Result<Self, Self::Error> {
+    fn try_from(msg: wire::ClientMessage) -> Result<Self, Self::Error> {
         Ok(ClientMessage {
             serial: msg.serial,
             session: msg.session.into(),
@@ -248,7 +311,7 @@ impl<G> TryFrom<protocol::ClientMessage> for ClientMessage<G> {
 }
 
 // Types behind the Pomerium
-impl From<Params> for protocol::Params {
+impl From<Params> for wire::Params {
     fn from(params: Params) -> Self {
         Self {
             correction_and_entropy: params.correction as u32 | ((params.entropy as u32) << 8),
@@ -257,9 +320,9 @@ impl From<Params> for protocol::Params {
     }
 }
 
-impl From<ClientMessageVariant> for protocol::ClientMessageVariant {
+impl From<ClientMessageVariant> for wire::ClientMessageVariant {
     fn from(msg: ClientMessageVariant) -> Self {
-        use protocol::client_message_variant::Variant as V;
+        use wire::client_message_variant::Variant as V;
         Self {
             variant: Some(match msg {
                 ClientMessageVariant::BridgeNegotiate(msg) => V::BridgeNegotiate(msg.into()),
@@ -271,12 +334,12 @@ impl From<ClientMessageVariant> for protocol::ClientMessageVariant {
     }
 }
 
-impl From<StreamRequest> for protocol::StreamRequest {
+impl From<StreamRequest> for wire::StreamRequest {
     fn from(msg: StreamRequest) -> Self {
-        use protocol::stream_request::Variant as V;
+        use wire::stream_request::Variant as V;
         Self {
             variant: Some(match msg {
-                StreamRequest::Reset { stream, window } => V::Reset(protocol::StreamReset {
+                StreamRequest::Reset { stream, window } => V::Reset(wire::StreamReset {
                     stream: stream as u32,
                     window: window as u32,
                 }),
@@ -285,27 +348,23 @@ impl From<StreamRequest> for protocol::StreamRequest {
     }
 }
 
-impl From<BridgeNegotiationMessage> for protocol::BridgeNegotiate {
+impl From<BridgeNegotiationMessage> for wire::BridgeNegotiate {
     fn from(msg: BridgeNegotiationMessage) -> Self {
-        use protocol::bridge_negotiate::Variant as V;
+        use wire::bridge_negotiate::Variant as V;
         Self {
             variant: Some(match msg {
-                BridgeNegotiationMessage::Ask(asks) => V::Ask(protocol::BridgeAsk {
+                BridgeNegotiationMessage::Ask(asks) => V::Ask(wire::BridgeAsk {
                     asks: asks.into_iter().map(<_>::from).collect(),
                 }),
-                BridgeNegotiationMessage::Retract(retracts) => {
-                    V::Retract(protocol::BridgeRetract {
-                        retracts: retracts.into_iter().map(|r| r.0.to_string()).collect(),
-                    })
-                }
-                BridgeNegotiationMessage::AskProposal(asks) => {
-                    V::AskProposal(protocol::BridgeAsk {
-                        asks: asks.into_iter().map(<_>::from).collect(),
-                    })
-                }
+                BridgeNegotiationMessage::Retract(retracts) => V::Retract(wire::BridgeRetract {
+                    retracts: retracts.into_iter().map(|r| r.0.to_string()).collect(),
+                }),
+                BridgeNegotiationMessage::AskProposal(asks) => V::AskProposal(wire::BridgeAsk {
+                    asks: asks.into_iter().map(<_>::from).collect(),
+                }),
                 BridgeNegotiationMessage::ProposeAsk => V::ProposeAsk(true),
                 BridgeNegotiationMessage::QueryHealth => V::QueryHealth(true),
-                BridgeNegotiationMessage::Health(health) => V::Health(protocol::Health {
+                BridgeNegotiationMessage::Health(health) => V::Health(wire::Health {
                     report: health
                         .into_iter()
                         .map(|(id, count)| (id.to_string(), count))
@@ -316,7 +375,7 @@ impl From<BridgeNegotiationMessage> for protocol::BridgeNegotiate {
     }
 }
 
-impl From<BridgeAsk> for protocol::BridgeSpec {
+impl From<BridgeAsk> for wire::BridgeSpec {
     fn from(msg: BridgeAsk) -> Self {
         Self {
             bridge_type: Some(msg.r#type.into()),
@@ -325,9 +384,9 @@ impl From<BridgeAsk> for protocol::BridgeSpec {
     }
 }
 
-impl From<BridgeType> for protocol::BridgeType {
+impl From<BridgeType> for wire::BridgeType {
     fn from(typ: BridgeType) -> Self {
-        use protocol::bridge_type::Variant as V;
+        use wire::bridge_type::Variant as V;
         Self {
             variant: Some(match typ {
                 BridgeType::Grpc(typ) => V::Grpc(typ.into()),
@@ -336,7 +395,7 @@ impl From<BridgeType> for protocol::BridgeType {
     }
 }
 
-impl From<GrpcBridge> for protocol::BridgeGrpc {
+impl From<GrpcBridge> for wire::BridgeGrpc {
     fn from(grpc: GrpcBridge) -> Self {
         Self {
             endpoint: grpc.0.to_string(),
@@ -344,9 +403,9 @@ impl From<GrpcBridge> for protocol::BridgeGrpc {
     }
 }
 
-impl TryFrom<protocol::Params> for Params {
+impl TryFrom<wire::Params> for Params {
     type Error = WireError;
-    fn try_from(params: protocol::Params) -> Result<Self, Self::Error> {
+    fn try_from(params: wire::Params) -> Result<Self, Self::Error> {
         let correction_and_entropy = u16::try_from(params.correction_and_entropy)?;
         let correction = (correction_and_entropy & 0xff) as u8;
         let entropy = (correction_and_entropy >> 8) as u8;
@@ -358,11 +417,11 @@ impl TryFrom<protocol::Params> for Params {
     }
 }
 
-impl TryFrom<protocol::ClientMessageVariant> for ClientMessageVariant {
+impl TryFrom<wire::ClientMessageVariant> for ClientMessageVariant {
     type Error = WireError;
-    fn try_from(msg: protocol::ClientMessageVariant) -> Result<Self, Self::Error> {
-        use protocol::client_message_variant::Variant as V;
-        let protocol::ClientMessageVariant { variant } = msg;
+    fn try_from(msg: wire::ClientMessageVariant) -> Result<Self, Self::Error> {
+        use wire::client_message_variant::Variant as V;
+        let wire::ClientMessageVariant { variant } = msg;
         if let Some(variant) = variant {
             Ok(match variant {
                 V::BridgeNegotiate(msg) => ClientMessageVariant::BridgeNegotiate(msg.try_into()?),
@@ -376,21 +435,21 @@ impl TryFrom<protocol::ClientMessageVariant> for ClientMessageVariant {
     }
 }
 
-impl TryFrom<protocol::BridgeNegotiate> for BridgeNegotiationMessage {
+impl TryFrom<wire::BridgeNegotiate> for BridgeNegotiationMessage {
     type Error = WireError;
-    fn try_from(msg: protocol::BridgeNegotiate) -> Result<Self, Self::Error> {
-        use protocol::bridge_negotiate::Variant as V;
-        let protocol::BridgeNegotiate { variant } = msg;
+    fn try_from(msg: wire::BridgeNegotiate) -> Result<Self, Self::Error> {
+        use wire::bridge_negotiate::Variant as V;
+        let wire::BridgeNegotiate { variant } = msg;
         if let Some(variant) = variant {
             Ok(match variant {
-                V::Ask(protocol::BridgeAsk { asks }) => {
+                V::Ask(wire::BridgeAsk { asks }) => {
                     let asks = asks
                         .into_iter()
                         .map(BridgeAsk::try_from)
                         .collect::<Result<Vec<_>, _>>()?;
                     BridgeNegotiationMessage::Ask(asks)
                 }
-                V::Retract(protocol::BridgeRetract { retracts }) => {
+                V::Retract(wire::BridgeRetract { retracts }) => {
                     let retracts = retracts
                         .into_iter()
                         .map(BridgeId::from)
@@ -398,7 +457,7 @@ impl TryFrom<protocol::BridgeNegotiate> for BridgeNegotiationMessage {
                         .collect();
                     BridgeNegotiationMessage::Retract(retracts)
                 }
-                V::AskProposal(protocol::BridgeAsk { asks }) => {
+                V::AskProposal(wire::BridgeAsk { asks }) => {
                     let asks = asks
                         .into_iter()
                         .map(BridgeAsk::try_from)
@@ -407,7 +466,7 @@ impl TryFrom<protocol::BridgeNegotiate> for BridgeNegotiationMessage {
                 }
                 V::ProposeAsk(_) => BridgeNegotiationMessage::ProposeAsk,
                 V::QueryHealth(_) => BridgeNegotiationMessage::QueryHealth,
-                V::Health(protocol::Health { report }) => BridgeNegotiationMessage::Health(
+                V::Health(wire::Health { report }) => BridgeNegotiationMessage::Health(
                     report
                         .into_iter()
                         .map(|(id, count)| (id.into(), count))
@@ -420,11 +479,11 @@ impl TryFrom<protocol::BridgeNegotiate> for BridgeNegotiationMessage {
     }
 }
 
-impl TryFrom<protocol::BridgeSpec> for BridgeAsk {
+impl TryFrom<wire::BridgeSpec> for BridgeAsk {
     type Error = WireError;
-    fn try_from(msg: protocol::BridgeSpec) -> Result<Self, Self::Error> {
+    fn try_from(msg: wire::BridgeSpec) -> Result<Self, Self::Error> {
         match msg {
-            protocol::BridgeSpec {
+            wire::BridgeSpec {
                 id,
                 bridge_type: Some(bridge_type),
             } => Ok(Self {
@@ -436,16 +495,16 @@ impl TryFrom<protocol::BridgeSpec> for BridgeAsk {
     }
 }
 
-impl TryFrom<protocol::BridgeType> for BridgeType {
+impl TryFrom<wire::BridgeType> for BridgeType {
     type Error = WireError;
-    fn try_from(msg: protocol::BridgeType) -> Result<Self, Self::Error> {
-        use protocol::bridge_type::Variant as V;
-        if let protocol::BridgeType {
+    fn try_from(msg: wire::BridgeType) -> Result<Self, Self::Error> {
+        use wire::bridge_type::Variant as V;
+        if let wire::BridgeType {
             variant: Some(variant),
         } = msg
         {
             Ok(match variant {
-                V::Grpc(protocol::BridgeGrpc { endpoint }) => {
+                V::Grpc(wire::BridgeGrpc { endpoint }) => {
                     BridgeType::Grpc(GrpcBridge(endpoint.parse()?))
                 }
             })
@@ -455,16 +514,16 @@ impl TryFrom<protocol::BridgeType> for BridgeType {
     }
 }
 
-impl TryFrom<protocol::StreamRequest> for StreamRequest {
+impl TryFrom<wire::StreamRequest> for StreamRequest {
     type Error = WireError;
-    fn try_from(msg: protocol::StreamRequest) -> Result<Self, Self::Error> {
-        use protocol::stream_request::Variant as V;
-        if let protocol::StreamRequest {
+    fn try_from(msg: wire::StreamRequest) -> Result<Self, Self::Error> {
+        use wire::stream_request::Variant as V;
+        if let wire::StreamRequest {
             variant: Some(variant),
         } = msg
         {
             Ok(match variant {
-                V::Reset(protocol::StreamReset { stream, window }) => StreamRequest::Reset {
+                V::Reset(wire::StreamReset { stream, window }) => StreamRequest::Reset {
                     stream: u8::try_from(stream)?,
                     window: usize::try_from(window)?,
                 },

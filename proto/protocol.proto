@@ -16,7 +16,25 @@ message Message {
     KeyExchange key_exchange = 1;
     bytes params = 2;
     ClientMessage client = 3;
+    string session = 4;
+    bytes session_log_on_challenge = 5;
+    SessionLogOn session_log_on = 6;
   }
+}
+
+message SessionLogOn {
+  string init_identity = 1;
+  string identity = 2;
+  string session = 3;
+  bytes challenge = 4;
+  Signature signature = 5;
+}
+
+message Signature {
+  repeated bytes p = 1;
+  repeated bytes q = 2;
+  repeated bytes r = 3;
+  bytes k = 4;
 }
 
 message ClientMessage {

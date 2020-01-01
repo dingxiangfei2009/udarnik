@@ -350,7 +350,7 @@ pub struct ShardId {
     id: u8,
     serial: u64,
     key: [u8; 32],
-    nounce: [u8; 12],
+    nonce: [u8; 12],
 }
 
 impl ShardId {
@@ -381,7 +381,7 @@ impl Verifiable for RawShard {
         let aad = proof.to_aad();
         let data = aead
             .decrypt(
-                &GenericArray::clone_from_slice(&proof.nounce),
+                &GenericArray::clone_from_slice(&proof.nonce),
                 Payload {
                     msg: raw_data.as_slice(),
                     aad: aad.as_slice(),
@@ -414,17 +414,17 @@ pub struct ShardState {
 }
 
 #[derive(Clone, Debug, Copy, Hash, PartialEq)]
-struct ShardNounce([u8; 12]);
+struct ShardNonce([u8; 12]);
 
-impl ShardNounce {
+impl ShardNonce {
     fn new(state: &ShardState, id: u8, serial: u64) -> Self {
         let seed = state.seed(id, serial);
         let mut rng = ChaChaRng::from_seed(seed);
         rng.set_stream(serial);
         rng.set_word_pos(id as u128 * 2);
-        let mut nounce = [0; 12];
-        rng.fill_bytes(&mut nounce);
-        Self(nounce)
+        let mut nonce = [0; 12];
+        rng.fill_bytes(&mut nonce);
+        Self(nonce)
     }
 }
 
@@ -460,12 +460,12 @@ impl<'a> Verifiable for (RawShardId, &'a ShardState) {
     type Output = ShardId;
     fn verify(self, _: Self::Proof) -> Result<Self::Output, Self::Error> {
         let (RawShardId { id, serial, .. }, proof) = self;
-        let ShardNounce(nounce) = ShardNounce::new(&proof, id, serial);
+        let ShardNonce(nonce) = ShardNonce::new(&proof, id, serial);
         let ShardState { key, .. } = proof;
         Ok(ShardId {
             id,
             serial,
-            nounce,
+            nonce,
             key: *key,
         })
     }
@@ -473,13 +473,13 @@ impl<'a> Verifiable for (RawShardId, &'a ShardState) {
 
 impl Shard {
     fn generate_shard_id(&self, serial: u64, state: &ShardState) -> ShardId {
-        let ShardNounce(nounce) = ShardNounce::new(&state, self.id, serial);
+        let ShardNonce(nonce) = ShardNonce::new(&state, self.id, serial);
         let ShardState { key, .. } = state;
         let Self { id, .. } = self;
         ShardId {
             key: *key,
             id: *id,
-            nounce,
+            nonce,
             serial,
         }
     }
@@ -501,7 +501,7 @@ impl Shard {
 
         let raw_data = aead
             .encrypt(
-                &GenericArray::clone_from_slice(&proof.nounce),
+                &GenericArray::clone_from_slice(&proof.nonce),
                 Payload {
                     msg: data.as_slice(),
                     aad: aad.as_slice(),
