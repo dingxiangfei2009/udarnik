@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    convert::{TryFrom, TryInto},
+    convert::TryInto,
     fmt::Debug,
+    fmt::{Formatter, Result as FmtResult},
     marker::PhantomData,
     net::SocketAddr,
     num::Wrapping,
@@ -25,7 +26,7 @@ use futures::{
     stream::repeat,
 };
 use generic_array::GenericArray;
-use log::{error, info};
+use log::error;
 use lru::LruCache;
 use prost::Message as ProstMessage;
 use rand::{rngs::StdRng, seq::IteratorRandom, CryptoRng, RngCore, SeedableRng};
@@ -46,7 +47,7 @@ use crate::{
 };
 
 pub mod wire {
-    include!(concat!(env!("OUT_DIR"), "/protocal.rs"));
+    include!(concat!(env!("OUT_DIR"), "/protocol.rs"));
 }
 
 mod convert;
@@ -664,7 +665,7 @@ where
     G: 'static
         + Send
         + Sync
-        + for<'a> From<&'a Params>
+        + for<'a> From<&'a [u8]>
         + Guard<ClientMessageVariant, (SessionId, u64), Error = GenericError>
         + Guard<BridgeMessage, (), Error = GenericError>,
 {
@@ -689,8 +690,8 @@ where
         let session = Arc::pin(Self {
             local_serial: <_>::default(),
             remote_serial: <_>::default(),
-            inbound_guard: Arc::new(G::from(&params)),
-            outbound_guard: Arc::new(G::from(&params)),
+            inbound_guard: Arc::new(G::from(&session_key)),
+            outbound_guard: Arc::new(G::from(&session_key)),
             send_counter: <_>::default(),
             send_success_counter: <_>::default(),
             receive_counter: <_>::default(),
@@ -1826,8 +1827,14 @@ pub enum PayloadFeedback {
     },
 }
 
-struct SafeGuard {
+pub(crate) struct SafeGuard {
     aead: Aes256GcmSiv,
+}
+
+impl Debug for SafeGuard {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "<SafeGuard>")
+    }
 }
 
 impl SafeGuard {
@@ -1862,7 +1869,7 @@ impl<'a> From<&'a [u8]> for SafeGuard {
     }
 }
 
-trait Tag {
+pub trait Tag {
     fn into_bytes(&self) -> Vec<u8>;
 }
 
@@ -1881,13 +1888,23 @@ impl Tag for (SessionId, u64) {
     }
 }
 
-trait ProstMessageMapping: Sized {
+pub(crate) trait ProstMessageMapping: Sized {
     type MapTo: ProstMessage + Default + From<Self> + TryInto<Self>;
     type Tag: Tag;
 }
 
 impl ProstMessageMapping for ClientMessageVariant {
     type MapTo = wire::ClientMessageVariant;
+    type Tag = (SessionId, u64);
+}
+
+impl ProstMessageMapping for Params {
+    type MapTo = wire::Params;
+    type Tag = ();
+}
+
+impl ProstMessageMapping for BridgeMessage {
+    type MapTo = wire::BridgeMessage;
     type Tag = ();
 }
 
@@ -1895,7 +1912,8 @@ impl<P, T> Guard<P, T> for SafeGuard
 where
     P: ProstMessageMapping<Tag = T>,
     T: Tag,
-    <P::MapTo as TryInto<P>>::Error: 'static + Into<GenericError> + Send + Sync + std::error::Error,
+    <P::MapTo as TryInto<P>>::Error: 'static + Send + Sync,
+    GenericError: From<<P::MapTo as TryInto<P>>::Error>,
 {
     type Error = GenericError;
     fn encode(&self, payload: P) -> Vec<u8> {
@@ -1942,11 +1960,24 @@ where
         let payload: <P as ProstMessageMapping>::MapTo = Self::decode_message(buf)?;
         Ok(payload.try_into()?)
     }
-    fn decode_with_tag(
-        &self,
-        data: &[u8],
-        tag: &T,
-    ) -> Result<P, Self::Error> {
-        todo!()
+    fn decode_with_tag(&self, data: &[u8], tag: &T) -> Result<P, Self::Error> {
+        if data.len() < 12 {
+            return Err(Box::new(err_msg("truncated data").compat()));
+        }
+        let mut nonce = [0u8; 12];
+        nonce[..].copy_from_slice(&data[..12]);
+        let (_, data) = data.split_at(12);
+        let buf = self
+            .aead
+            .decrypt(
+                GenericArray::from_slice(&nonce),
+                Payload {
+                    msg: data,
+                    aad: &tag.into_bytes(),
+                },
+            )
+            .map_err(|e| Box::new(err_msg(format!("decode: {:?}", e)).compat()))?;
+        let payload: <P as ProstMessageMapping>::MapTo = Self::decode_message(buf)?;
+        Ok(payload.try_into()?)
     }
 }

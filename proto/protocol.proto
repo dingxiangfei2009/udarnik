@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package protocal;
+package protocol;
 
 service Server {
   rpc KeyExchange(stream Message) returns (stream Message);

@@ -13,22 +13,24 @@ use async_std::sync::{Arc, Mutex, RwLock};
 use failure::Fail;
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
+    future::{pending, select_all},
     prelude::*,
     select,
 };
+use log::{error, info};
 use pin_utils::unsafe_pinned;
 use rand::{CryptoRng, RngCore, SeedableRng};
 use sss::lattice::{
-    Anke, Boris, Init, PrivateKey, PublicKey, SessionKeyPart, SessionKeyPartMix, SigningKey,
-    VerificationKey,
+    Init, PrivateKey, PublicKey, SessionKeyPart, SessionKeyPartMix, VerificationKey,
 };
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     protocol::signature_hasher,
     state::{
-        key_exchange_boris, wire, ClonableSink, Guard, Identity, InitIdentity, KeyExchange,
-        Message, Params, Session, SessionBootstrap, SessionError, SessionId, SessionLogOn,
+        key_exchange_boris, wire, Guard, Identity, InitIdentity, KeyExchange, Message, Params,
+        SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle, SessionId,
     },
     GenericError,
 };
@@ -260,7 +262,7 @@ impl<T, E> Unpin for TryFutureStream<T, E> {}
 
 #[tonic::async_trait]
 impl<G, R, S, TimeGen, Timeout> wire::server_server::Server
-    for UdarnikServer<G, R, S, TimeGen, Timeout>
+    for Pin<Arc<UdarnikServer<G, R, S, TimeGen, Timeout>>>
 where
     G: 'static + Send + Sync + Guard<Params, ()> + for<'a> From<&'a [u8]> + Debug,
     G::Error: Debug,
@@ -367,7 +369,9 @@ pub struct ServerBootstrap {
     verify_db: BTreeMap<InitIdentity, BTreeMap<Identity, VerificationKey>>,
 }
 
-pub async fn server(bootstrap: ServerBootstrap) {
+pub type ServiceFuture<T> = Pin<Box<dyn Future<Output = T> + Send + Sync>>;
+
+pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
     let ServerBootstrap {
         addr,
         allowed_identities,
@@ -379,20 +383,135 @@ pub async fn server(bootstrap: ServerBootstrap) {
         retries,
         verify_db,
     } = bootstrap;
-    // let (new_sessions_tx, new_sessions) = channel(32);
-    // let server = UdarnikServer {
-    //     _p: PhantomData,
-    //     allowed_identities,
-    //     anke_data,
-    //     boris_data,
-    //     identity_db,
-    //     identity_sequence,
-    //     init_db,
-    //     new_sessions: new_sessions_tx,
-    //     retries,
-    //     seeder: signature_hasher,
-    //     sessions: <_>::default(),
-    //     verify_db: Arc::new(verify_db),
-    //     timeout_generator: async_std::task::sleep,
-    // };
+    let (new_sessions_tx, mut new_sessions) = channel(32);
+    let sessions = Arc::default();
+    let seeder = |input: &[u8]| {
+        use sha3::digest::Digest;
+        let mut s = [0; 32];
+        for chunks in sha3::Sha3_512::digest(input).chunks(32) {
+            for (s, c) in s.iter_mut().zip(chunks) {
+                *s ^= c;
+            }
+        }
+        s
+    };
+    let server: UdarnikServer<SafeGuard, rand_chacha::ChaChaRng, _, _, ServiceFuture<()>> =
+        UdarnikServer {
+            _p: PhantomData,
+            allowed_identities,
+            anke_data,
+            boris_data,
+            identity_db,
+            identity_sequence,
+            init_db,
+            new_sessions: new_sessions_tx,
+            retries,
+            seeder,
+            sessions: Arc::clone(&sessions),
+            verify_db: Arc::new(verify_db),
+            timeout_generator: |duration| {
+                Pin::from(Box::new(async_std::task::sleep(duration))
+                    as Box<dyn Future<Output = ()> + Send + Sync>)
+            },
+        };
+    let server = Arc::pin(server);
+    let (mut poll_session_tx, mut poll_session) = channel(32);
+    let mut new_sessions = async {
+        while let Some(session_bootstrap) = new_sessions.next().await {
+            let timeout_generator = |duration| async_std::task::sleep(duration).boxed();
+            let (master_in, master_messages) = channel(4096);
+            let (master_sink, master_out) = channel(4096);
+            let master_sink =
+                Box::new(master_sink.sink_map_err(|e| Box::new(e) as GenericError)) as _;
+            let SessionHandle {
+                session,
+                poll,
+                input,
+                output,
+                mut progress,
+            } = match Session::<SafeGuard>::new(
+                session_bootstrap,
+                master_messages,
+                master_sink,
+                timeout_generator,
+            ) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    error!("session: {}", e);
+                    continue;
+                }
+            };
+            let session_id = session.session_id.clone();
+            let master_out = Arc::pin(Mutex::new(master_out));
+            let session_state = SessionState {
+                session,
+                master_in,
+                master_out,
+            };
+            sessions
+                .write()
+                .await
+                .insert(session_id.clone(), session_state);
+            let mut poll = poll.fuse();
+            let sessions = Arc::clone(&sessions);
+            let mut output = output
+                .for_each(|data| async move { info!("data={:?}", data) })
+                .boxed()
+                .fuse();
+            let poll_progress_or_timeout = async move {
+                loop {
+                    let mut timeout = timeout_generator(Duration::new(300, 0)).fuse();
+                    select! {
+                        _ = progress.next().fuse() => (),
+                        _ = timeout => break,
+                        _ = poll => break,
+                        _ = output => break,
+                    }
+                }
+                info!("session {} is dropped", session_id);
+                sessions.write().await.remove(&session_id);
+            };
+            if let Err(e) = poll_session_tx.send(poll_progress_or_timeout).await {
+                error!("creating session: {}", e);
+                break;
+            }
+        }
+    }
+    .boxed()
+    .fuse();
+    let mut poll_sessions = async move {
+        let mut polls = vec![];
+        loop {
+            let mut poll_all = if polls.is_empty() {
+                select_all(polls.clone()).boxed()
+            } else {
+                pending().boxed()
+            }
+            .fuse();
+            select! {
+                new_poll = poll_session.next() => {
+                    if let Some(new_poll) = new_poll {
+                        polls.push(new_poll.shared())
+                    }
+                },
+                (_, idx, _) = poll_all => {
+                    let _ = polls.remove(idx);
+                },
+            }
+        }
+    }
+    .boxed()
+    .fuse();
+    let service = wire::server_server::ServerServer::new(server);
+    let mut service = Server::builder()
+        .add_service(service)
+        .serve(addr)
+        .boxed()
+        .fuse();
+    select! {
+        r = service => r?,
+        _ = poll_sessions => (),
+        _ = new_sessions => (),
+    }
+    Ok(())
 }

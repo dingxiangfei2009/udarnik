@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     protocol::{RawShard, RawShardId},
-    Redact,
+    GenericError, Redact,
 };
 
 impl<G> From<Message<G>> for wire::Message {
@@ -198,6 +198,12 @@ pub enum WireError {
     Int(#[cause] std::num::TryFromIntError),
     #[fail(display = "invalid socket address: {}", _0)]
     SocketAddr(#[cause] std::net::AddrParseError),
+}
+
+impl From<WireError> for GenericError {
+    fn from(e: WireError) -> GenericError {
+        Box::new(e.compat())
+    }
 }
 
 impl<G> TryFrom<wire::Message> for Message<G> {
@@ -527,6 +533,89 @@ impl TryFrom<wire::StreamRequest> for StreamRequest {
                     stream: u8::try_from(stream)?,
                     window: usize::try_from(window)?,
                 },
+            })
+        } else {
+            Err(WireError::Malformed(<_>::default()))
+        }
+    }
+}
+
+impl TryFrom<wire::BridgeMessage> for BridgeMessage {
+    type Error = WireError;
+    fn try_from(msg: wire::BridgeMessage) -> Result<Self, Self::Error> {
+        use wire::bridge_message::Variant as V;
+        if let wire::BridgeMessage {
+            variant: Some(variant),
+        } = msg
+        {
+            Ok(match variant {
+                V::Payload(wire::Payload {
+                    raw_shard: Some(wire::RawShard { raw_data }),
+                    raw_shard_id:
+                        Some(wire::RawShardId {
+                            id_and_stream,
+                            serial,
+                        }),
+                }) => {
+                    let id = (id_and_stream & 0xff) as u8;
+                    let stream = (id_and_stream >> 8) as u8;
+                    BridgeMessage::Payload {
+                        raw_shard: RawShard { raw_data },
+                        raw_shard_id: RawShardId { id, stream, serial },
+                    }
+                }
+                V::PayloadFeedback(wire::PayloadFeedback {
+                    stream,
+                    inner:
+                        Some(wire::PayloadFeedbackInner {
+                            variant: Some(variant),
+                        }),
+                }) => {
+                    use wire::payload_feedback_inner::Variant as V;
+                    BridgeMessage::PayloadFeedback {
+                        stream: stream.try_into()?,
+                        feedback: match variant {
+                            V::Ok(wire::FeedbackOk {
+                                id_and_quorum,
+                                serial,
+                            }) => {
+                                let id = (id_and_quorum & 0xff) as u8;
+                                let quorum = (id_and_quorum >> 8) as u8;
+                                PayloadFeedback::Ok { serial, id, quorum }
+                            }
+                            V::Duplicate(wire::FeedbackDuplicate {
+                                id_and_quorum,
+                                serial,
+                            }) => {
+                                let id = (id_and_quorum & 0xff) as u8;
+                                let quorum = (id_and_quorum >> 8) as u8;
+                                PayloadFeedback::Ok { serial, id, quorum }
+                            }
+                            V::Full(wire::FeedbackFull { serial, queue }) => {
+                                PayloadFeedback::Full {
+                                    serial,
+                                    queue_len: queue.try_into()?,
+                                }
+                            }
+                            V::OutOfBound(wire::FeedbackOutOfBound {
+                                serial,
+                                start,
+                                queue,
+                            }) => PayloadFeedback::OutOfBound {
+                                serial,
+                                start,
+                                queue_len: queue.try_into()?,
+                            },
+                            V::Malformed(wire::FeedbackMalformed { serial }) => {
+                                PayloadFeedback::Malformed { serial }
+                            }
+                            V::Complete(wire::FeedbackComplete { serial }) => {
+                                PayloadFeedback::Complete { serial }
+                            }
+                        },
+                    }
+                }
+                _ => return Err(WireError::Malformed(<_>::default())),
             })
         } else {
             Err(WireError::Malformed(<_>::default()))
