@@ -8,6 +8,7 @@ use std::{
 };
 
 pub mod common;
+pub mod keyman;
 pub mod protocol;
 pub mod pvss;
 pub mod server;

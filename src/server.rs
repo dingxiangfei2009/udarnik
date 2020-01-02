@@ -6,6 +6,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use async_std::sync::{Arc, Mutex, RwLock};
@@ -24,6 +25,7 @@ use sss::lattice::{
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
+    protocol::signature_hasher,
     state::{
         key_exchange_boris, wire, ClonableSink, Guard, Identity, InitIdentity, KeyExchange,
         Message, Params, Session, SessionBootstrap, SessionError, SessionId, SessionLogOn,
@@ -47,9 +49,8 @@ impl<G> Clone for SessionState<G> {
     }
 }
 
-pub struct UdarnikServer<G, R, S> {
+struct UdarnikServer<G, R, S, TimeGen, Timeout> {
     sessions: Arc<RwLock<HashMap<SessionId, SessionState<G>>>>,
-    sign_db: Arc<BTreeMap<InitIdentity, BTreeMap<Identity, SigningKey>>>,
     verify_db: Arc<BTreeMap<InitIdentity, BTreeMap<Identity, VerificationKey>>>,
     retries: Option<u32>,
     init_db: Arc<BTreeMap<InitIdentity, Init>>,
@@ -60,19 +61,22 @@ pub struct UdarnikServer<G, R, S> {
     boris_data: Vec<u8>,
     seeder: S,
     new_sessions: Sender<SessionBootstrap>,
-    _p: PhantomData<fn() -> R>,
+    timeout_generator: TimeGen,
+    _p: PhantomData<fn() -> (R, Timeout)>,
 }
 
-impl<G, R, S> UdarnikServer<G, R, S>
+impl<G, R, S, TimeGen, Timeout> UdarnikServer<G, R, S, TimeGen, Timeout>
 where
     R: 'static + Send + CryptoRng + RngCore + SeedableRng,
+    TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
+    Timeout: 'static + Send + Sync + Future<Output = ()>,
 {
-    async fn handle_session(
+    fn handle_session(
         &self,
         mut message_stream: impl Stream<Item = Result<Message<G>, SessionError>> + Send + Sync + Unpin,
         mut message_sink: impl Sink<Message<G>, Error = SessionError> + Send + Sync + Unpin,
         h: impl Fn(Vec<u8>) -> Vec<u8>,
-    ) -> Result<(), SessionError> {
+    ) -> impl Future<Output = Result<(), SessionError>> {
         let init_db = Arc::clone(&self.init_db);
         let verify_db = Arc::clone(&self.verify_db);
         let sessions = Arc::clone(&self.sessions);
@@ -80,82 +84,127 @@ where
         let mut challenge = vec![0u8; 256];
         rng.fill_bytes(&mut challenge);
         let orig_challenge = challenge.clone();
-        message_sink
-            .send(Message::SessionLogOnChallenge(challenge))
-            .await?;
-
-        if let Some(m) = message_stream.next().await {
-            match m? {
-                Message::SessionLogOn(SessionLogOn {
-                    session,
-                    init_identity,
-                    identity,
-                    challenge,
-                    signature,
-                }) => {
-                    if challenge != orig_challenge {
-                        return Err(SessionError::SignOn("unexpected message".into()));
-                    }
-                    if let (Some(key), Some(init)) = (
-                        verify_db.get(&init_identity).and_then(|t| t.get(&identity)),
-                        init_db.get(&init_identity),
-                    ) {
-                        let mut challenge = challenge;
-                        challenge.extend(session.as_bytes());
-                        challenge.extend(init_identity.as_bytes());
-                        challenge.extend(identity.as_bytes());
-
-                        if key.verify(&challenge, signature, init, h) {
-                            let SessionState {
-                                master_in,
-                                master_out,
-                                ..
-                            } = {
-                                let sessions = sessions.read().await;
-                                if let Some(state) = sessions.get(&session) {
-                                    if state.session.init_identity == init_identity
-                                        && state.session.anke_identity == identity
-                                    {
-                                        SessionState::clone(state)
+        let timeout_generator = self.timeout_generator.clone();
+        async move {
+            message_sink
+                .send(Message::SessionLogOnChallenge(challenge))
+                .await?;
+            if let Some(m) = message_stream.next().await {
+                match m? {
+                    Message::SessionLogOn(logon) => {
+                        if logon.challenge != orig_challenge {
+                            return Err(SessionError::SignOn("unexpected message".into()));
+                        }
+                        if let (Some(key), Some(init)) = (
+                            verify_db
+                                .get(&logon.init_identity)
+                                .and_then(|t| t.get(&logon.identity)),
+                            init_db.get(&logon.init_identity),
+                        ) {
+                            if key.verify(&logon.generate_body(), logon.signature, init, h) {
+                                let SessionState {
+                                    mut master_in,
+                                    master_out,
+                                    ..
+                                } = {
+                                    let sessions = sessions.read().await;
+                                    if let Some(state) = sessions.get(&logon.session) {
+                                        if state.session.init_identity == logon.init_identity
+                                            && state.session.anke_identity == logon.identity
+                                        {
+                                            SessionState::clone(state)
+                                        } else {
+                                            return Err(SessionError::SignOn(
+                                                "unexpected message".into(),
+                                            ));
+                                        }
                                     } else {
                                         return Err(SessionError::SignOn(
                                             "unexpected message".into(),
                                         ));
                                     }
-                                } else {
-                                    return Err(SessionError::SignOn("unexpected message".into()));
+                                };
+                                let (progress_tx, mut progress_rx) = channel(4096);
+                                let master_in = {
+                                    let mut progress = progress_tx.clone();
+                                    async move {
+                                        while let Some(msg) = message_stream.next().await {
+                                            master_in
+                                                .send(msg?)
+                                                .map_err(|e| {
+                                                    SessionError::BrokenPipe(
+                                                        Box::new(e),
+                                                        <_>::default(),
+                                                    )
+                                                })
+                                                .await?;
+                                            progress.send(()).await.map_err(|e| {
+                                                SessionError::BrokenPipe(
+                                                    Box::new(e),
+                                                    <_>::default(),
+                                                )
+                                            })?;
+                                        }
+                                        Ok::<_, SessionError>(())
+                                    }
+                                };
+
+                                let master_out = {
+                                    let mut progress = progress_tx;
+                                    async move {
+                                        while let Some(msg) =
+                                            { master_out.lock().await.next() }.await
+                                        {
+                                            message_sink.send(msg).await?;
+                                            progress.send(()).await.map_err(|e| {
+                                                SessionError::BrokenPipe(
+                                                    Box::new(e),
+                                                    <_>::default(),
+                                                )
+                                            })?;
+                                        }
+                                        Ok::<_, SessionError>(())
+                                    }
+                                };
+                                let progress = async {
+                                    loop {
+                                        let mut timeout = Pin::from(Box::new(timeout_generator(
+                                            Duration::new(300, 0),
+                                        ))
+                                            as Box<dyn Future<Output = ()> + Send + Sync>)
+                                        .fuse();
+                                        select! {
+                                            _ = progress_rx.next() => (),
+                                            _ = timeout => break
+                                        }
+                                    }
+                                };
+                                let mut master_in = Pin::from(Box::new(master_in)
+                                    as Box<
+                                        dyn Future<Output = Result<(), SessionError>> + Send + Sync,
+                                    >)
+                                .fuse();
+                                let mut master_out = Pin::from(Box::new(master_out)
+                                    as Box<
+                                        dyn Future<Output = Result<(), SessionError>> + Send + Sync,
+                                    >)
+                                .fuse();
+                                let mut progress = Pin::from(Box::new(progress)
+                                    as Box<dyn Future<Output = ()> + Send + Sync>)
+                                .fuse();
+                                select! {
+                                    r = master_in => r?,
+                                    r = master_out => r?,
+                                    _ = progress => (),
                                 }
-                            };
-                            let master_in = message_stream.forward(master_in.sink_map_err(|e| {
-                                SessionError::BrokenPipe(Box::new(e), <_>::default())
-                            }));
-                            let master_out = async {
-                                while let Some(msg) = { master_out.lock().await.next() }.await {
-                                    message_sink.send(msg).await?
-                                }
-                                Ok::<_, SessionError>(())
-                            };
-                            let mut master_in = Pin::from(Box::new(master_in)
-                                as Box<
-                                    dyn Future<Output = Result<(), SessionError>> + Send + Sync,
-                                >)
-                            .fuse();
-                            let mut master_out = Pin::from(Box::new(master_out)
-                                as Box<
-                                    dyn Future<Output = Result<(), SessionError>> + Send + Sync,
-                                >)
-                            .fuse();
-                            select! {
-                                r = master_in => r?,
-                                r = master_out => r?,
                             }
                         }
                     }
+                    _ => return Err(SessionError::SignOn("unexpected message".into())),
                 }
-                _ => return Err(SessionError::SignOn("unexpected message".into())),
             }
+            Ok(())
         }
-        Ok(())
     }
 }
 
@@ -210,12 +259,15 @@ impl<T, E> Stream for TryFutureStream<T, E> {
 impl<T, E> Unpin for TryFutureStream<T, E> {}
 
 #[tonic::async_trait]
-impl<G, R, S> wire::server_server::Server for UdarnikServer<G, R, S>
+impl<G, R, S, TimeGen, Timeout> wire::server_server::Server
+    for UdarnikServer<G, R, S, TimeGen, Timeout>
 where
-    G: 'static + Send + Sync + Guard<Params> + for<'a> From<&'a [u8]> + Debug,
+    G: 'static + Send + Sync + Guard<Params, ()> + for<'a> From<&'a [u8]> + Debug,
     G::Error: Debug,
-    R: 'static + Send + SeedableRng + RngCore + CryptoRng,
+    R: 'static + Send + Sync + SeedableRng + RngCore + CryptoRng,
     S: 'static + Send + Sync + Clone + Fn(&[u8]) -> R::Seed,
+    TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
+    Timeout: 'static + Future<Output = ()> + Send + Sync,
 {
     type KeyExchangeStream =
         Pin<Box<dyn 'static + Send + Sync + Stream<Item = Result<wire::Message, Status>>>>;
@@ -273,16 +325,74 @@ where
         &self,
         request: Request<Streaming<wire::Message>>,
     ) -> Result<Response<Self::ClientStream>, Status> {
-        let request = request.into_inner().and_then(|m| {
-            async { Message::<G>::try_from(m).map_err(|e| Status::aborted(format!("{}", e))) }
-        });
-        let request =
-            Pin::from(Box::new(request)
-                as Box<
-                    dyn Stream<Item = Result<Message<G>, Status>> + Send + Sync,
-                >);
-        todo!()
+        let request = request
+            .into_inner()
+            .and_then(|m| {
+                {
+                    async {
+                        Message::<G>::try_from(m).map_err(|e| Status::aborted(format!("{}", e)))
+                    }
+                }
+            })
+            .map_err(|e| {
+                SessionError::Stream(Box::new(e.compat()) as GenericError, <_>::default())
+            });
+        let request = Pin::from(Box::new(request)
+            as Box<dyn Stream<Item = Result<Message<G>, SessionError>> + Send + Sync>);
+        let (message_sink, stream) = channel(4096);
+        let complete = self.handle_session(
+            request,
+            message_sink.sink_map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default())),
+            signature_hasher,
+        );
+        let stream = TryFutureStream {
+            complete: Some(Box::new(Pin::from(Box::new(complete)))),
+            stream: Some(Box::new(stream.map(wire::Message::from).map(Ok))),
+        };
+        Ok(Response::new(Box::pin(
+            stream.map_err(|e| Status::aborted(format!("{}", e))),
+        )))
     }
 }
 
-pub async fn server(addr: SocketAddr) {}
+pub struct ServerBootstrap {
+    addr: SocketAddr,
+    allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
+    anke_data: Vec<u8>,
+    boris_data: Vec<u8>,
+    identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
+    identity_sequence: Vec<(InitIdentity, Identity)>,
+    init_db: Arc<BTreeMap<InitIdentity, Init>>,
+    retries: Option<u32>,
+    verify_db: BTreeMap<InitIdentity, BTreeMap<Identity, VerificationKey>>,
+}
+
+pub async fn server(bootstrap: ServerBootstrap) {
+    let ServerBootstrap {
+        addr,
+        allowed_identities,
+        anke_data,
+        boris_data,
+        identity_db,
+        identity_sequence,
+        init_db,
+        retries,
+        verify_db,
+    } = bootstrap;
+    // let (new_sessions_tx, new_sessions) = channel(32);
+    // let server = UdarnikServer {
+    //     _p: PhantomData,
+    //     allowed_identities,
+    //     anke_data,
+    //     boris_data,
+    //     identity_db,
+    //     identity_sequence,
+    //     init_db,
+    //     new_sessions: new_sessions_tx,
+    //     retries,
+    //     seeder: signature_hasher,
+    //     sessions: <_>::default(),
+    //     verify_db: Arc::new(verify_db),
+    //     timeout_generator: async_std::task::sleep,
+    // };
+}

@@ -809,6 +809,10 @@ impl SendQueue {
     }
 }
 
+pub fn signature_hasher(input: Vec<u8>) -> Vec<u8> {
+    sha3::Sha3_512::digest(&input).to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

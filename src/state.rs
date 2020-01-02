@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    convert::{TryFrom, TryInto},
     fmt::Debug,
     marker::PhantomData,
     net::SocketAddr,
@@ -14,7 +15,7 @@ use aead::{Aead, NewAead, Payload};
 use aes_gcm_siv::Aes256GcmSiv;
 use async_std::sync::{Arc, Mutex, RwLock};
 use dyn_clone::{clone_box, DynClone};
-use failure::{Backtrace, Error as TopError, Fail};
+use failure::{err_msg, Backtrace, Error as TopError, Fail};
 use futures::{
     channel::mpsc::{channel, unbounded, Receiver, Sender, UnboundedReceiver, UnboundedSender},
     future::BoxFuture,
@@ -26,6 +27,7 @@ use futures::{
 use generic_array::GenericArray;
 use log::{error, info};
 use lru::LruCache;
+use prost::Message as ProstMessage;
 use rand::{rngs::StdRng, seq::IteratorRandom, CryptoRng, RngCore, SeedableRng};
 use sha3::Digest;
 use sss::lattice::{
@@ -54,22 +56,21 @@ pub struct InitIdentity(String);
 #[derive(From, Hash, PartialEq, PartialOrd, Eq, Ord, Clone, Debug, Deref)]
 pub struct Identity(String);
 
-pub trait Guard<P> {
+pub trait Guard<P, T> {
     type Error;
-    type Tag;
     fn encode(&self, payload: P) -> Vec<u8>;
-    fn encode_with_tag(&self, payload: P, tag: &Self::Tag) -> Vec<u8>;
+    fn encode_with_tag(&self, payload: P, tag: &T) -> Vec<u8>;
     fn decode(&self, data: &[u8]) -> Result<P, Self::Error>;
-    fn decode_with_tag(&self, data: &[u8], tag: &Self::Tag) -> Result<P, Self::Error>;
+    fn decode_with_tag(&self, data: &[u8], tag: &T) -> Result<P, Self::Error>;
 }
 
 #[derive(Debug)]
-pub struct Pomerium<Guard, Payload> {
+pub struct Pomerium<Guard, Payload, Tag> {
     pub data: Vec<u8>,
-    _p: PhantomData<fn() -> (Guard, Payload)>,
+    _p: PhantomData<fn() -> (Guard, Payload, Tag)>,
 }
 
-impl<G, P> Pomerium<G, P> {
+impl<G, P, T> Pomerium<G, P, T> {
     pub fn from_raw(data: Vec<u8>) -> Self {
         Self {
             data,
@@ -78,9 +79,9 @@ impl<G, P> Pomerium<G, P> {
     }
 }
 
-impl<G, P> Pomerium<G, P>
+impl<G, P, T> Pomerium<G, P, T>
 where
-    G: Guard<P>,
+    G: Guard<P, T>,
 {
     pub fn encode(guard: &G, payload: P) -> Self {
         Pomerium {
@@ -93,14 +94,14 @@ where
         guard.decode(&self.data)
     }
 
-    pub fn encode_with_tag(guard: &G, payload: P, tag: &G::Tag) -> Self {
+    pub fn encode_with_tag(guard: &G, payload: P, tag: &T) -> Self {
         Pomerium {
             data: guard.encode_with_tag(payload, tag),
             _p: PhantomData,
         }
     }
 
-    pub fn decode_with_tag(self, guard: &G, tag: &G::Tag) -> Result<P, G::Error> {
+    pub fn decode_with_tag(self, guard: &G, tag: &T) -> Result<P, G::Error> {
         guard.decode_with_tag(&self.data, tag)
     }
 }
@@ -142,7 +143,7 @@ pub struct BridgeRetract(BridgeId);
 #[derive(Debug)]
 pub enum Message<G> {
     KeyExchange(KeyExchangeMessage),
-    Params(Redact<Pomerium<G, Params>>),
+    Params(Redact<Pomerium<G, Params, ()>>),
     Client(ClientMessage<G>),
     Session(SessionId),
     SessionLogOnChallenge(Vec<u8>),
@@ -158,9 +159,19 @@ pub struct SessionLogOn {
     pub signature: Signature,
 }
 
+impl SessionLogOn {
+    pub fn generate_body(&self) -> Vec<u8> {
+        let mut body = self.challenge.clone();
+        body.extend(self.session.as_bytes());
+        body.extend(self.init_identity.as_bytes());
+        body.extend(self.identity.as_bytes());
+        body
+    }
+}
+
 #[derive(Debug)]
 pub struct ClientMessage<G> {
-    variant: Redact<Pomerium<G, ClientMessageVariant>>,
+    variant: Redact<Pomerium<G, ClientMessageVariant, (SessionId, u64)>>,
     serial: u64,
     session: SessionId,
 }
@@ -237,7 +248,7 @@ pub async fn key_exchange_anke<R, G, MsgStream, MsgSink, MsgStreamErr>(
 ) -> Result<SessionBootstrap, KeyExchangeError<G>>
 where
     R: RngCore + CryptoRng + SeedableRng,
-    G: 'static + Debug + Guard<Params> + for<'a> From<&'a [u8]>,
+    G: 'static + Debug + Guard<Params, ()> + for<'a> From<&'a [u8]>,
     G::Error: Debug,
     MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
     MsgSink: Sink<Message<G>> + Unpin,
@@ -390,7 +401,7 @@ pub async fn key_exchange_boris<R, G, MsgStream, MsgSink, MsgStreamErr>(
 ) -> Result<SessionBootstrap, KeyExchangeError<G>>
 where
     R: RngCore + CryptoRng + SeedableRng,
-    G: 'static + Debug + Guard<Params> + for<'a> From<&'a [u8]>,
+    G: 'static + Debug + Guard<Params, ()> + for<'a> From<&'a [u8]>,
     G::Error: Debug,
     MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
     MsgSink: Sink<Message<G>> + Unpin,
@@ -574,8 +585,6 @@ pub struct Session<G> {
 pub struct SessionStream {
     send_queue: Arc<SendQueue>,
     receive_queue: Arc<ReceiveQueue>,
-    shard_state: ShardState,
-    task_notifiers: Arc<RwLock<BTreeMap<u64, TaskProgressNotifier>>>,
     bridges_in_tx: Box<dyn ClonableSink<BridgeMessage, SessionError> + Send + Sync + Unpin>,
     input_tx: Sender<Vec<u8>>,
 }
@@ -656,8 +665,8 @@ where
         + Send
         + Sync
         + for<'a> From<&'a Params>
-        + Guard<ClientMessageVariant, Error = GenericError, Tag = (SessionId, u64)>
-        + Guard<BridgeMessage, Error = GenericError>,
+        + Guard<ClientMessageVariant, (SessionId, u64), Error = GenericError>
+        + Guard<BridgeMessage, (), Error = GenericError>,
 {
     pub fn new<Timeout: 'static + Send + Future<Output = ()>>(
         session_bootstrap: SessionBootstrap,
@@ -1725,9 +1734,7 @@ where
             SessionStream {
                 send_queue,
                 receive_queue,
-                shard_state,
                 bridges_in_tx,
-                task_notifiers,
                 input_tx,
             },
             poll_all,
@@ -1745,6 +1752,8 @@ pub enum SessionError {
     Codec(#[cause] CodecError),
     #[fail(display = "token: {:?}", _0)]
     SignOn(String),
+    #[fail(display = "stream: {}", _0)]
+    Stream(GenericError, Backtrace),
 }
 
 #[derive(Default)]
@@ -1753,8 +1762,9 @@ struct Counter {
 }
 
 pub struct Bridge<G> {
-    pub tx: Box<dyn Send + ClonableSink<Pomerium<G, BridgeMessage>, GenericError> + Unpin>,
-    pub rx: Box<dyn Send + Stream<Item = Result<Pomerium<G, BridgeMessage>, GenericError>> + Unpin>,
+    pub tx: Box<dyn Send + ClonableSink<Pomerium<G, BridgeMessage, ()>, GenericError> + Unpin>,
+    pub rx:
+        Box<dyn Send + Stream<Item = Result<Pomerium<G, BridgeMessage, ()>, GenericError>> + Unpin>,
     pub poll: Box<dyn Send + Future<Output = ()> + Unpin>,
 }
 
@@ -1814,4 +1824,129 @@ pub enum PayloadFeedback {
     Complete {
         serial: u64,
     },
+}
+
+struct SafeGuard {
+    aead: Aes256GcmSiv,
+}
+
+impl SafeGuard {
+    fn derive_key(input: &[u8]) -> [u8; 32] {
+        let mut key = [0; 32];
+        for chunk in input.chunks(32) {
+            for (k, c) in key.iter_mut().zip(chunk.iter().copied()) {
+                *k ^= c;
+            }
+        }
+        key
+    }
+    fn new(key: &[u8]) -> Self {
+        let key = SafeGuard::derive_key(key);
+        Self {
+            aead: Aes256GcmSiv::new(*GenericArray::from_slice(&key)),
+        }
+    }
+    fn encode_message<P: ProstMessage>(payload: P) -> Vec<u8> {
+        let mut buf = vec![];
+        payload.encode(&mut buf).expect("sufficient space");
+        buf
+    }
+    fn decode_message<P: ProstMessage + Default>(data: Vec<u8>) -> Result<P, GenericError> {
+        P::decode(data).map_err(|e| Box::new(e) as GenericError)
+    }
+}
+
+impl<'a> From<&'a [u8]> for SafeGuard {
+    fn from(key: &'_ [u8]) -> Self {
+        Self::new(key)
+    }
+}
+
+trait Tag {
+    fn into_bytes(&self) -> Vec<u8>;
+}
+
+impl Tag for () {
+    fn into_bytes(&self) -> Vec<u8> {
+        vec![]
+    }
+}
+
+impl Tag for (SessionId, u64) {
+    fn into_bytes(&self) -> Vec<u8> {
+        let mut buf = vec![];
+        buf.extend(self.0.as_bytes());
+        buf.extend(&self.1.to_le_bytes());
+        buf
+    }
+}
+
+trait ProstMessageMapping: Sized {
+    type MapTo: ProstMessage + Default + From<Self> + TryInto<Self>;
+    type Tag: Tag;
+}
+
+impl ProstMessageMapping for ClientMessageVariant {
+    type MapTo = wire::ClientMessageVariant;
+    type Tag = ();
+}
+
+impl<P, T> Guard<P, T> for SafeGuard
+where
+    P: ProstMessageMapping<Tag = T>,
+    T: Tag,
+    <P::MapTo as TryInto<P>>::Error: 'static + Into<GenericError> + Send + Sync + std::error::Error,
+{
+    type Error = GenericError;
+    fn encode(&self, payload: P) -> Vec<u8> {
+        let mut nonce = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let payload = <P as ProstMessageMapping>::MapTo::from(payload);
+        let payload = Self::encode_message(payload);
+        let mut buf = self
+            .aead
+            .encrypt(GenericArray::from_slice(&nonce), &payload[..])
+            .expect("correct key sizes and bounds");
+        buf.splice(..0, nonce.to_vec());
+        buf
+    }
+    fn encode_with_tag(&self, payload: P, tag: &T) -> Vec<u8> {
+        let mut nonce = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let payload = <P as ProstMessageMapping>::MapTo::from(payload);
+        let payload = Self::encode_message(payload);
+        let mut buf = self
+            .aead
+            .encrypt(
+                GenericArray::from_slice(&nonce),
+                Payload {
+                    msg: &payload,
+                    aad: &tag.into_bytes(),
+                },
+            )
+            .expect("correct key sizes and bounds");
+        buf.splice(..0, nonce.to_vec());
+        buf
+    }
+    fn decode(&self, data: &[u8]) -> Result<P, Self::Error> {
+        if data.len() < 12 {
+            return Err(Box::new(err_msg("truncated data").compat()));
+        }
+        let mut nonce = [0u8; 12];
+        nonce[..].copy_from_slice(&data[..12]);
+        let (_, data) = data.split_at(12);
+        let buf = self
+            .aead
+            .decrypt(GenericArray::from_slice(&nonce), data)
+            .map_err(|e| Box::new(err_msg(format!("decode: {:?}", e)).compat()))?;
+        let payload: <P as ProstMessageMapping>::MapTo = Self::decode_message(buf)?;
+        Ok(payload.try_into()?)
+    }
+    fn decode_with_tag(
+        &self,
+        data: &[u8],
+        tag: &T,
+    ) -> Result<P, Self::Error> {
+        todo!()
+    }
 }
