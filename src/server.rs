@@ -28,6 +28,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     protocol::signature_hasher,
+    reference_seeder_chacha,
     state::{
         key_exchange_boris, wire, Guard, Identity, InitIdentity, KeyExchange, Message, Params,
         SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle, SessionId,
@@ -261,7 +262,7 @@ impl<T, E> Stream for TryFutureStream<T, E> {
 impl<T, E> Unpin for TryFutureStream<T, E> {}
 
 #[tonic::async_trait]
-impl<G, R, S, TimeGen, Timeout> wire::server_server::Server
+impl<G, R, S, TimeGen, Timeout> wire::master_server::Master
     for Pin<Arc<UdarnikServer<G, R, S, TimeGen, Timeout>>>
 where
     G: 'static + Send + Sync + Guard<Params, ()> + for<'a> From<&'a [u8]> + Debug,
@@ -385,16 +386,7 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
     } = bootstrap;
     let (new_sessions_tx, mut new_sessions) = channel(32);
     let sessions = Arc::default();
-    let seeder = |input: &[u8]| {
-        use sha3::digest::Digest;
-        let mut s = [0; 32];
-        for chunks in sha3::Sha3_512::digest(input).chunks(32) {
-            for (s, c) in s.iter_mut().zip(chunks) {
-                *s ^= c;
-            }
-        }
-        s
-    };
+    let seeder = reference_seeder_chacha;
     let server: UdarnikServer<SafeGuard, rand_chacha::ChaChaRng, _, _, ServiceFuture<()>> =
         UdarnikServer {
             _p: PhantomData,
@@ -502,7 +494,7 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
     }
     .boxed()
     .fuse();
-    let service = wire::server_server::ServerServer::new(server);
+    let service = wire::master_server::MasterServer::new(server);
     let mut service = Server::builder()
         .add_service(service)
         .serve(addr)

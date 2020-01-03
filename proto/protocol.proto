@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package protocol;
 
-service Server {
+service Master {
   rpc KeyExchange(stream Message) returns (stream Message);
   rpc Client(stream Message) returns (stream Message);
 }

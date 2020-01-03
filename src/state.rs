@@ -1174,7 +1174,7 @@ where
         let mut poll_master_messages = master_messages
             .map(Ok)
             .try_for_each(|request| {
-                let self_ = &self;
+                let this = &self;
                 let stream_polls = &stream_polls;
                 let bridge_polls = &bridge_polls;
                 let bridges_in_tx = bridges_in_tx.clone();
@@ -1190,11 +1190,11 @@ where
                             variant: Redact(variant),
                         }) => {
                             let tag = (session.clone(), serial);
-                            match variant.decode_with_tag(&self_.inbound_guard, &tag) {
+                            match variant.decode_with_tag(&this.inbound_guard, &tag) {
                                 Ok(variant) => {
                                     // prevent replay
-                                    if let Err(local_serial) = self_.assert_valid_serial(serial) {
-                                        return self_
+                                    if let Err(local_serial) = this.assert_valid_serial(serial) {
+                                        return this
                                             .as_ref()
                                             .notify_serial(local_serial, true)
                                             .await;
@@ -1203,11 +1203,10 @@ where
                                         ClientMessageVariant::BridgeNegotiate(negotiation) => {
                                             match negotiation {
                                                 BridgeNegotiationMessage::ProposeAsk => {
-                                                    self_.as_ref().answer_ask_proposal().await?
+                                                    this.as_ref().answer_ask_proposal().await?
                                                 }
                                                 BridgeNegotiationMessage::Ask(proposals) => {
-                                                    self_
-                                                        .as_ref()
+                                                    this.as_ref()
                                                         .apply_proposal(
                                                             &proposals,
                                                             &mut *bridge_polls.write().await,
@@ -1226,7 +1225,7 @@ where
                                                 BridgeNegotiationMessage::AskProposal(
                                                     proposals,
                                                 ) => {
-                                                    let asks = self_
+                                                    let asks = this
                                                         .as_ref()
                                                         .apply_proposal(
                                                             &proposals,
@@ -1235,16 +1234,15 @@ where
                                                             &mut *bridges_out.write().await,
                                                         )
                                                         .await;
-                                                    self_.as_ref().ask_bridge(asks).await?
+                                                    this.as_ref().ask_bridge(asks).await?
                                                 }
                                                 BridgeNegotiationMessage::QueryHealth => {
-                                                    self_
-                                                        .as_ref()
+                                                    this.as_ref()
                                                         .answer_bridge_health_query()
                                                         .await?
                                                 }
                                                 BridgeNegotiationMessage::Health(health) => {
-                                                    let mut counters = self_
+                                                    let mut counters = this
                                                         .send_success_counter
                                                         .counters
                                                         .write()
@@ -1260,7 +1258,7 @@ where
                                         }
                                         ClientMessageVariant::Stream(request) => match request {
                                             StreamRequest::Reset { stream, window } => {
-                                                let (session_stream, poll) = self_.new_stream(
+                                                let (session_stream, poll) = this.new_stream(
                                                     stream,
                                                     window,
                                                     bridges_out_tx.clone(),
@@ -1273,7 +1271,7 @@ where
                                             }
                                         },
                                         ClientMessageVariant::Ok | ClientMessageVariant::Err => {
-                                            self_.update_remote_serial(serial);
+                                            this.update_remote_serial(serial);
                                             return progress.send(()).await.map_err(|e| {
                                                 SessionError::BrokenPipe(
                                                     Box::new(e),
@@ -1282,9 +1280,8 @@ where
                                             });
                                         }
                                     }
-                                    self_
-                                        .as_ref()
-                                        .notify_serial(self_.update_local_serial(serial), false)
+                                    this.as_ref()
+                                        .notify_serial(this.update_local_serial(serial), false)
                                         .await?;
                                     progress.send(()).await.map_err(|e| {
                                         SessionError::BrokenPipe(Box::new(e), <_>::default())

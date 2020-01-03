@@ -6,7 +6,9 @@ use std::{convert::TryFrom, fs::File, io::Write, path::PathBuf};
 use failure::Fail;
 use sss::lattice::{keygen, Init, PrivateKey, SigningKey};
 use structopt::StructOpt;
-use udarnik::keyman::{Error as KeyError, RawInit, RawPrivateKey, RawPublicKey};
+use udarnik::keyman::{
+    Error as KeyError, RawInit, RawPrivateKey, RawPublicKey, RawSigningKey, RawVerificationKey,
+};
 
 #[derive(Debug, StructOpt)]
 enum Opt {
@@ -76,6 +78,8 @@ fn main() -> Result<(), Error> {
             let prikey = PrivateKey::try_from(prikey)?;
             let sign_key = SigningKey::from_private_key(&prikey);
             let verify_key = sign_key.verification_key(&init);
+            let sign_key = RawSigningKey::from(sign_key);
+            let verify_key = RawVerificationKey::from(verify_key);
             write!(
                 File::create(signing)?,
                 "{}",
