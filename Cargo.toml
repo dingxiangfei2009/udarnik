@@ -50,7 +50,7 @@ version = "0.5"
 
 [dependencies.async-std]
 version = "1.0"
-features = ["attributes"]
+features = ["attributes", "unstable"]
 
 [dependencies.tokio]
 version = "0.2.0"
@@ -58,7 +58,7 @@ features = ["macros", "io-driver", "time", "rt-threaded"]
 
 [dependencies.sss]
 git = "https://github.com/dingxiangfei2009/sss"
-rev = "695a93525b6fb7bc1da8012bfb58a87187d47e8c"
+rev = "9e1e991e955c8be8f0a5bbcbf442610efbae6dc9"
 
 [build-dependencies]
 prost-build = "0.5"

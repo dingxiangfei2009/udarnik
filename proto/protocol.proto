@@ -79,8 +79,9 @@ message BorisPart {
 
 message BridgeMessage {
   oneof variant {
-    Payload payload = 1;
-    PayloadFeedback payload_feedback = 2;
+    string id = 1;
+    Payload payload = 2;
+    PayloadFeedback payload_feedback = 3;
   }
 }
 

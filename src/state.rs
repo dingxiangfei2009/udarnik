@@ -51,6 +51,7 @@ pub mod wire {
 }
 
 mod convert;
+pub use convert::WireError;
 
 #[derive(From, Hash, PartialEq, PartialOrd, Eq, Ord, Clone, Debug, Deref)]
 pub struct InitIdentity(String);
@@ -161,12 +162,25 @@ pub struct SessionLogOn {
 }
 
 impl SessionLogOn {
-    pub fn generate_body(&self) -> Vec<u8> {
-        let mut body = self.challenge.clone();
-        body.extend(self.session.as_bytes());
-        body.extend(self.init_identity.as_bytes());
-        body.extend(self.identity.as_bytes());
+    pub fn generate_body(
+        init_identity: &InitIdentity,
+        identity: &Identity,
+        session: &SessionId,
+        challenge: &[u8],
+    ) -> Vec<u8> {
+        let mut body = challenge.to_vec();
+        body.extend(session.as_bytes());
+        body.extend(init_identity.as_bytes());
+        body.extend(identity.as_bytes());
         body
+    }
+    pub fn recover_body(&self) -> Vec<u8> {
+        Self::generate_body(
+            &self.init_identity,
+            &self.identity,
+            &self.session,
+            &self.challenge,
+        )
     }
 }
 
@@ -202,9 +216,9 @@ pub enum KeyExchangeMessage {
 }
 
 #[derive(Fail, Debug, From)]
-pub enum KeyExchangeError<G: 'static + Debug> {
+pub enum KeyExchangeError {
     #[fail(display = "unknown message received")]
-    UnknownMessage(Message<G>, Backtrace),
+    UnknownMessage(Backtrace),
     #[fail(display = "message decoding: {}", _0)]
     Message(#[cause] TopError, Backtrace),
     #[fail(display = "sending message: {}", _0)]
@@ -246,7 +260,7 @@ pub async fn key_exchange_anke<R, G, MsgStream, MsgSink, MsgStreamErr>(
     message_sink: MsgSink,
     seeder: impl Fn(&[u8]) -> R::Seed,
     params: Params,
-) -> Result<SessionBootstrap, KeyExchangeError<G>>
+) -> Result<SessionBootstrap, KeyExchangeError>
 where
     R: RngCore + CryptoRng + SeedableRng,
     G: 'static + Debug + Guard<Params, ()> + for<'a> From<&'a [u8]>,
@@ -297,7 +311,7 @@ where
                 }
                 Message::KeyExchange(KeyExchangeMessage::Reject(ident_, init_ident_))
                     if ident_ == ident && init_ident_ == init_ident => {}
-                m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+                _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
             },
         }
         if let Some(countdown) = &mut retries {
@@ -329,7 +343,7 @@ where
                         }
                     }
                 }
-                m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+                _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
             },
         }
         if let Some(countdown) = &mut retries {
@@ -370,7 +384,7 @@ where
                 v.extend(shared_key.iter().copied());
                 v.into_vec()
             }
-            m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+            _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
         },
     };
     let outbound_guard = G::from(&shared_key);
@@ -380,7 +394,7 @@ where
         None => return Err(KeyExchangeError::Terminated(<_>::default())),
         Some(m) => match m? {
             Message::Session(session_id) => session_id,
-            m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+            _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
         },
     };
     Ok(SessionBootstrap {
@@ -399,7 +413,7 @@ pub async fn key_exchange_boris<R, G, MsgStream, MsgSink, MsgStreamErr>(
     message_sink: MsgSink,
     seeder: impl Fn(&[u8]) -> R::Seed,
     session_id: SessionId,
-) -> Result<SessionBootstrap, KeyExchangeError<G>>
+) -> Result<SessionBootstrap, KeyExchangeError>
 where
     R: RngCore + CryptoRng + SeedableRng,
     G: 'static + Debug + Guard<Params, ()> + for<'a> From<&'a [u8]>,
@@ -444,7 +458,7 @@ where
                         }
                     }
                 }
-                m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+                _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
             },
         }
         if let Some(countdown) = &mut retries {
@@ -486,7 +500,7 @@ where
                 }
                 Message::KeyExchange(KeyExchangeMessage::Reject(ident_, init_ident_))
                     if ident_ == ident && init_ident_ == init_ident => {}
-                m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+                _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
             },
         }
         if let Some(countdown) = &mut retries {
@@ -505,7 +519,7 @@ where
         None => return Err(KeyExchangeError::Terminated(<_>::default())),
         Some(m) => match m? {
             Message::KeyExchange(KeyExchangeMessage::AnkePart(Redact(part))) => part,
-            m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+            _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
         },
     };
     let (boris_part_mix, _, _) = SessionKeyPartMix::<Boris>::generate::<R, _, _>(
@@ -538,7 +552,7 @@ where
                 error!("key_exchange: params: {:?}", e);
                 KeyExchangeError::NoParams
             })?,
-            m => return Err(KeyExchangeError::UnknownMessage(m, <_>::default())),
+            _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
         },
     };
     message_sink
@@ -1103,6 +1117,7 @@ where
                         let stream = match &inbound {
                             BridgeMessage::PayloadFeedback { stream, .. } => *stream,
                             BridgeMessage::Payload { raw_shard_id, .. } => raw_shard_id.stream,
+                            _ => return,
                         };
                         let report = if let BridgeMessage::Payload {
                             raw_shard_id: RawShardId { stream, serial, id },
@@ -1794,6 +1809,7 @@ pub enum BridgeMessage {
         stream: u8,
         feedback: PayloadFeedback,
     },
+    Id(String),
 }
 
 pub enum PayloadFeedback {

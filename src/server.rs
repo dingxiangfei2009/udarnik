@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 
-use async_std::sync::{Arc, Mutex, RwLock};
+use async_std::{
+    sync::{Arc, Mutex, RwLock},
+    task::sleep,
+};
 use failure::Fail;
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
@@ -31,8 +34,9 @@ use crate::{
     reference_seeder_chacha,
     state::{
         key_exchange_boris, wire, Guard, Identity, InitIdentity, KeyExchange, Message, Params,
-        SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle, SessionId,
+        SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle, SessionId, SessionLogOn,
     },
+    utils::TryFutureStream,
     GenericError,
 };
 
@@ -104,7 +108,7 @@ where
                                 .and_then(|t| t.get(&logon.identity)),
                             init_db.get(&logon.init_identity),
                         ) {
-                            if key.verify(&logon.generate_body(), logon.signature, init, h) {
+                            if key.verify(&logon.recover_body(), logon.signature, init, h) {
                                 let SessionState {
                                     mut master_in,
                                     master_out,
@@ -210,56 +214,6 @@ where
         }
     }
 }
-
-struct TryFutureStream<T, E> {
-    complete: Option<Box<dyn Send + Sync + Unpin + Future<Output = Result<(), E>>>>,
-    stream: Option<Box<dyn Send + Sync + Unpin + Stream<Item = Result<T, E>>>>,
-}
-
-impl<T, E> TryFutureStream<T, E> {
-    unsafe_pinned!(complete: Option<Box<dyn Send + Sync + Unpin + Future<Output = Result<(), E>>>>);
-    unsafe_pinned!(stream: Option<Box<dyn Send + Sync + Unpin + Stream<Item = Result<T, E>>>>);
-}
-
-impl<T, E> Stream for TryFutureStream<T, E> {
-    type Item = Result<T, E>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        use Poll::*;
-
-        let stream = self
-            .as_mut()
-            .stream()
-            .as_pin_mut()
-            .map(|stream| stream.poll_next(cx));
-        let complete = self
-            .as_mut()
-            .complete()
-            .as_pin_mut()
-            .map(|complete| complete.poll(cx));
-        match (stream, complete) {
-            (Some(Pending), Some(Pending)) => Pending,
-            (_, Some(Ready(Ok(_)))) => {
-                *self.as_mut().stream() = None;
-                *self.as_mut().complete() = None;
-                Ready(None)
-            }
-            (_, Some(Ready(Err(e)))) => {
-                *self.as_mut().stream() = None;
-                *self.as_mut().complete() = None;
-                Ready(Some(Err(e)))
-            }
-            (_, None) => Ready(None),
-            (Some(Ready(Some(item))), Some(_)) => Ready(Some(item)),
-            (Some(Ready(None)), Some(_)) => {
-                *self.as_mut().stream() = None;
-                Pending
-            }
-            _ => Ready(None),
-        }
-    }
-}
-
-impl<T, E> Unpin for TryFutureStream<T, E> {}
 
 #[tonic::async_trait]
 impl<G, R, S, TimeGen, Timeout> wire::master_server::Master
@@ -410,7 +364,7 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
     let (mut poll_session_tx, mut poll_session) = channel(32);
     let mut new_sessions = async {
         while let Some(session_bootstrap) = new_sessions.next().await {
-            let timeout_generator = |duration| async_std::task::sleep(duration).boxed();
+            let timeout_generator = |duration| sleep(duration).boxed();
             let (master_in, master_messages) = channel(4096);
             let (master_sink, master_out) = channel(4096);
             let master_sink =

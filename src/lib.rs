@@ -7,6 +7,7 @@ use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
 };
 
+pub mod bridge;
 pub mod client;
 pub mod common;
 pub mod keyman;
@@ -14,6 +15,7 @@ pub mod protocol;
 pub mod pvss;
 pub mod server;
 pub mod state;
+pub mod utils;
 
 pub type GenericError = Box<dyn 'static + StdError + Send + Sync>;
 
