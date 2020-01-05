@@ -132,7 +132,6 @@ impl From<BridgeMessage> for wire::bridge_message::Variant {
                     }),
                 })
             }
-            BridgeMessage::Id(id) => V::Id(id),
         }
     }
 }
@@ -616,7 +615,6 @@ impl TryFrom<wire::BridgeMessage> for BridgeMessage {
                         },
                     }
                 }
-                V::Id(id) => BridgeMessage::Id(id),
                 _ => return Err(WireError::Malformed(<_>::default())),
             })
         } else {

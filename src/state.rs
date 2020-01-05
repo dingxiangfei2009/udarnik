@@ -1809,7 +1809,6 @@ pub enum BridgeMessage {
         stream: u8,
         feedback: PayloadFeedback,
     },
-    Id(String),
 }
 
 pub enum PayloadFeedback {
