@@ -1,17 +1,40 @@
-use std::convert::{TryFrom, TryInto};
+use std::{
+    convert::{TryFrom, TryInto},
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+};
 
+use cfg_if::cfg_if;
 use failure::{Backtrace, Fail};
 use sss::lattice::{Int, Poly, Reconciliator, SessionKeyPart, Signature};
 
 use super::{
-    wire, BridgeAsk, BridgeId, BridgeMessage, BridgeNegotiationMessage, BridgeType, ClientMessage,
-    ClientMessageVariant, GrpcBridge, KeyExchangeMessage, Message, Params, PayloadFeedback,
-    Pomerium, SessionLogOn, StreamRequest,
+    wire, BridgeAsk, BridgeId, BridgeMessage, BridgeNegotiationMessage, BridgeRetract, BridgeType,
+    ClientMessage, ClientMessageVariant, GrpcBridge, KeyExchangeMessage, Message, Params,
+    PayloadFeedback, Pomerium, SessionLogOn, StreamRequest, UnixBridge,
 };
 use crate::{
     protocol::{RawShard, RawShardId},
     GenericError, Redact,
 };
+
+impl From<wire::BridgeId> for BridgeId {
+    fn from(id: wire::BridgeId) -> Self {
+        Self {
+            up: id.up,
+            down: id.down,
+        }
+    }
+}
+
+impl From<BridgeId> for wire::BridgeId {
+    fn from(id: BridgeId) -> Self {
+        Self {
+            up: id.up,
+            down: id.down,
+        }
+    }
+}
 
 impl<G> From<Message<G>> for wire::Message {
     fn from(message: Message<G>) -> Self {
@@ -363,7 +386,10 @@ impl From<BridgeNegotiationMessage> for wire::BridgeNegotiate {
                     asks: asks.into_iter().map(<_>::from).collect(),
                 }),
                 BridgeNegotiationMessage::Retract(retracts) => V::Retract(wire::BridgeRetract {
-                    retracts: retracts.into_iter().map(|r| r.0.to_string()).collect(),
+                    retracts: retracts
+                        .into_iter()
+                        .map(|BridgeRetract(id)| <_>::from(id))
+                        .collect(),
                 }),
                 BridgeNegotiationMessage::AskProposal(asks) => V::AskProposal(wire::BridgeAsk {
                     asks: asks.into_iter().map(<_>::from).collect(),
@@ -373,7 +399,10 @@ impl From<BridgeNegotiationMessage> for wire::BridgeNegotiate {
                 BridgeNegotiationMessage::Health(health) => V::Health(wire::Health {
                     report: health
                         .into_iter()
-                        .map(|(id, count)| (id.to_string(), count))
+                        .map(|(id, count)| wire::HealthReport {
+                            id: Some(<_>::from(id)),
+                            count,
+                        })
                         .collect(),
                 }),
             }),
@@ -382,10 +411,10 @@ impl From<BridgeNegotiationMessage> for wire::BridgeNegotiate {
 }
 
 impl From<BridgeAsk> for wire::BridgeSpec {
-    fn from(msg: BridgeAsk) -> Self {
+    fn from(BridgeAsk { r#type, id }: BridgeAsk) -> Self {
         Self {
-            bridge_type: Some(msg.r#type.into()),
-            id: msg.id.to_string(),
+            bridge_type: Some(r#type.into()),
+            id: Some(<_>::from(id)),
         }
     }
 }
@@ -396,15 +425,36 @@ impl From<BridgeType> for wire::BridgeType {
         Self {
             variant: Some(match typ {
                 BridgeType::Grpc(typ) => V::Grpc(typ.into()),
+                BridgeType::Unix(UnixBridge { addr, id, up, down }) => {
+                    let path;
+                    cfg_if! {
+                        if #[cfg(target_family = "unix")] {
+                            use std::os::unix::ffi::OsStrExt;
+                            path = addr.as_os_str().as_bytes().to_vec();
+                        } else {
+                            use std::os::unix::ffi::OsStrExt;
+                            path = addr.as_os_str().as_bytes().to_vec();
+                        }
+                    };
+                    V::Unix(wire::BridgeUnix {
+                        addr: path,
+                        id: Some(<_>::from(id)),
+                        up: up.to_vec(),
+                        down: down.to_vec(),
+                    })
+                }
             }),
         }
     }
 }
 
 impl From<GrpcBridge> for wire::BridgeGrpc {
-    fn from(grpc: GrpcBridge) -> Self {
+    fn from(GrpcBridge { id, addr, up, down }: GrpcBridge) -> Self {
         Self {
-            endpoint: grpc.0.to_string(),
+            endpoint: addr.to_string(),
+            id: Some(<_>::from(id)),
+            up: up.to_vec(),
+            down: down.to_vec(),
         }
     }
 }
@@ -475,8 +525,14 @@ impl TryFrom<wire::BridgeNegotiate> for BridgeNegotiationMessage {
                 V::Health(wire::Health { report }) => BridgeNegotiationMessage::Health(
                     report
                         .into_iter()
-                        .map(|(id, count)| (id.into(), count))
-                        .collect(),
+                        .map(|wire::HealthReport { id, count }| {
+                            if let Some(id) = id {
+                                Ok((<_>::from(id), count))
+                            } else {
+                                Err(WireError::Malformed(<_>::default()))
+                            }
+                        })
+                        .collect::<Result<_, WireError>>()?,
                 ),
             })
         } else {
@@ -490,7 +546,7 @@ impl TryFrom<wire::BridgeSpec> for BridgeAsk {
     fn try_from(msg: wire::BridgeSpec) -> Result<Self, Self::Error> {
         match msg {
             wire::BridgeSpec {
-                id,
+                id: Some(id),
                 bridge_type: Some(bridge_type),
             } => Ok(Self {
                 id: id.into(),
@@ -510,9 +566,56 @@ impl TryFrom<wire::BridgeType> for BridgeType {
         } = msg
         {
             Ok(match variant {
-                V::Grpc(wire::BridgeGrpc { endpoint }) => {
-                    BridgeType::Grpc(GrpcBridge(endpoint.parse()?))
+                V::Grpc(wire::BridgeGrpc {
+                    id: Some(id),
+                    up,
+                    down,
+                    endpoint,
+                }) => {
+                    if up.len() != 32 || down.len() != 32 {
+                        return Err(WireError::Malformed(<_>::default()));
+                    }
+                    let mut up_key = [0; 32];
+                    let mut down_key = [0; 32];
+                    up_key.copy_from_slice(&up);
+                    down_key.copy_from_slice(&down);
+                    BridgeType::Grpc(GrpcBridge {
+                        addr: endpoint.parse()?,
+                        id: id.into(),
+                        up: up_key,
+                        down: down_key,
+                    })
                 }
+                V::Unix(wire::BridgeUnix {
+                    addr,
+                    id: Some(id),
+                    up,
+                    down,
+                }) => {
+                    if up.len() != 32 || down.len() != 32 {
+                        return Err(WireError::Malformed(<_>::default()));
+                    }
+                    let mut up_key = [0; 32];
+                    let mut down_key = [0; 32];
+                    up_key.copy_from_slice(&up);
+                    down_key.copy_from_slice(&down);
+                    let path;
+                    cfg_if::cfg_if! {
+                        if #[cfg(target_family = "unix")] {
+                            path = <OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&addr);
+                        } else {
+                            path = <OsStr as std::os::windows::ffi::OsStrExt>::from_bytes(&addr);
+                        }
+                    };
+                    let path = OsString::from(path);
+                    BridgeType::Unix(UnixBridge {
+                        addr: PathBuf::from(path),
+                        id: id.into(),
+                        up: up_key,
+                        down: down_key,
+                    })
+                }
+                _ => return Err(WireError::Malformed(<_>::default())),
             })
         } else {
             Err(WireError::Malformed(<_>::default()))

@@ -21,7 +21,6 @@ use futures::{
     select,
 };
 use log::{error, info};
-use pin_utils::unsafe_pinned;
 use rand::{CryptoRng, RngCore, SeedableRng};
 use sss::lattice::{
     Init, PrivateKey, PublicKey, SessionKeyPart, SessionKeyPartMix, VerificationKey,
@@ -34,7 +33,7 @@ use crate::{
     reference_seeder_chacha,
     state::{
         key_exchange_boris, wire, Guard, Identity, InitIdentity, KeyExchange, Message, Params,
-        SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle, SessionId, SessionLogOn,
+        SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle, SessionId,
     },
     utils::TryFutureStream,
     GenericError,

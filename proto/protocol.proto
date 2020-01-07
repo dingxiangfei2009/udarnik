@@ -175,25 +175,46 @@ message BridgeAsk {
 
 message BridgeSpec {
   BridgeType bridge_type = 1;
-  string id = 2;
+  BridgeId id = 2;
+}
+
+message BridgeId {
+  string up = 1;
+  string down = 2;
 }
 
 message BridgeType {
   oneof variant {
     BridgeGrpc grpc = 1;
+    BridgeUnix unix = 2;
   }
 }
 
+message BridgeUnix {
+  BridgeId id = 1;
+  bytes up = 2;
+  bytes down = 3;
+  bytes addr = 4;
+}
+
 message BridgeGrpc {
-  string endpoint = 1;
+  BridgeId id = 1;
+  string endpoint = 2;
+  bytes up = 3;
+  bytes down = 4;
 }
 
 message BridgeRetract {
-  repeated string retracts = 1;
+  repeated BridgeId retracts = 1;
 }
 
 message Health {
-  map<string, uint64> report = 1;
+  repeated HealthReport report = 1;
+}
+
+message HealthReport {
+  BridgeId id = 1;
+  uint64 count = 2;
 }
 
 message StreamRequest {
@@ -215,12 +236,12 @@ message RawBridgeMessage {
 }
 
 message RawBridgeId {
-  string id = 1;
+  BridgeId id = 1;
   bytes nonce = 2;
 }
 
 message BridgeChannelRegister {
-  string id = 1;
+  BridgeId id = 1;
   bytes key = 2;
 }
 

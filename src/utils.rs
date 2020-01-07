@@ -1,5 +1,6 @@
 use core::fmt;
 use core::task::{Context, Poll};
+use std::sync::Mutex;
 
 use core::pin::Pin;
 use futures::{
@@ -185,7 +186,7 @@ impl<T, E> TryFutureStream<T, E> {
 
 impl<T, E> Stream for TryFutureStream<T, E> {
     type Item = Result<T, E>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         use Poll::*;
 
         let stream = self
@@ -222,3 +223,22 @@ impl<T, E> Stream for TryFutureStream<T, E> {
 }
 
 impl<T, E> Unpin for TryFutureStream<T, E> {}
+
+pub struct SyncFuture<F>(Mutex<F>);
+
+impl<F> SyncFuture<F> {
+    pub fn new(f: F) -> Self {
+        Self(Mutex::new(f))
+    }
+}
+
+impl<F> Future for SyncFuture<F>
+where
+    F: Future + Unpin,
+{
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut f = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Pin::new(&mut *f).poll(cx)
+    }
+}

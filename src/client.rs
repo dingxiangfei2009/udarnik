@@ -209,8 +209,8 @@ where
     let SessionHandle {
         session,
         poll,
-        input,
-        output,
+        input: session_input,
+        output: session_output,
         mut progress,
     } = Session::<SafeGuard>::new(
         session_bootstrap,
@@ -222,10 +222,6 @@ where
     let mut master_adapter =
         async move {
             pin_mut!(master_in);
-            // let (client_out_tx, client_out_rx) = channel(4096);
-            // let (client_in_tx, client_in_rx) = channel(4096);
-            // let send = async {};
-            // let recv = async {};
             while let Some(_) = master_in.as_mut().peek().await {
                 let (mut client_send, mut client_recv) =
                     match reconnect(&mut client, &session, &init_db, &sign_db, signature_hasher)
@@ -311,11 +307,28 @@ where
     .fuse();
     let mut terminate = terminate.fuse();
     let mut poll = poll.fuse();
+    let mut input = input
+        .map(Ok)
+        .forward(session_input)
+        .map_err(|_| ClientError::Pipe(<_>::default()))
+        .boxed()
+        .fuse();
+    let mut output = session_output
+        .map(Ok)
+        .try_for_each_concurrent(32, move |m| {
+            let output = output.clone();
+            async move { output.clone().send(m).await }
+        })
+        .map_err(|_| ClientError::Pipe(<_>::default()))
+        .boxed()
+        .fuse();
     select! {
         r = master_adapter => r?,
         () = progress => (),
         r = terminate => r.map_err(|_| ClientError::Pipe(<_>::default()))?,
         r = poll => r?,
+        r = input => r?,
+        r = output => r?,
     }
     Ok(())
 }

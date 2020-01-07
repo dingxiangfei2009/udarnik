@@ -6,10 +6,10 @@ use std::{
     marker::PhantomData,
     net::SocketAddr,
     num::Wrapping,
-    ops::Deref,
+    path::PathBuf,
     pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use aead::{Aead, NewAead, Payload};
@@ -19,11 +19,11 @@ use dyn_clone::{clone_box, DynClone};
 use failure::{err_msg, Backtrace, Error as TopError, Fail};
 use futures::{
     channel::mpsc::{channel, unbounded, Receiver, Sender, UnboundedReceiver, UnboundedSender},
-    future::BoxFuture,
+    future::{pending, BoxFuture, Fuse},
     join,
     prelude::*,
     select,
-    stream::repeat,
+    stream::{repeat, FuturesUnordered},
 };
 use generic_array::GenericArray;
 use log::error;
@@ -39,6 +39,7 @@ use sss::lattice::{
 };
 
 use crate::{
+    bridge::{grpc, BridgeHalf, ConstructibleBridge},
     protocol::{
         CodecError, QuorumError, RSCodec, RawShard, RawShardId, ReceiveError, ReceiveQueue,
         RemoteRecvError, SendError, SendQueue, ShardState, TaskProgressNotifier,
@@ -127,16 +128,23 @@ pub struct BridgeAsk {
 #[derive(Clone, Debug)]
 pub enum BridgeType {
     Grpc(GrpcBridge),
+    Unix(UnixBridge),
 }
 
 #[derive(Clone, Debug, From)]
-pub struct GrpcBridge(SocketAddr);
+pub struct GrpcBridge {
+    pub addr: SocketAddr,
+    pub id: BridgeId,
+    pub up: [u8; 32],
+    pub down: [u8; 32],
+}
 
-impl Deref for GrpcBridge {
-    type Target = SocketAddr;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+#[derive(Clone, Debug, From)]
+pub struct UnixBridge {
+    pub addr: PathBuf,
+    pub id: BridgeId,
+    pub up: [u8; 32],
+    pub down: [u8; 32],
 }
 
 #[derive(Clone, Debug, From)]
@@ -398,6 +406,7 @@ where
         },
     };
     Ok(SessionBootstrap {
+        role: KeyExchangeRole::Anke,
         anke_identity: anke_ident,
         boris_identity: boris_ident,
         params,
@@ -559,6 +568,7 @@ where
         .send(Message::Session(session_id.clone()))
         .await?;
     Ok(SessionBootstrap {
+        role: KeyExchangeRole::Anke,
         anke_identity: anke_ident,
         boris_identity: boris_ident,
         params,
@@ -568,8 +578,11 @@ where
     })
 }
 
-#[derive(From, Hash, Clone, Debug, Display, PartialEq, Eq, PartialOrd, Ord, Deref)]
-pub struct BridgeId(String);
+#[derive(Hash, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BridgeId {
+    pub up: String,
+    pub down: String,
+}
 
 #[derive(From, Hash, Clone, Display, Debug, PartialEq, Eq, PartialOrd, Ord, Deref)]
 pub struct SessionId(String);
@@ -590,6 +603,10 @@ pub struct Session<G> {
     error_reports: Sender<(u8, u64, HashSet<u8>)>,
     master_sink: Box<dyn Send + Sync + ClonableSink<Message<G>, GenericError>>,
     bridge_builder: BridgeBuilder<G>,
+    bridge_drivers: Pin<
+        Arc<RwLock<FuturesUnordered<Fuse<Box<dyn Future<Output = ()> + Send + Sync + Unpin>>>>>,
+    >,
+    role: KeyExchangeRole,
     pub session_id: SessionId,
     pub params: Params,
     pub anke_identity: Identity,
@@ -658,6 +675,7 @@ where
 }
 
 pub struct SessionBootstrap {
+    role: KeyExchangeRole,
     params: Params,
     session_key: Vec<u8>,
     session_id: SessionId,
@@ -690,6 +708,7 @@ where
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
     ) -> Result<SessionHandle<G>, SessionError> {
         let SessionBootstrap {
+            role,
             params,
             session_key,
             anke_identity,
@@ -701,7 +720,12 @@ where
         let (output, output_rx) = channel(4096);
         let (error_reports, error_reports_rx) = channel(4096);
         let (progress, progress_rx) = unbounded();
+        let bridge_drivers = FuturesUnordered::new();
+        bridge_drivers.push(
+            (Box::new(pending()) as Box<dyn Future<Output = ()> + Send + Sync + Unpin>).fuse(),
+        );
         let session = Arc::pin(Self {
+            role,
             local_serial: <_>::default(),
             remote_serial: <_>::default(),
             inbound_guard: Arc::new(G::from(&session_key)),
@@ -717,6 +741,7 @@ where
             error_reports,
             master_sink,
             bridge_builder: BridgeBuilder::new(),
+            bridge_drivers: Arc::pin(RwLock::new(bridge_drivers)),
             session_id: session_id.clone(),
             params,
             anke_identity,
@@ -752,7 +777,7 @@ where
     }
 
     async fn invite_bridge_proposal(self: Pin<&Self>) -> Result<(), SessionError> {
-        let serial = self.remote_serial.fetch_add(1, Ordering::AcqRel);
+        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
@@ -765,7 +790,7 @@ where
     }
 
     async fn reset_remote_stream(self: Pin<&Self>, stream: u8) -> Result<(), SessionError> {
-        let serial = self.remote_serial.fetch_add(1, Ordering::AcqRel);
+        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
@@ -780,10 +805,30 @@ where
         self.send_master_message(message).await
     }
 
+    async fn construct_bridge_proposals(self: Pin<&Self>) -> Vec<BridgeAsk> {
+        // TODO: provide other bridge types
+        let mut asks = vec![];
+        for _ in 0..3 {
+            let (id, params, poll) = match grpc::bridge().await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("bridge engineer: {}", e);
+                    continue;
+                }
+            };
+            self.bridge_drivers.read().await.push(poll.fuse());
+            asks.push(BridgeAsk {
+                r#type: BridgeType::Grpc(params),
+                id,
+            })
+        }
+        asks
+    }
+
     async fn answer_ask_proposal(self: Pin<&Self>) -> Result<(), SessionError> {
         // TODO: proposal
-        let proposals = vec![];
-        let serial = self.remote_serial.fetch_add(1, Ordering::AcqRel);
+        let proposals = self.as_ref().construct_bridge_proposals().await;
+        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
@@ -811,8 +856,12 @@ where
         >,
     ) -> Vec<BridgeAsk> {
         let mut success = vec![];
+        let half = match self.role {
+            KeyExchangeRole::Anke => BridgeHalf::Down,
+            KeyExchangeRole::Boris => BridgeHalf::Up,
+        };
         for BridgeAsk { r#type, id } in proposals {
-            match self.bridge_builder.build(r#type, id).await {
+            match self.bridge_builder.build(r#type, id, half).await {
                 Ok(Bridge { tx, rx, poll }) => {
                     let (mapping_tx, mapping_rx) = unbounded();
                     let inbound_guard = Arc::clone(&self.inbound_guard);
@@ -875,8 +924,9 @@ where
     }
 
     fn update_local_serial(&self, serial: u64) -> u64 {
-        let local_serial = self.local_serial.load(Ordering::Relaxed);
+        let serial = serial + 1;
         loop {
+            let local_serial = self.local_serial.load(Ordering::Relaxed);
             if Wrapping(serial) - Wrapping(serial) < Wrapping(1 << 63) {
                 break local_serial;
             } else if self
@@ -890,8 +940,9 @@ where
     }
 
     fn update_remote_serial(&self, serial: u64) -> u64 {
-        let remote_serial = self.remote_serial.load(Ordering::Relaxed);
+        let serial = serial + 1;
         loop {
+            let remote_serial = self.remote_serial.load(Ordering::Relaxed);
             if Wrapping(serial) - Wrapping(serial) < Wrapping(1 << 63) {
                 break remote_serial;
             } else if self
@@ -927,7 +978,7 @@ where
     }
 
     async fn ask_bridge(self: Pin<&Self>, proposals: Vec<BridgeAsk>) -> Result<(), SessionError> {
-        let serial = self.remote_serial.fetch_add(1, Ordering::AcqRel);
+        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         let tag = (self.session_id.clone(), serial);
         let message = Message::Client(ClientMessage {
             serial,
@@ -942,7 +993,7 @@ where
     }
 
     fn assert_valid_serial(&self, serial: u64) -> Result<u64, u64> {
-        let local_serial = self.local_serial.load(Ordering::Acquire);
+        let local_serial = self.local_serial.load(Ordering::Relaxed);
         let diff = Wrapping(serial) - Wrapping(local_serial);
         if diff == Wrapping(0) || diff > Wrapping(1 << 63) {
             Err(local_serial)
@@ -952,7 +1003,7 @@ where
     }
 
     async fn answer_bridge_health_query(self: Pin<&Self>) -> Result<(), SessionError> {
-        let serial = self.remote_serial.fetch_add(1, Ordering::AcqRel);
+        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         let tag = (self.session_id.clone(), serial);
         let health = self
             .receive_counter
@@ -1032,7 +1083,7 @@ where
                     }) {
                         if let Some(counter) = receive_counter.counters.read().await.get(&bridge_id)
                         {
-                            counter.fetch_add(1, Ordering::AcqRel);
+                            counter.fetch_add(1, Ordering::Relaxed);
                         } else {
                             receive_counter
                                 .counters
@@ -1040,7 +1091,7 @@ where
                                 .await
                                 .entry(bridge_id)
                                 .or_default()
-                                .fetch_add(1, Ordering::AcqRel);
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     progress
@@ -1092,7 +1143,7 @@ where
                         if let Some(counter) =
                             self.send_counter.counters.read().await.get(&bridge_id)
                         {
-                            counter.fetch_add(1, Ordering::AcqRel);
+                            counter.fetch_add(1, Ordering::Relaxed);
                         } else {
                             self.send_counter
                                 .counters
@@ -1100,7 +1151,7 @@ where
                                 .await
                                 .entry(bridge_id)
                                 .or_default()
-                                .fetch_add(1, Ordering::AcqRel);
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                         Ok(())
                     }
@@ -1117,7 +1168,6 @@ where
                         let stream = match &inbound {
                             BridgeMessage::PayloadFeedback { stream, .. } => *stream,
                             BridgeMessage::Payload { raw_shard_id, .. } => raw_shard_id.stream,
-                            _ => return,
                         };
                         let report = if let BridgeMessage::Payload {
                             raw_shard_id: RawShardId { stream, serial, id },
@@ -1266,7 +1316,7 @@ where
                                                         counters
                                                             .entry(id)
                                                             .or_default()
-                                                            .fetch_add(count, Ordering::AcqRel);
+                                                            .fetch_add(count, Ordering::Relaxed);
                                                     }
                                                 }
                                             }
@@ -1354,6 +1404,8 @@ where
         .fuse();
         let mut poll_bridges = async {
             let mut progress = progress.clone();
+            let mut last_invite = Instant::now();
+            let invite_cooldown = Duration::new(10, 0);
             loop {
                 let polls: Vec<_> = bridge_polls
                     .read()
@@ -1362,7 +1414,14 @@ where
                     .map(|poll| ClonableSendableFuture::clone_pin_box(&**poll))
                     .collect();
                 if polls.is_empty() {
-                    self.as_ref().invite_bridge_proposal().await?
+                    let now = Instant::now();
+                    if now.duration_since(last_invite) > invite_cooldown {
+                        self.as_ref().invite_bridge_proposal().await?;
+                        last_invite = Instant::now();
+                    } else {
+                        timeout_generator(Duration::new(0, 3000000)).await;
+                        continue;
+                    }
                 } else {
                     let (bridge, _, _) = future::select_all(polls).await;
                     bridge_polls.write().await.remove(&bridge);
@@ -1382,11 +1441,16 @@ where
         }
         .boxed()
         .fuse();
+        let mut poll_bridge_drivers =
+            async { while let Some(_) = self.bridge_drivers.write().await.next().await {} }
+                .boxed()
+                .fuse();
         select! {
             result = error_reports => result,
             _ = poll_bridges_in => Ok(()),
             _ = poll_bridges_out => Ok(()),
             _ = poll_master_messages => Ok(()),
+            _ = poll_bridge_drivers => Ok(()),
             result = poll_streams => result,
             result = poll_bridges => result,
             result = input => {
@@ -1767,6 +1831,8 @@ pub enum SessionError {
     SignOn(String),
     #[fail(display = "stream: {}", _0)]
     Stream(GenericError, Backtrace),
+    #[fail(display = "bridge: {}", _0)]
+    Bridge(GenericError, Backtrace),
 }
 
 #[derive(Default)]
@@ -1785,7 +1851,11 @@ pub struct BridgeBuilder<G> {
     _p: PhantomData<fn() -> G>,
 }
 
-impl<G> BridgeBuilder<G> {
+impl<G> BridgeBuilder<G>
+where
+    G: 'static + Guard<BridgeMessage, ()>,
+    GenericError: From<G::Error>,
+{
     pub fn new() -> Self {
         Self { _p: PhantomData }
     }
@@ -1793,8 +1863,17 @@ impl<G> BridgeBuilder<G> {
         &self,
         r#type: &BridgeType,
         id: &BridgeId,
+        half: BridgeHalf,
     ) -> Result<Bridge<G>, SessionError> {
         match r#type {
+            BridgeType::Grpc(params) => grpc::GrpcBridge
+                .build(id, params, half)
+                .await
+                .map_err(|e| SessionError::Bridge(Box::new(e.compat()), <_>::default())),
+            BridgeType::Unix(params) => grpc::UnixBridge
+                .build(id, params, half)
+                .await
+                .map_err(|e| SessionError::Bridge(Box::new(e.compat()), <_>::default())),
             _ => Err(SessionError::UnknownBridgeType),
         }
     }

@@ -722,7 +722,7 @@ impl SendQueue {
                 .encode(data.as_ref())
                 .map_err(|e| SendError::Codec(e, <_>::default()))?,
         );
-        let serial = self.serial.fetch_add(1, Ordering::AcqRel);
+        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
         let mut shards: Vec<_> = shards
             .iter()
             .map(|shard| shard.encode_shard(self.stream, serial, &shard_state))
