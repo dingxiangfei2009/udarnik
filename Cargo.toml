@@ -32,9 +32,10 @@ rand_chacha = "0.2.1"
 rayon = "1.2.0"
 serde_json = "1.0"
 sha3 = "0.8.1"
+slog-envlogger = "2.2.0" 
 structopt = "0.3.0"
-tower = "0.3"
 tempfile = "3.0"
+tower = "0.3"
 
 [dependencies.serde]
 version = "1.0"
@@ -61,8 +62,11 @@ features = ["macros", "io-driver", "time", "rt-threaded"]
 
 [dependencies.sss]
 git = "https://github.com/dingxiangfei2009/sss"
-rev = "9e1e991e955c8be8f0a5bbcbf442610efbae6dc9"
+rev = "13708b40f223dcb7ee7abe7f303f5cc5ed4abe1c"
 
 [build-dependencies]
 prost-build = "0.5"
 tonic-build = "0.1.0-beta.1"
+
+[profile.release]
+debug = true

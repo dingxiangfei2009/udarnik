@@ -5,7 +5,6 @@ use std::{
     marker::PhantomData,
     net::SocketAddr,
     pin::Pin,
-    task::{Context, Poll},
     time::Duration,
 };
 
@@ -20,7 +19,7 @@ use futures::{
     prelude::*,
     select,
 };
-use log::{error, info};
+use log::{error, info, trace};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use sss::lattice::{
     Init, PrivateKey, PublicKey, SessionKeyPart, SessionKeyPartMix, VerificationKey,
@@ -35,7 +34,7 @@ use crate::{
         key_exchange_boris, wire, Guard, Identity, InitIdentity, KeyExchange, Message, Params,
         SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle, SessionId,
     },
-    utils::TryFutureStream,
+    utils::{Spawn, TryFutureStream},
     GenericError,
 };
 
@@ -130,6 +129,8 @@ where
                                         ));
                                     }
                                 };
+                                let session = logon.session;
+                                trace!("server: session {} sign on", session);
                                 let (progress_tx, mut progress_rx) = channel(4096);
                                 let master_in = {
                                     let mut progress = progress_tx.clone();
@@ -184,6 +185,7 @@ where
                                             _ = timeout => break
                                         }
                                     }
+                                    info!("session {}: master link has no activity", session);
                                 };
                                 let mut master_in = Pin::from(Box::new(master_in)
                                     as Box<
@@ -234,6 +236,7 @@ where
         &self,
         request: Request<Streaming<wire::Message>>,
     ) -> Result<Response<Self::KeyExchangeStream>, Status> {
+        info!("boris: incoming key exchange {:?}", request.remote_addr());
         let request = request.into_inner().and_then(|m| {
             async { Message::<G>::try_from(m).map_err(|e| Status::aborted(format!("{}", e))) }
         });
@@ -259,19 +262,24 @@ where
         let mut new_sessions = self.new_sessions.clone();
         let session_id = SessionId::from(uuid::Uuid::new_v4().to_string());
         let kex_result = key_exchange_boris(kex, request, message_sink, seeder, session_id)
-            .map_err(|e| Box::new(e.compat()) as GenericError)
+            .map_err(|e| {
+                info!("boris: error: {}", e);
+                Box::new(e.compat()) as GenericError
+            })
             .and_then(move |r| {
                 async move {
-                    new_sessions
-                        .send(r)
-                        .await
-                        .map_err(|e| Box::new(e) as GenericError)
+                    info!("new session");
+                    new_sessions.send(r).await.map_err(|e| {
+                        info!("boris: error: {}", e);
+                        Box::new(e) as GenericError
+                    })
                 }
             });
-        let stream = TryFutureStream {
-            complete: Some(Box::new(Pin::from(Box::new(kex_result)))),
-            stream: Some(Box::new(message_stream.map(wire::Message::from).map(Ok))),
-        };
+        let stream = TryFutureStream::new(
+            Box::new(Pin::from(Box::new(kex_result))),
+            Box::new(message_stream.map(wire::Message::from).map(Ok)),
+            true,
+        );
         Ok(Response::new(Box::pin(
             stream.map_err(|e| Status::aborted(format!("{}", e))),
         )))
@@ -301,10 +309,11 @@ where
             message_sink.sink_map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default())),
             signature_hasher,
         );
-        let stream = TryFutureStream {
-            complete: Some(Box::new(Pin::from(Box::new(complete)))),
-            stream: Some(Box::new(stream.map(wire::Message::from).map(Ok))),
-        };
+        let stream = TryFutureStream::new(
+            Box::new(Pin::from(Box::new(complete))),
+            Box::new(stream.map(wire::Message::from).map(Ok)),
+            true,
+        );
         Ok(Response::new(Box::pin(
             stream.map_err(|e| Status::aborted(format!("{}", e))),
         )))
@@ -312,20 +321,24 @@ where
 }
 
 pub struct ServerBootstrap {
-    addr: SocketAddr,
-    allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
-    anke_data: Vec<u8>,
-    boris_data: Vec<u8>,
-    identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
-    identity_sequence: Vec<(InitIdentity, Identity)>,
-    init_db: Arc<BTreeMap<InitIdentity, Init>>,
-    retries: Option<u32>,
-    verify_db: BTreeMap<InitIdentity, BTreeMap<Identity, VerificationKey>>,
+    pub addr: SocketAddr,
+    pub allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
+    pub anke_data: Vec<u8>,
+    pub boris_data: Vec<u8>,
+    pub identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
+    pub identity_sequence: Vec<(InitIdentity, Identity)>,
+    pub init_db: BTreeMap<InitIdentity, Init>,
+    pub retries: Option<u32>,
+    pub verify_db: BTreeMap<InitIdentity, BTreeMap<Identity, VerificationKey>>,
 }
 
 pub type ServiceFuture<T> = Pin<Box<dyn Future<Output = T> + Send + Sync>>;
 
-pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
+pub async fn server(
+    bootstrap: ServerBootstrap,
+    mut new_channel: Sender<(Sender<Vec<u8>>, Receiver<Vec<u8>>)>,
+    spawn: impl Spawn + Clone + Send + Sync + 'static,
+) -> Result<(), GenericError> {
     let ServerBootstrap {
         addr,
         allowed_identities,
@@ -348,7 +361,7 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
             boris_data,
             identity_db,
             identity_sequence,
-            init_db,
+            init_db: Arc::new(init_db),
             new_sessions: new_sessions_tx,
             retries,
             seeder,
@@ -379,6 +392,7 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
                 master_messages,
                 master_sink,
                 timeout_generator,
+                spawn.clone(),
             ) {
                 Ok(handle) => handle,
                 Err(e) => {
@@ -386,6 +400,10 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
                     continue;
                 }
             };
+            if let Err(e) = new_channel.send((input, output)).await {
+                error!("broken pipe: {}", e);
+                break;
+            }
             let session_id = session.session_id.clone();
             let master_out = Arc::pin(Mutex::new(master_out));
             let session_state = SessionState {
@@ -399,10 +417,6 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
                 .insert(session_id.clone(), session_state);
             let mut poll = poll.fuse();
             let sessions = Arc::clone(&sessions);
-            let mut output = output
-                .for_each(|data| async move { info!("data={:?}", data) })
-                .boxed()
-                .fuse();
             let poll_progress_or_timeout = async move {
                 loop {
                     let mut timeout = timeout_generator(Duration::new(300, 0)).fuse();
@@ -410,7 +424,6 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
                         _ = progress.next().fuse() => (),
                         _ = timeout => break,
                         _ = poll => break,
-                        _ = output => break,
                     }
                 }
                 info!("session {} is dropped", session_id);
@@ -427,10 +440,11 @@ pub async fn server(bootstrap: ServerBootstrap) -> Result<(), GenericError> {
     let mut poll_sessions = async move {
         let mut polls = vec![];
         loop {
+            trace!("server: poll_sessions");
             let mut poll_all = if polls.is_empty() {
-                select_all(polls.clone()).boxed()
-            } else {
                 pending().boxed()
+            } else {
+                select_all(polls.clone()).boxed()
             }
             .fuse();
             select! {

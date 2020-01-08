@@ -18,7 +18,7 @@ use futures::{
     select,
 };
 use http::Uri;
-use log::{error, info};
+use log::{error, info, trace};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use sss::lattice::{
     Init, PrivateKey, PublicKey, SessionKeyPart, SessionKeyPartMix, SigningKey, SIGN_K,
@@ -27,26 +27,27 @@ use tonic::{Request, Status};
 
 use crate::{
     protocol::signature_hasher,
+    reference_seeder_chacha,
     state::{
         key_exchange_anke, wire, ClientMessageVariant, Guard, Identity, InitIdentity, KeyExchange,
         KeyExchangeError, Message, Params, SafeGuard, Session, SessionError, SessionHandle,
         SessionId, SessionLogOn, WireError,
     },
+    utils::Spawn,
     GenericError,
 };
 
-pub struct ClientBootstrap<S> {
-    addr: Uri,
-    params: Params,
-    allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
-    anke_data: Vec<u8>,
-    boris_data: Vec<u8>,
-    identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
-    identity_sequence: Vec<(InitIdentity, Identity)>,
-    init_db: BTreeMap<InitIdentity, Init>,
-    retries: Option<u32>,
-    sign_db: BTreeMap<InitIdentity, BTreeMap<Identity, SigningKey>>,
-    seeder: S,
+pub struct ClientBootstrap {
+    pub addr: Uri,
+    pub params: Params,
+    pub allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
+    pub anke_data: Vec<u8>,
+    pub boris_data: Vec<u8>,
+    pub identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
+    pub identity_sequence: Vec<(InitIdentity, Identity)>,
+    pub init_db: BTreeMap<InitIdentity, Init>,
+    pub retries: Option<u32>,
+    pub sign_db: BTreeMap<InitIdentity, BTreeMap<Identity, SigningKey>>,
 }
 
 #[derive(Fail, Debug, From)]
@@ -93,6 +94,7 @@ where
         + Debug,
     G::Error: Debug,
 {
+    trace!("client: contacting master");
     let (mut message_sink, master_in) = channel(4096);
     let mut message_stream = Box::pin(
         client
@@ -117,6 +119,7 @@ where
     } else {
         Err(ClientError::Pipe(<_>::default()))?
     };
+    trace!("client: master challenge");
     let Session {
         init_identity,
         anke_identity,
@@ -130,10 +133,12 @@ where
         .and_then(|db| db.get(anke_identity))
     {
         let mut rng = rand::rngs::OsRng;
+        trace!("client: signing challenge");
         key.sign(&mut rng, init, body, SIGN_K, h)
     } else {
         return Err(ClientError::NoSigningKey);
     };
+    trace!("client: send signature");
     message_sink
         .send(Message::<G>::SessionLogOn(SessionLogOn {
             init_identity: init_identity.clone(),
@@ -147,17 +152,20 @@ where
     Ok((message_sink, message_stream))
 }
 
-pub async fn client<G, R, S>(
-    bootstrap: ClientBootstrap<S>,
+async fn client_impl<G, R, S, Sp>(
+    bootstrap: ClientBootstrap,
+    seeder: S,
     input: Receiver<Vec<u8>>,
     output: Sender<Vec<u8>>,
     terminate: OneshotReceiver<()>,
+    spawn: Sp,
 ) -> Result<(), ClientError>
 where
     G: 'static + Send + Sync + Guard<Params, ()> + for<'a> From<&'a [u8]> + Debug,
     G::Error: Debug,
     R: 'static + Send + Sync + SeedableRng + RngCore + CryptoRng,
     S: Send + Sync + Clone + Fn(&[u8]) -> R::Seed,
+    Sp: Spawn + Clone + Send + Sync + 'static,
 {
     let ClientBootstrap {
         addr,
@@ -170,7 +178,6 @@ where
         init_db,
         retries,
         sign_db,
-        seeder,
     } = bootstrap;
     let mut client = wire::master_client::MasterClient::connect(addr)
         .await
@@ -217,12 +224,15 @@ where
         master_messages,
         master_sink,
         |duration| async_std::task::sleep(duration).boxed(),
+        spawn,
     )?;
+    info!("client: session assigned, {}", session.session_id);
     let master_in = crate::utils::Peekable::new(master_in);
     let mut master_adapter =
         async move {
             pin_mut!(master_in);
             while let Some(_) = master_in.as_mut().peek().await {
+                trace!("client: want to send message to master");
                 let (mut client_send, mut client_recv) =
                     match reconnect(&mut client, &session, &init_db, &sign_db, signature_hasher)
                         .await
@@ -315,7 +325,7 @@ where
         .fuse();
     let mut output = session_output
         .map(Ok)
-        .try_for_each_concurrent(32, move |m| {
+        .try_for_each_concurrent(2, move |m| {
             let output = output.clone();
             async move { output.clone().send(m).await }
         })
@@ -331,4 +341,26 @@ where
         r = output => r?,
     }
     Ok(())
+}
+
+pub async fn client<S>(
+    bootstrap: ClientBootstrap,
+    input: Receiver<Vec<u8>>,
+    output: Sender<Vec<u8>>,
+    terminate: OneshotReceiver<()>,
+    spawn: S,
+) -> Result<(), ClientError>
+where
+    S: Spawn + Clone + Send + Sync + 'static,
+{
+    client_impl::<SafeGuard, rand_chacha::ChaChaRng, _, _>(
+        bootstrap,
+        reference_seeder_chacha,
+        input,
+        output,
+        terminate,
+        spawn,
+    )
+    .inspect_err(|e| error!("client: {}", e))
+    .await
 }

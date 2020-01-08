@@ -2,7 +2,10 @@ use async_trait::async_trait;
 
 pub mod grpc;
 
-use crate::state::{Bridge, BridgeId};
+use crate::{
+    state::{Bridge, BridgeId},
+    utils::Spawn,
+};
 
 #[derive(PartialEq, Eq, Clone, Copy, Hash)]
 pub enum BridgeHalf {
@@ -14,10 +17,14 @@ pub enum BridgeHalf {
 pub trait ConstructibleBridge<G> {
     type Params;
     type Error;
-    async fn build(
+    async fn build<S>(
         &self,
         id: &BridgeId,
         params: &Self::Params,
         half: BridgeHalf,
-    ) -> Result<Bridge<G>, Self::Error>;
+        spawn: S,
+    ) -> Result<Bridge<G>, Self::Error>
+    where
+        S: Spawn + Send + Sync + 'static,
+        S::Error: 'static;
 }

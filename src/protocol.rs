@@ -15,6 +15,7 @@ use failure::{Backtrace, Fail};
 use futures::{channel::mpsc::unbounded, future::BoxFuture, prelude::*, select};
 use generic_array::GenericArray;
 use lazy_static::lazy_static;
+use log::trace;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 use rayon::prelude::*;
@@ -741,6 +742,7 @@ impl SendQueue {
         let threshold = codec.threshold();
         for (mut shard, mut shard_id) in shards.drain(..threshold) {
             loop {
+                trace!("enqueue");
                 if let Err((shard_, shard_id_)) = self.enqueue((shard, shard_id)).await {
                     shard = shard_;
                     shard_id = shard_id_;
@@ -777,6 +779,7 @@ impl SendQueue {
         // and we need to try harder now
         for (mut shard, mut shard_id) in shards {
             loop {
+                trace!("enqueue");
                 if let Err((shard_, shard_id_)) = self.enqueue((shard, shard_id)).await {
                     shard = shard_;
                     shard_id = shard_id_;

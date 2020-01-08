@@ -1,3 +1,4 @@
+#![type_length_limit="2000000"]
 #![recursion_limit = "4096"]
 #[macro_use]
 extern crate derive_more;

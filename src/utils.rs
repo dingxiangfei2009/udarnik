@@ -1,8 +1,9 @@
 use core::fmt;
+use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Mutex;
 
-use core::pin::Pin;
+use async_trait::async_trait;
 use futures::{
     future::{Either, FusedFuture},
     prelude::*,
@@ -175,8 +176,27 @@ where
 }
 
 pub struct TryFutureStream<T, E> {
-    pub complete: Option<Box<dyn Send + Sync + Unpin + Future<Output = Result<(), E>>>>,
-    pub stream: Option<Box<dyn Send + Sync + Unpin + Stream<Item = Result<T, E>>>>,
+    complete: Option<Box<dyn Send + Sync + Unpin + Future<Output = Result<(), E>>>>,
+    stream: Option<Box<dyn Send + Sync + Unpin + Stream<Item = Result<T, E>>>>,
+    flush: bool,
+    stream_peek: Option<Result<T, E>>,
+    complete_peek: Option<Result<(), E>>,
+}
+
+impl<T, E> TryFutureStream<T, E> {
+    pub fn new(
+        complete: Box<dyn Send + Sync + Unpin + Future<Output = Result<(), E>>>,
+        stream: Box<dyn Send + Sync + Unpin + Stream<Item = Result<T, E>>>,
+        flush: bool,
+    ) -> Self {
+        Self {
+            complete: Some(complete),
+            complete_peek: None,
+            flush,
+            stream: Some(stream),
+            stream_peek: None,
+        }
+    }
 }
 
 impl<T, E> TryFutureStream<T, E> {
@@ -189,35 +209,113 @@ impl<T, E> Stream for TryFutureStream<T, E> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         use Poll::*;
 
-        let stream = self
+        let stream_item = match self
             .as_mut()
             .stream()
             .as_pin_mut()
-            .map(|stream| stream.poll_next(cx));
-        let complete = self
+            .map(|stream| stream.poll_next(cx))
+        {
+            None | Some(Pending) => None,
+            Some(Ready(None)) => {
+                self.stream = None;
+                None
+            }
+            Some(Ready(Some(item))) => Some(item),
+        };
+        let complete_result = match self
             .as_mut()
             .complete()
             .as_pin_mut()
-            .map(|complete| complete.poll(cx));
-        match (stream, complete) {
-            (Some(Pending), Some(Pending)) => Pending,
-            (_, Some(Ready(Ok(_)))) => {
-                *self.as_mut().stream() = None;
-                *self.as_mut().complete() = None;
-                Ready(None)
+            .map(|complete| complete.poll(cx))
+        {
+            Some(Pending) | None => None,
+            Some(Ready(result)) => {
+                self.complete = None;
+                Some(result)
             }
-            (_, Some(Ready(Err(e)))) => {
-                *self.as_mut().stream() = None;
-                *self.as_mut().complete() = None;
-                Ready(Some(Err(e)))
+        };
+        match (stream_item, complete_result) {
+            (None, None) => {
+                if self.flush {
+                    if let Some(item) = self.stream_peek.take() {
+                        Ready(Some(item))
+                    } else if self.stream.is_some() || self.complete.is_some() {
+                        Pending
+                    } else if let Some(Err(e)) = self.complete_peek.take() {
+                        Ready(Some(Err(e)))
+                    } else {
+                        Ready(None)
+                    }
+                } else if let Some(Err(e)) = self.complete_peek.take() {
+                    self.stream = None;
+                    Ready(Some(Err(e)))
+                } else if self.stream.is_some() || self.complete.is_some() {
+                    Pending
+                } else {
+                    Ready(None)
+                }
             }
-            (_, None) => Ready(None),
-            (Some(Ready(Some(item))), Some(_)) => Ready(Some(item)),
-            (Some(Ready(None)), Some(_)) => {
-                *self.as_mut().stream() = None;
-                Pending
+            (Some(item), Some(result)) => {
+                if self.flush {
+                    let item = if let Some(item_) = self.stream_peek.take() {
+                        self.stream_peek = Some(item);
+                        item_
+                    } else {
+                        item
+                    };
+                    self.complete_peek = Some(result);
+                    Ready(Some(item))
+                } else {
+                    self.stream = None;
+                    self.stream_peek = None;
+                    if let Err(e) = result {
+                        Ready(Some(Err(e)))
+                    } else {
+                        Ready(None)
+                    }
+                }
             }
-            _ => Ready(None),
+            (None, Some(result)) => {
+                if self.flush {
+                    if let Some(item) = self.stream_peek.take() {
+                        self.complete_peek = Some(result);
+                        Ready(Some(item))
+                    } else if self.stream.is_some() {
+                        self.complete_peek = Some(result);
+                        Pending
+                    } else if let Err(e) = result {
+                        Ready(Some(Err(e)))
+                    } else {
+                        Ready(None)
+                    }
+                } else {
+                    self.stream = None;
+                    self.stream_peek = None;
+                    if let Err(e) = result {
+                        Ready(Some(Err(e)))
+                    } else {
+                        Ready(None)
+                    }
+                }
+            }
+            (Some(item), None) => {
+                if self.flush {
+                    let item = if let Some(item_) = self.stream_peek.take() {
+                        self.stream_peek = Some(item);
+                        item_
+                    } else {
+                        item
+                    };
+                    Ready(Some(item))
+                } else if let Some(Err(e)) = self.complete_peek.take() {
+                    self.stream = None;
+                    Ready(Some(Err(e)))
+                } else if self.complete.is_some() {
+                    Pending
+                } else {
+                    Ready(None)
+                }
+            }
         }
     }
 }
@@ -240,5 +338,29 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut f = self.0.lock().unwrap_or_else(|e| e.into_inner());
         Pin::new(&mut *f).poll(cx)
+    }
+}
+
+#[async_trait]
+pub trait Spawn {
+    type Error: core::fmt::Debug + Send + Sync;
+    async fn spawn<F, T>(&self, f: F) -> Result<T, Self::Error>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static;
+}
+
+#[derive(Clone)]
+pub struct TokioSpawn(pub tokio::runtime::Handle);
+
+#[async_trait]
+impl Spawn for TokioSpawn {
+    type Error = tokio::task::JoinError;
+    async fn spawn<F, T>(&self, f: F) -> Result<T, Self::Error>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.0.spawn(f).await
     }
 }
