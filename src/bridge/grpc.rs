@@ -28,7 +28,6 @@ use futures::{
 use generic_array::GenericArray;
 use http::Uri;
 use log::{error, info, trace};
-use prost::Message;
 use rand::{rngs::OsRng, RngCore};
 use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
 use tonic::transport::{server::Connected, Channel, Endpoint, Server};
@@ -54,8 +53,8 @@ pub enum BridgeServerError {
 #[derive(Clone)]
 pub struct BridgeChannel {
     key: [u8; 32],
-    send: Sender<BridgeMessage>,
-    recv: Receiver<BridgeMessage>,
+    send: Sender<Vec<u8>>,
+    recv: Receiver<Vec<u8>>,
 }
 
 impl BridgeChannel {
@@ -65,16 +64,17 @@ impl BridgeChannel {
     }
 }
 
-pub struct BridgeServer {
+pub struct BridgeServer<S> {
     up_id: String,
     down_id: String,
     up: BridgeChannel,
     down: BridgeChannel,
     progress: Sender<()>,
+    spawn: S,
 }
 
-impl BridgeServer {
-    fn new() -> (Self, Receiver<()>) {
+impl<S> BridgeServer<S> {
+    fn new(spawn: S) -> (Self, Receiver<()>) {
         let up = uuid::Uuid::new_v4().to_string();
         let down = uuid::Uuid::new_v4().to_string();
         let mut up_key = [0; 32];
@@ -89,23 +89,17 @@ impl BridgeServer {
                 up: BridgeChannel::new(up_key),
                 down: BridgeChannel::new(down_key),
                 progress: progress_tx,
+                spawn,
             },
             progress,
         )
     }
-}
 
-#[tonic::async_trait]
-impl wire::bridge_server::Bridge for Pin<Arc<BridgeServer>> {
-    type ChannelStream =
-        Pin<Box<dyn 'static + Send + Sync + Stream<Item = Result<wire::RawBridgeMessage, Status>>>>;
-    async fn channel(
-        &self,
-        request: Request<Streaming<wire::RawBridgeMessage>>,
-    ) -> Result<Response<Self::ChannelStream>, Status> {
-        let request = request.into_inner();
-        let mut request = Pin::from(Box::new(request)
-            as Box<dyn Stream<Item = Result<wire::RawBridgeMessage, Status>> + Send + Sync>);
+    async fn process_stream(
+        self: Pin<&Self>,
+        mut request: impl Stream<Item = Result<wire::RawBridgeMessage, Status>> + Send + Sync + Unpin,
+        response: StdSender<Result<wire::RawBridgeMessage, Status>>,
+    ) -> Result<(), Status> {
         let (up, down, mut nonce) = match request
             .next()
             .await
@@ -129,6 +123,7 @@ impl wire::bridge_server::Bridge for Pin<Arc<BridgeServer>> {
         } else {
             return Err(Status::aborted("broken pipe"));
         };
+        info!("up={}, down={}", up, down);
         let aead = Arc::pin(Aes256GcmSiv::new(*GenericArray::from_slice(&key)));
         let aead_ = Pin::clone(&aead);
         let nonce_ = Pin::clone(&nonce);
@@ -143,20 +138,13 @@ impl wire::bridge_server::Bridge for Pin<Arc<BridgeServer>> {
                     wire::RawBridgeMessage {
                         variant: Some(wire::raw_bridge_message::Variant::Raw(m)),
                     } => {
+                        trace!("bridge: incoming data");
                         let m = aead
                             .decrypt(GenericArray::from_slice(&nonce), &m[..])
                             .map_err(|e| {
                                 error!("decrypt: {:?}", e);
                                 Status::aborted("malformed data")
                             })?;
-                        let m = wire::BridgeMessage::decode(&m[..]).map_err(|e| {
-                            error!("decode: {}", e);
-                            Status::aborted("malformed data")
-                        })?;
-                        let m = BridgeMessage::try_from(m).map_err(|e| {
-                            error!("transform: {}", e);
-                            Status::aborted("malformed data")
-                        })?;
                         send.send(m).await;
                         Ok(progress.send(()).await)
                     }
@@ -164,6 +152,7 @@ impl wire::bridge_server::Bridge for Pin<Arc<BridgeServer>> {
                 }
             }
         });
+        let mut up = Box::new(Box::pin(up));
         let progress = self.progress.clone();
         let down = recv
             .map(move |m| {
@@ -171,14 +160,9 @@ impl wire::bridge_server::Bridge for Pin<Arc<BridgeServer>> {
                 let nonce = Pin::clone(&nonce);
                 let progress = progress.clone();
                 async move {
-                    let m = wire::BridgeMessage::from(m);
-                    let mut v = vec![];
-                    m.encode(&mut v).map_err(|e| {
-                        error!("encode: {}", e);
-                        Status::aborted("malformed data")
-                    })?;
+                    trace!("bridge: outgoing data");
                     let m = aead
-                        .encrypt(GenericArray::from_slice(&nonce), &v[..])
+                        .encrypt(GenericArray::from_slice(&nonce), &m[..])
                         .map_err(|e| {
                             error!("encrypt: {:?}", e);
                             Status::aborted("malformed data")
@@ -190,29 +174,86 @@ impl wire::bridge_server::Bridge for Pin<Arc<BridgeServer>> {
                     Ok::<_, Status>(m)
                 }
             })
-            .buffer_unordered(32);
+            .buffer_unordered(32)
+            .map(Ok)
+            .forward(response)
+            .map_err(|e| {
+                error!("bridge: broken pipe: {}", e);
+                Status::aborted("hangup")
+            });
+        let mut down = Box::new(Box::pin(down));
+        select! {
+            r = up => {
+                info!("bridge: up: terminated");
+                r
+            },
+            r = down => {
+                info!("bridge: down: terminated");
+                r
+            },
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl<S> wire::bridge_server::Bridge for Pin<Arc<BridgeServer<S>>>
+where
+    S: Spawn + Send + Sync + 'static,
+    S::Error: 'static,
+{
+    type ChannelStream =
+        Pin<Box<dyn 'static + Send + Sync + Stream<Item = Result<wire::RawBridgeMessage, Status>>>>;
+    async fn channel(
+        &self,
+        request: Request<Streaming<wire::RawBridgeMessage>>,
+    ) -> Result<Response<Self::ChannelStream>, Status> {
+        info!("bridge: incoming bridge connection");
+        let request = request.into_inner();
+        let request = Pin::from(Box::new(request)
+            as Box<dyn Stream<Item = Result<wire::RawBridgeMessage, Status>> + Send + Sync>);
+        let (response_tx, response) = std_channel(4096);
+        let poll = self
+            .spawn
+            .spawn({
+                let this = Pin::clone(self);
+                async move { this.as_ref().process_stream(request, response_tx).await }
+            })
+            .unwrap_or_else(|e| {
+                error!("bridge: {:?}", e);
+                Ok(())
+            });
 
         Ok(Response::new(Box::pin(TryFutureStream::new(
-            Box::new(Box::pin(up)),
-            Box::new(down),
+            Box::new(Box::pin(poll)),
+            Box::new(Box::pin(response)),
             true,
         ))))
     }
 }
 
-pub async fn bridge() -> Result<
+pub async fn bridge<S>(
+    spawn: S,
+) -> Result<
     (
         BridgeId,
         GrpcParams,
         Box<dyn Future<Output = ()> + Send + Sync + Unpin>,
     ),
     GenericError,
-> {
+>
+where
+    S: Spawn + Send + Sync + 'static,
+    S::Error: 'static,
+{
     trace!("bridge: engineering");
     let stream = TcpListener::bind("[::]:0").await?;
     let addr = stream.local_addr()?;
     info!("bridge: address {}", addr);
-    let (server, mut progress) = BridgeServer::new();
+    // TODO: proper address translation
+    let addr = format!("[::1]:{}", addr.port())
+        .parse()
+        .expect("correct socket address format");
+    let (server, mut progress) = BridgeServer::new(spawn);
     let up_key = server.up.key;
     let down_key = server.down.key;
     let up = server.up_id.clone();
@@ -256,10 +297,11 @@ pub async fn bridge() -> Result<
     let progress = async move {
         loop {
             select! {
-                _ = progress.next().fuse() => (),
+                _ = progress.next().fuse() => trace!("bridge service: progress"),
                 _ = sleep(Duration::new(300, 0)).fuse() => break,
             }
         }
+        info!("bridge service: terminated");
     };
     let progress = Box::pin(progress) as Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
     let mut progress = progress.fuse();
@@ -279,19 +321,25 @@ pub async fn bridge() -> Result<
 }
 
 #[cfg(target_family = "unix")]
-pub async fn bridge_uds() -> Result<
+pub async fn bridge_uds<S>(
+    spawn: S,
+) -> Result<
     (
         BridgeId,
         UnixParams,
         Box<dyn Future<Output = ()> + Send + Sync + Unpin>,
     ),
     GenericError,
-> {
+>
+where
+    S: Spawn + Send + Sync + 'static,
+    S::Error: 'static,
+{
     let tempdir = tempfile::tempdir()?;
     let mut socket = PathBuf::from(tempdir.path());
     socket.push("socket");
     let stream = UnixListener::bind(&socket).await?;
-    let (server, mut progress) = BridgeServer::new();
+    let (server, mut progress) = BridgeServer::new(spawn);
     let up_key = server.up.key;
     let down_key = server.down.key;
     let up = server.up_id.clone();
@@ -469,6 +517,7 @@ where
 {
     let mut nonce = [0; 12];
     OsRng.fill_bytes(&mut nonce);
+    info!("bridge: connect: sending nonce");
     message_sink
         .send(wire::RawBridgeMessage {
             variant: Some(wire::raw_bridge_message::Variant::Id(wire::RawBridgeId {
@@ -481,6 +530,7 @@ where
             error!("broken pipe: {}", e);
             Error::Pipe(<_>::default())
         })?;
+    info!("bridge: connect: nonce sent");
     let aead = Arc::pin(Aes256GcmSiv::new(*GenericArray::from_slice(&key)));
     let nonce = Arc::pin(nonce);
     let (tx, message_sink_transform) = std_channel(4096);
@@ -495,6 +545,7 @@ where
                             let aead = Pin::clone(&aead);
                             let nonce = Pin::clone(&nonce);
                             move |m| {
+                                trace!("bridge terminal: outgoing data");
                                 let Pomerium { data, .. } = m;
                                 let data = aead
                                     .encrypt(GenericArray::from_slice(&nonce[..]), &data[..])
@@ -540,6 +591,7 @@ where
                         wire::RawBridgeMessage {
                             variant: Some(wire::raw_bridge_message::Variant::Raw(data)),
                         } => {
+                            trace!("bridge terminal: incoming data");
                             let data = aead
                                 .decrypt(GenericArray::from_slice(&nonce[..]), &data[..])
                                 .map_err(|e| Error::Crypto(e, <_>::default()))?;
@@ -580,9 +632,11 @@ where
             .path_and_query("/")
             .build()
             .map_err(Error::Uri)?;
+        info!("bridge: connecting {}", uri);
         let mut client = wire::bridge_client::BridgeClient::connect(uri)
             .await
             .map_err(Error::Transport)?;
+        info!("bridge: connection open");
         let (message_sink, bridge_in) = std_channel(4096);
         let bridge_out = client
             .channel(Request::new(bridge_in.map(wire::RawBridgeMessage::from)))
@@ -590,6 +644,7 @@ where
             .map_err(|e| Error::Net(e, <_>::default()))?
             .into_inner()
             .map_err(|e| Error::Net(e, <_>::default()));
+        info!("bridge: channel open");
         match half {
             BridgeHalf::Up => {
                 grpc_bridge_client(

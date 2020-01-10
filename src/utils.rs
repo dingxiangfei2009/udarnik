@@ -3,7 +3,6 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Mutex;
 
-use async_trait::async_trait;
 use futures::{
     future::{Either, FusedFuture},
     prelude::*,
@@ -341,10 +340,12 @@ where
     }
 }
 
-#[async_trait]
 pub trait Spawn {
     type Error: core::fmt::Debug + Send + Sync;
-    async fn spawn<F, T>(&self, f: F) -> Result<T, Self::Error>
+    fn spawn<F, T>(
+        &self,
+        f: F,
+    ) -> Box<dyn Future<Output = Result<T, Self::Error>> + Send + Sync + Unpin + 'static>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static;
@@ -353,14 +354,16 @@ pub trait Spawn {
 #[derive(Clone)]
 pub struct TokioSpawn(pub tokio::runtime::Handle);
 
-#[async_trait]
 impl Spawn for TokioSpawn {
     type Error = tokio::task::JoinError;
-    async fn spawn<F, T>(&self, f: F) -> Result<T, Self::Error>
+    fn spawn<F, T>(
+        &self,
+        f: F,
+    ) -> Box<dyn Future<Output = Result<T, Self::Error>> + Send + Sync + Unpin + 'static>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.0.spawn(f).await
+        Box::new(Box::pin(self.0.spawn(f)))
     }
 }

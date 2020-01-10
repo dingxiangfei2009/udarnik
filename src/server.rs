@@ -8,10 +8,7 @@ use std::{
     time::Duration,
 };
 
-use async_std::{
-    sync::{Arc, Mutex, RwLock},
-    task::sleep,
-};
+use async_std::sync::{Arc, Mutex, RwLock};
 use failure::Fail;
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
@@ -19,7 +16,7 @@ use futures::{
     prelude::*,
     select,
 };
-use log::{error, info, trace};
+use log::{error, info, trace, warn};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use sss::lattice::{
     Init, PrivateKey, PublicKey, SessionKeyPart, SessionKeyPartMix, VerificationKey,
@@ -334,11 +331,16 @@ pub struct ServerBootstrap {
 
 pub type ServiceFuture<T> = Pin<Box<dyn Future<Output = T> + Send + Sync>>;
 
-pub async fn server(
+pub async fn server<TimeGen, Timeout>(
     bootstrap: ServerBootstrap,
     mut new_channel: Sender<(Sender<Vec<u8>>, Receiver<Vec<u8>>)>,
     spawn: impl Spawn + Clone + Send + Sync + 'static,
-) -> Result<(), GenericError> {
+    timeout_generator: TimeGen,
+) -> Result<(), GenericError>
+where
+    TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
+    Timeout: 'static + Future<Output = ()> + Send + Sync,
+{
     let ServerBootstrap {
         addr,
         allowed_identities,
@@ -353,30 +355,25 @@ pub async fn server(
     let (new_sessions_tx, mut new_sessions) = channel(32);
     let sessions = Arc::default();
     let seeder = reference_seeder_chacha;
-    let server: UdarnikServer<SafeGuard, rand_chacha::ChaChaRng, _, _, ServiceFuture<()>> =
-        UdarnikServer {
-            _p: PhantomData,
-            allowed_identities,
-            anke_data,
-            boris_data,
-            identity_db,
-            identity_sequence,
-            init_db: Arc::new(init_db),
-            new_sessions: new_sessions_tx,
-            retries,
-            seeder,
-            sessions: Arc::clone(&sessions),
-            verify_db: Arc::new(verify_db),
-            timeout_generator: |duration| {
-                Pin::from(Box::new(async_std::task::sleep(duration))
-                    as Box<dyn Future<Output = ()> + Send + Sync>)
-            },
-        };
+    let server: UdarnikServer<SafeGuard, rand_chacha::ChaChaRng, _, _, Timeout> = UdarnikServer {
+        _p: PhantomData,
+        allowed_identities,
+        anke_data,
+        boris_data,
+        identity_db,
+        identity_sequence,
+        init_db: Arc::new(init_db),
+        new_sessions: new_sessions_tx,
+        retries,
+        seeder,
+        sessions: Arc::clone(&sessions),
+        verify_db: Arc::new(verify_db),
+        timeout_generator: timeout_generator.clone(),
+    };
     let server = Arc::pin(server);
     let (mut poll_session_tx, mut poll_session) = channel(32);
     let mut new_sessions = async {
         while let Some(session_bootstrap) = new_sessions.next().await {
-            let timeout_generator = |duration| sleep(duration).boxed();
             let (master_in, master_messages) = channel(4096);
             let (master_sink, master_out) = channel(4096);
             let master_sink =
@@ -391,7 +388,7 @@ pub async fn server(
                 session_bootstrap,
                 master_messages,
                 master_sink,
-                timeout_generator,
+                timeout_generator.clone(),
                 spawn.clone(),
             ) {
                 Ok(handle) => handle,
@@ -417,9 +414,10 @@ pub async fn server(
                 .insert(session_id.clone(), session_state);
             let mut poll = poll.fuse();
             let sessions = Arc::clone(&sessions);
+            let timeout_generator = timeout_generator.clone();
             let poll_progress_or_timeout = async move {
                 loop {
-                    let mut timeout = timeout_generator(Duration::new(300, 0)).fuse();
+                    let mut timeout = timeout_generator(Duration::new(300, 0)).boxed().fuse();
                     select! {
                         _ = progress.next().fuse() => (),
                         _ = timeout => break,
@@ -472,5 +470,6 @@ pub async fn server(
         _ = poll_sessions => (),
         _ = new_sessions => (),
     }
+    warn!("server: terminated");
     Ok(())
 }

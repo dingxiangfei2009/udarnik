@@ -1,4 +1,4 @@
-#![type_length_limit="2000000"]
+#![type_length_limit = "4000000"]
 use std::{
     collections::{BTreeMap, HashMap},
     convert::TryFrom,
@@ -12,7 +12,7 @@ use futures::{
     prelude::*,
 };
 use http::Uri;
-use log::info;
+use log::{error, info};
 use sss::lattice::{keygen, Init, PrivateKey, PublicKey, SigningKey};
 use udarnik::{
     client::{client, ClientBootstrap},
@@ -39,7 +39,7 @@ async fn start(handle: tokio::runtime::Handle) {
     let pubkey: PublicKey = PublicKey::try_from(pubkey).unwrap();
     let sign_key = SigningKey::from_private_key(&prikey);
     let verify_key = sign_key.verification_key(&init);
-    let (new_channel_tx, new_channel) = channel(32);
+    let (new_channel_tx, mut new_channel) = channel(32);
 
     let mut init_db = BTreeMap::default();
     init_db.insert(InitIdentity::from(&init), init.clone());
@@ -86,6 +86,7 @@ async fn start(handle: tokio::runtime::Handle) {
         },
         new_channel_tx,
         spawn.clone(),
+        |duration| tokio::time::delay_for(duration),
     );
     let server = handle.spawn(server);
     sleep(Duration::new(1, 0)).await;
@@ -114,10 +115,39 @@ async fn start(handle: tokio::runtime::Handle) {
         output_tx,
         terminate_rx,
         spawn,
+        |duration| tokio::time::delay_for(duration),
     );
     let client = handle.spawn(client);
-    input.send(vec![10, 20, 30u8]).await;
-    sleep(Duration::new(1000, 0)).await;
+    let handle_ = handle.clone();
+    handle.spawn(async move {
+        let handle = handle_;
+        while let Some((input, output)) = new_channel.next().await {
+            info!("server: new channel, short-circuiting");
+            handle.spawn(async {
+                output
+                    .map(Ok)
+                    .inspect_ok(|m| info!("got {:?}", m))
+                    .forward(input)
+                    .await
+                    .unwrap_or_else(|e| error!("server: channel: {}", e))
+            });
+        }
+    });
+    handle.spawn(async move {
+        loop {
+            if let Err(e) = input.send(vec![10, 20, 30u8]).await {
+                error!("client: send to input: {}", e);
+                break;
+            }
+            sleep(Duration::new(8, 0)).await;
+        }
+    });
+    handle.spawn(output.for_each(|m| {
+        async move {
+            info!("client: output: {:?}", m);
+        }
+    }));
+    sleep(Duration::new(10000, 0)).await;
 }
 
 #[test]
@@ -126,7 +156,8 @@ fn entry() {
     let mut rt = tokio::runtime::Builder::new()
         .threaded_scheduler()
         .enable_all()
-        .thread_stack_size(32 << 30)
+        .core_threads(512)
+        // .thread_stack_size(32 << 30)
         .build()
         .unwrap();
     let h = rt.spawn(start(rt.handle().clone()));

@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use async_std::task::sleep;
 use failure::{Backtrace, Error as TopError, Fail};
 use futures::{
     channel::{
@@ -152,13 +151,14 @@ where
     Ok((message_sink, message_stream))
 }
 
-async fn client_impl<G, R, S, Sp>(
+async fn client_impl<G, R, S, Sp, TimeGen, Timeout>(
     bootstrap: ClientBootstrap,
     seeder: S,
     input: Receiver<Vec<u8>>,
     output: Sender<Vec<u8>>,
     terminate: OneshotReceiver<()>,
     spawn: Sp,
+    timeout_generator: TimeGen,
 ) -> Result<(), ClientError>
 where
     G: 'static + Send + Sync + Guard<Params, ()> + for<'a> From<&'a [u8]> + Debug,
@@ -166,6 +166,8 @@ where
     R: 'static + Send + Sync + SeedableRng + RngCore + CryptoRng,
     S: Send + Sync + Clone + Fn(&[u8]) -> R::Seed,
     Sp: Spawn + Clone + Send + Sync + 'static,
+    TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
+    Timeout: 'static + Future<Output = ()> + Send + Sync,
 {
     let ClientBootstrap {
         addr,
@@ -223,15 +225,17 @@ where
         session_bootstrap,
         master_messages,
         master_sink,
-        |duration| async_std::task::sleep(duration).boxed(),
+        timeout_generator.clone(),
         spawn,
     )?;
     info!("client: session assigned, {}", session.session_id);
     let master_in = crate::utils::Peekable::new(master_in);
+    let timeout_generator_ = timeout_generator.clone();
     let mut master_adapter =
         async move {
             pin_mut!(master_in);
             while let Some(_) = master_in.as_mut().peek().await {
+                let timeout_generator = timeout_generator_.clone();
                 trace!("client: want to send message to master");
                 let (mut client_send, mut client_recv) =
                     match reconnect(&mut client, &session, &init_db, &sign_db, signature_hasher)
@@ -285,7 +289,7 @@ where
                     loop {
                         select! {
                             () = progress_rx.select_next_some().fuse() => (),
-                            () = sleep(Duration::new(300, 0)).fuse() => break,
+                            () = timeout_generator(Duration::new(300, 0)).fuse() => break,
                         }
                     }
                 }
@@ -305,11 +309,11 @@ where
         }
         .boxed()
         .fuse();
-    let mut progress = async {
+    let mut progress = async move {
         loop {
             select! {
                 () = progress.select_next_some().fuse() => (),
-                () = sleep(Duration::new(300, 0)).fuse() => break,
+                () = timeout_generator(Duration::new(300, 0)).fuse() => break,
             }
         }
     }
@@ -343,23 +347,27 @@ where
     Ok(())
 }
 
-pub async fn client<S>(
+pub async fn client<S, TimeGen, Timeout>(
     bootstrap: ClientBootstrap,
     input: Receiver<Vec<u8>>,
     output: Sender<Vec<u8>>,
     terminate: OneshotReceiver<()>,
     spawn: S,
+    timeout_generator: TimeGen,
 ) -> Result<(), ClientError>
 where
     S: Spawn + Clone + Send + Sync + 'static,
+    TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
+    Timeout: 'static + Future<Output = ()> + Send + Sync,
 {
-    client_impl::<SafeGuard, rand_chacha::ChaChaRng, _, _>(
+    client_impl::<SafeGuard, rand_chacha::ChaChaRng, _, _, _, _>(
         bootstrap,
         reference_seeder_chacha,
         input,
         output,
         terminate,
         spawn,
+        timeout_generator,
     )
     .inspect_err(|e| error!("client: {}", e))
     .await

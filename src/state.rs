@@ -18,15 +18,15 @@ use async_std::sync::{Arc, Mutex, RwLock};
 use dyn_clone::{clone_box, DynClone};
 use failure::{err_msg, Backtrace, Error as TopError, Fail};
 use futures::{
-    channel::mpsc::{channel, unbounded, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    channel::mpsc::{channel, Receiver, Sender},
     future::{BoxFuture, Fuse},
     join,
     prelude::*,
     select,
-    stream::{unfold, FuturesUnordered},
+    stream::{iter, unfold, FuturesUnordered},
 };
 use generic_array::GenericArray;
-use log::{error, info, trace};
+use log::{debug, error, info, trace};
 use lru::LruCache;
 use prost::Message as ProstMessage;
 use rand::{rngs::StdRng, seq::IteratorRandom, CryptoRng, RngCore, SeedableRng};
@@ -52,8 +52,19 @@ pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/protocol.rs"));
 }
 
+mod apply_proposal;
+mod bridges;
+mod bridges_in;
+mod bridges_out;
 mod convert;
+mod error_reports;
+mod input;
+mod key_exchange;
+mod master_messages;
+mod new_stream;
+mod streams;
 pub use convert::WireError;
+pub use key_exchange::{key_exchange_anke, key_exchange_boris};
 
 #[derive(From, Hash, PartialEq, PartialOrd, Eq, Ord, Clone, Debug, Deref)]
 pub struct InitIdentity(String);
@@ -284,369 +295,6 @@ pub struct KeyExchange<R> {
     pub boris_data: Vec<u8>,
 }
 
-pub async fn key_exchange_anke<R, G, MsgStream, MsgSink, MsgStreamErr>(
-    kex: KeyExchange<R>,
-    message_stream: MsgStream,
-    message_sink: MsgSink,
-    seeder: impl Fn(&[u8]) -> R::Seed,
-    params: Params,
-) -> Result<SessionBootstrap, KeyExchangeError>
-where
-    R: RngCore + CryptoRng + SeedableRng,
-    G: 'static + Debug + Guard<Params, ()> + for<'a> From<&'a [u8]>,
-    G::Error: Debug,
-    MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
-    MsgSink: Sink<Message<G>> + Unpin,
-    MsgStreamErr: 'static + Send + Sync,
-    TopError: From<MsgSink::Error> + From<MsgStreamErr>,
-{
-    use bitvec::prelude::*;
-    let mut message_stream =
-        message_stream.map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
-    let mut message_sink =
-        message_sink.sink_map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
-    let KeyExchange {
-        mut retries,
-        init_db,
-        identity_db,
-        allowed_identities,
-        identity_sequence,
-        session_key_part_sampler,
-        anke_session_key_part_mix_sampler,
-        anke_data,
-        ..
-    } = kex;
-    // Anke initiate negotiation
-    let mut key = None;
-    for (init_ident, ident) in identity_sequence {
-        let key_ = if let Some(key) = identity_db.get(&init_ident).and_then(|ids| ids.get(&ident)) {
-            key
-        } else {
-            continue;
-        };
-        message_sink
-            .send(Message::KeyExchange(KeyExchangeMessage::Offer(
-                ident.clone(),
-                init_ident.clone(),
-            )))
-            .await?;
-        match message_stream.next().await {
-            None => return Err(KeyExchangeError::Terminated(<_>::default())),
-            Some(m) => match m? {
-                Message::KeyExchange(KeyExchangeMessage::Accept(ident_, init_ident_))
-                    if ident_ == ident && init_ident_ == init_ident =>
-                {
-                    key = Some((init_ident, ident, key_));
-                    break;
-                }
-                Message::KeyExchange(KeyExchangeMessage::Reject(ident_, init_ident_))
-                    if ident_ == ident && init_ident_ == init_ident => {}
-                _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
-            },
-        }
-        if let Some(countdown) = &mut retries {
-            if *countdown > 0 {
-                *countdown -= 1
-            } else {
-                break;
-            }
-        }
-    }
-    let (init_ident, anke_ident, anke_key) = key.ok_or_else(|| KeyExchangeError::Authentication)?;
-    let init = init_db
-        .get(&init_ident)
-        .ok_or_else(|| KeyExchangeError::UnknownInit(<_>::default()))?
-        .clone();
-    let anke_pub = anke_key.public_key(&init);
-    // expect Boris to negotiate keys
-    let mut boris_pub = None;
-    while boris_pub.is_none() {
-        match message_stream.next().await {
-            None => return Err(KeyExchangeError::Terminated(<_>::default())),
-            Some(m) => match m? {
-                Message::KeyExchange(KeyExchangeMessage::Offer(ident, init_ident_))
-                    if init_ident_ == init_ident =>
-                {
-                    if let Some(pub_key) = allowed_identities
-                        .get(&init_ident)
-                        .and_then(|db| db.get(&ident))
-                    {
-                        boris_pub = Some((ident.clone(), pub_key.clone()));
-                        message_sink
-                            .send(Message::KeyExchange(KeyExchangeMessage::Accept(
-                                ident,
-                                init_ident_,
-                            )))
-                            .await?;
-                    } else {
-                        message_sink
-                            .send(Message::KeyExchange(KeyExchangeMessage::Reject(
-                                ident,
-                                init_ident_,
-                            )))
-                            .await?;
-                    }
-                }
-                _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
-            },
-        }
-        if let Some(countdown) = &mut retries {
-            if *countdown > 0 {
-                *countdown -= 1
-            } else {
-                break;
-            }
-        }
-    }
-    let (boris_ident, boris_pub) = boris_pub.ok_or_else(|| KeyExchangeError::Authentication)?;
-    info!(
-        "anke: init={:?} anke={:?} boris={:?}",
-        init_ident, anke_ident, boris_ident
-    );
-    let (anke_session_part, anke_random) =
-        SessionKeyPart::generate(&session_key_part_sampler, &init);
-    message_sink
-        .send(Message::KeyExchange(KeyExchangeMessage::AnkePart(
-            anke_session_part.clone().into(),
-        )))
-        .await?;
-    info!("anke: anke session part");
-    let shared_key = match message_stream.next().await {
-        None => return Err(KeyExchangeError::Terminated(<_>::default())),
-        Some(m) => match m? {
-            Message::KeyExchange(KeyExchangeMessage::BorisPart(
-                Redact(boris_session_part),
-                Redact(reconciliator),
-            )) => {
-                info!("anke: boris session part");
-                let (anke_part_mix, _, _) = SessionKeyPartMix::<Anke>::generate::<R, _, _>(
-                    seeder,
-                    &anke_session_key_part_mix_sampler,
-                    AnkePublic(&anke_data, &anke_pub),
-                    BorisPublic(&anke_data, &boris_pub),
-                    AnkeSessionKeyPart(&anke_session_part),
-                    BorisSessionKeyPart(&boris_session_part),
-                    AnkeIdentity(&anke_key),
-                    AnkeSessionKeyPartR(&anke_random),
-                );
-                let shared_key = anke_part_mix.reconciliate(&reconciliator);
-                let mut v = BitVec::<LittleEndian, u8>::new();
-                v.extend(shared_key.iter().copied());
-                v.into_vec()
-            }
-            _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
-        },
-    };
-    let outbound_guard = G::from(&shared_key);
-    let message = Message::Params(Redact(Pomerium::encode(&outbound_guard, params.clone())));
-    message_sink.send(message).await?;
-    let session_id = match message_stream.next().await {
-        None => return Err(KeyExchangeError::Terminated(<_>::default())),
-        Some(m) => match m? {
-            Message::Session(session_id) => session_id,
-            _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
-        },
-    };
-    Ok(SessionBootstrap {
-        role: KeyExchangeRole::Anke,
-        anke_identity: anke_ident,
-        boris_identity: boris_ident,
-        params,
-        session_key: shared_key,
-        session_id,
-        init_identity: init_ident,
-    })
-}
-
-pub async fn key_exchange_boris<R, G, MsgStream, MsgSink, MsgStreamErr>(
-    kex: KeyExchange<R>,
-    message_stream: MsgStream,
-    message_sink: MsgSink,
-    seeder: impl Fn(&[u8]) -> R::Seed,
-    session_id: SessionId,
-) -> Result<SessionBootstrap, KeyExchangeError>
-where
-    R: RngCore + CryptoRng + SeedableRng,
-    G: 'static + Debug + Guard<Params, ()> + for<'a> From<&'a [u8]>,
-    G::Error: Debug,
-    MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
-    MsgSink: Sink<Message<G>> + Unpin,
-    MsgStreamErr: 'static + Send + Sync,
-    TopError: From<MsgSink::Error> + From<MsgStreamErr>,
-{
-    use bitvec::prelude::*;
-    let mut message_stream =
-        message_stream.map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
-    let mut message_sink =
-        message_sink.sink_map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
-    let KeyExchange {
-        mut retries,
-        init_db,
-        identity_db,
-        allowed_identities,
-        identity_sequence,
-        session_key_part_sampler,
-        boris_session_key_part_mix_sampler,
-        anke_data,
-        boris_data,
-        ..
-    } = kex;
-    // Anke offers keys in negotiation
-    let mut anke_pub = None;
-    let mut init_ident = None;
-    while anke_pub.is_none() {
-        match message_stream.next().await {
-            None => return Err(KeyExchangeError::Terminated(<_>::default())),
-            Some(m) => match m? {
-                Message::KeyExchange(KeyExchangeMessage::Offer(ident, init_ident_))
-                    if identity_db.contains_key(&init_ident_)
-                        && init_db.contains_key(&init_ident_) =>
-                {
-                    info!(
-                        "boris: anke offer: init={:?}, ident={:?}",
-                        init_ident_, ident
-                    );
-                    if let Some(pub_key) = allowed_identities
-                        .get(&init_ident_)
-                        .and_then(|db| db.get(&ident))
-                    {
-                        init_ident = Some(init_ident_.clone());
-                        anke_pub = Some((ident.clone(), pub_key.clone()));
-                        message_sink
-                            .send(Message::KeyExchange(KeyExchangeMessage::Accept(
-                                ident,
-                                init_ident_,
-                            )))
-                            .await?;
-                    } else {
-                        message_sink
-                            .send(Message::KeyExchange(KeyExchangeMessage::Reject(
-                                ident,
-                                init_ident_,
-                            )))
-                            .await?;
-                    }
-                }
-                _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
-            },
-        }
-        if let Some(countdown) = &mut retries {
-            if *countdown > 0 {
-                *countdown -= 1
-            } else {
-                break;
-            }
-        }
-    }
-    let (anke_ident, anke_pub) = anke_pub.ok_or_else(|| KeyExchangeError::Authentication)?;
-    let init_ident = init_ident.unwrap();
-    info!(
-        "boris: choose anke: init={:?}, ident={:?}",
-        init_ident, anke_ident
-    );
-    let init = init_db.get(&init_ident).unwrap();
-    // Boris negotiate keys
-    let mut key = None;
-    for (init_ident_, ident) in identity_sequence {
-        if init_ident_ != init_ident {
-            continue;
-        }
-        let key_ = if let Some(key) = identity_db.get(&init_ident).and_then(|ids| ids.get(&ident)) {
-            key
-        } else {
-            continue;
-        };
-        message_sink
-            .send(Message::KeyExchange(KeyExchangeMessage::Offer(
-                ident.clone(),
-                init_ident.clone(),
-            )))
-            .await?;
-        match message_stream.next().await {
-            None => return Err(KeyExchangeError::Terminated(<_>::default())),
-            Some(m) => match m? {
-                Message::KeyExchange(KeyExchangeMessage::Accept(ident_, init_ident_))
-                    if ident_ == ident && init_ident_ == init_ident =>
-                {
-                    key = Some((ident, key_));
-                    break;
-                }
-                Message::KeyExchange(KeyExchangeMessage::Reject(ident_, init_ident_))
-                    if ident_ == ident && init_ident_ == init_ident => {}
-                _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
-            },
-        }
-        if let Some(countdown) = &mut retries {
-            if *countdown > 0 {
-                *countdown -= 1
-            } else {
-                break;
-            }
-        }
-    }
-    let (boris_ident, boris_key) = key.ok_or_else(|| KeyExchangeError::Authentication)?;
-    info!("boris: anke accept: ident={:?}", boris_ident);
-    let boris_pub = boris_key.public_key(&init);
-    let (boris_session_part, boris_random) =
-        SessionKeyPart::generate(&session_key_part_sampler, &init);
-    let anke_session_part = match message_stream.next().await {
-        None => return Err(KeyExchangeError::Terminated(<_>::default())),
-        Some(m) => match m? {
-            Message::KeyExchange(KeyExchangeMessage::AnkePart(Redact(part))) => part,
-            _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
-        },
-    };
-    info!("boris: anke session part");
-    let (boris_part_mix, _, _) = SessionKeyPartMix::<Boris>::generate::<R, _, _>(
-        seeder,
-        &boris_session_key_part_mix_sampler,
-        AnkePublic(&anke_data, &anke_pub),
-        BorisPublic(&boris_data, &boris_pub),
-        AnkeSessionKeyPart(&anke_session_part),
-        BorisSessionKeyPart(&boris_session_part),
-        BorisIdentity(&boris_key),
-        BorisSessionKeyPartR(&boris_random),
-    );
-    let reconciliator = boris_part_mix.reconciliator();
-    let shared_key = boris_part_mix.reconciliate(&reconciliator);
-    let mut v = BitVec::<LittleEndian, u8>::new();
-    v.extend(shared_key.iter().copied());
-    let shared_key = v.into_vec();
-
-    let inbound_guard = G::from(&shared_key);
-    message_sink
-        .send(Message::KeyExchange(KeyExchangeMessage::BorisPart(
-            Redact(boris_session_part),
-            Redact(reconciliator),
-        )))
-        .await?;
-    info!("boris: boris session part");
-    let params = match message_stream.next().await {
-        None => return Err(KeyExchangeError::Terminated(<_>::default())),
-        Some(m) => match m? {
-            Message::Params(Redact(pomerium)) => pomerium.decode(&inbound_guard).map_err(|e| {
-                error!("key_exchange: params: {:?}", e);
-                KeyExchangeError::NoParams
-            })?,
-            _ => return Err(KeyExchangeError::UnknownMessage(<_>::default())),
-        },
-    };
-    info!("boris: new session: {}", session_id);
-    message_sink
-        .send(Message::Session(session_id.clone()))
-        .await?;
-    info!("boris: session {}: key exchange finished", session_id);
-    Ok(SessionBootstrap {
-        role: KeyExchangeRole::Boris,
-        anke_identity: anke_ident,
-        boris_identity: boris_ident,
-        params,
-        session_key: shared_key,
-        session_id,
-        init_identity: init_ident,
-    })
-}
-
 #[derive(Hash, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BridgeId {
     pub up: String,
@@ -669,12 +317,37 @@ pub struct Session<G> {
     output: Sender<Vec<u8>>,
     receive_timeout: Duration,
     send_cooldown: Duration,
+
+    // internal states
     error_reports: Sender<(u8, u64, HashSet<u8>)>,
     master_sink: Box<dyn Send + Sync + ClonableSink<Message<G>, GenericError>>,
     bridge_builder: BridgeBuilder<G>,
     bridge_drivers: Pin<
         Arc<RwLock<FuturesUnordered<Fuse<Box<dyn Future<Output = ()> + Send + Sync + Unpin>>>>>,
     >,
+    stream_polls: Arc<
+        RwLock<
+            HashMap<
+                u8,
+                (
+                    SessionStream,
+                    Pin<Box<dyn Sync + ClonableSendableFuture<()>>>,
+                ),
+            >,
+        >,
+    >,
+    bridges_out: Arc<
+        RwLock<
+            HashMap<
+                BridgeId,
+                Box<dyn Send + Sync + ClonableSink<BridgeMessage, GenericError> + Unpin>,
+            >,
+        >,
+    >,
+    bridge_polls: Arc<
+        RwLock<HashMap<BridgeId, Box<dyn Send + Sync + ClonableSendableFuture<BridgeId> + Unpin>>>,
+    >,
+    hall_of_fame: Arc<RwLock<LruCache<u8, Mutex<LruCache<u64, HashMap<u8, Option<BridgeId>>>>>>>,
     role: KeyExchangeRole,
     pub session_id: SessionId,
     pub params: Params,
@@ -758,7 +431,7 @@ pub struct SessionHandle<G> {
     pub poll: BoxFuture<'static, Result<(), SessionError>>,
     pub input: Sender<Vec<u8>>,
     pub output: Receiver<Vec<u8>>,
-    pub progress: UnboundedReceiver<()>,
+    pub progress: Receiver<()>,
 }
 
 impl<G> Session<G>
@@ -790,11 +463,12 @@ where
             init_identity,
             session_id,
         } = session_bootstrap;
-        // error!("{:?}: session key {:?}", role, session_key); // TODO: REMOVE
         let (input_tx, input) = channel(4096);
         let (output, output_rx) = channel(4096);
         let (error_reports, error_reports_rx) = channel(4096);
-        let (progress, progress_rx) = unbounded();
+        let (progress, progress_rx) = channel(4096);
+        let (bridges_out_tx, bridges_out_rx) = channel(4096);
+        let (bridges_in_tx, bridges_in_rx) = channel(4096);
         let bridge_drivers = FuturesUnordered::new();
         let session = Arc::pin(Self {
             role,
@@ -814,6 +488,11 @@ where
             master_sink,
             bridge_builder: BridgeBuilder::new(),
             bridge_drivers: Arc::pin(RwLock::new(bridge_drivers)),
+            stream_polls: <_>::default(),
+            bridges_out: <_>::default(),
+            bridge_polls: <_>::default(),
+            hall_of_fame: Arc::new(RwLock::new(LruCache::new(256))),
+
             session_id: session_id.clone(),
             params,
             anke_identity,
@@ -826,6 +505,10 @@ where
                 error_reports_rx,
                 master_messages,
                 progress,
+                bridges_in_tx,
+                bridges_in_rx,
+                bridges_out_tx,
+                bridges_out_rx,
                 timeout_generator.clone(),
                 spawn,
             )
@@ -837,6 +520,25 @@ where
             output: output_rx,
             progress: progress_rx,
         })
+    }
+
+    // processes
+    async fn handle_bridge_drivers<T>(
+        self: Pin<&Self>,
+        timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
+    ) where
+        T: 'static + Send + Future<Output = ()>,
+    {
+        loop {
+            trace!("{:?}: poll_bridge_drivers", self.role);
+            let mut bridge_drivers = self.bridge_drivers.write().await;
+            if bridge_drivers.len() > 0 {
+                bridge_drivers.next().await;
+            } else {
+                drop(bridge_drivers);
+                timeout_generator(Duration::new(1, 0)).await;
+            }
+        }
     }
 
     async fn send_master_message(
@@ -881,12 +583,15 @@ where
         self.send_master_message(message).await
     }
 
-    async fn construct_bridge_proposals(self: Pin<&Self>) -> Vec<BridgeAsk> {
+    async fn construct_bridge_proposals<S>(self: Pin<&Self>, spawn: S) -> Vec<BridgeAsk>
+    where
+        S: Spawn + Clone + Send + Sync + 'static,
+    {
         // TODO: provide other bridge types
         let mut asks = vec![];
         for _ in 0..3 {
             trace!("{:?}: building bridge", self.role);
-            let (id, params, poll) = match grpc::bridge().await {
+            let (id, params, poll) = match grpc::bridge(spawn.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!("{:?}: bridge engineer: {}", self.role, e);
@@ -904,9 +609,12 @@ where
         asks
     }
 
-    async fn answer_ask_proposal(self: Pin<&Self>) -> Result<(), SessionError> {
+    async fn answer_ask_proposal<S>(self: Pin<&Self>, spawn: S) -> Result<(), SessionError>
+    where
+        S: Spawn + Clone + Send + Sync + 'static,
+    {
         // TODO: proposal
-        let proposals = self.as_ref().construct_bridge_proposals().await;
+        let proposals = self.as_ref().construct_bridge_proposals(spawn).await;
         let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         let message = Message::Client(ClientMessage {
             serial,
@@ -920,96 +628,6 @@ where
             )),
         });
         self.send_master_message(message).await
-    }
-
-    async fn apply_proposal<S>(
-        self: Pin<&Self>,
-        proposals: &[BridgeAsk],
-        poll_bridges_in: &mut HashMap<
-            BridgeId,
-            Box<dyn Send + Sync + ClonableSendableFuture<BridgeId> + Unpin>,
-        >,
-        bridges_in_tx: Sender<(BridgeId, BridgeMessage)>,
-        bridges_out: &mut HashMap<
-            BridgeId,
-            Box<dyn Send + Sync + ClonableSink<BridgeMessage, GenericError> + Unpin>,
-        >,
-        spawn: S,
-    ) -> Vec<BridgeAsk>
-    where
-        S: Spawn + Clone + Send + Sync + 'static,
-        S::Error: 'static,
-    {
-        let mut success = vec![];
-        let half = match self.role {
-            KeyExchangeRole::Anke => BridgeHalf::Down,
-            KeyExchangeRole::Boris => BridgeHalf::Up,
-        };
-        for BridgeAsk { r#type, id } in proposals {
-            match self
-                .bridge_builder
-                .build(r#type, id, half, spawn.clone())
-                .await
-            {
-                Ok(Bridge { tx, rx, poll }) => {
-                    let (mapping_tx, mapping_rx) = unbounded();
-                    let inbound_guard = Arc::clone(&self.inbound_guard);
-                    let outbound_guard = Arc::clone(&self.outbound_guard);
-                    bridges_out.insert(
-                        id.clone(),
-                        Box::new(mapping_tx.sink_map_err(|e| Box::new(e) as GenericError)) as _,
-                    );
-                    let mut poll_outbound = mapping_rx
-                        .map(move |m| Ok(Pomerium::encode(&*outbound_guard, m)))
-                        .forward(tx)
-                        .unwrap_or_else({
-                            move |e| {
-                                error!("poll_outbound: {}", e);
-                            }
-                        })
-                        .boxed()
-                        .fuse();
-                    let mut poll_inbound = rx
-                        .and_then(move |p| {
-                            let inbound_guard = Arc::clone(&inbound_guard);
-                            async move { p.decode(&inbound_guard) }
-                        })
-                        .map_ok({
-                            let id = id.clone();
-                            move |p| (id.clone(), p)
-                        })
-                        .forward(bridges_in_tx.clone().sink_err_into())
-                        .unwrap_or_else({
-                            move |e| {
-                                error!("bridges_in_tx: {}", e);
-                            }
-                        })
-                        .boxed()
-                        .fuse();
-                    let mut poll = poll.fuse();
-                    poll_bridges_in.insert(id.clone(), {
-                        let id = id.clone();
-                        Box::new(
-                            async move {
-                                select! {
-                                    () = poll_inbound => id,
-                                    () = poll_outbound => id,
-                                    () = poll => id,
-                                }
-                            }
-                            .boxed()
-                            .shared(),
-                        )
-                    });
-                    success.push(BridgeAsk {
-                        r#type: r#type.clone(),
-                        id: id.clone(),
-                    });
-                }
-                Err(e) => error!("bridge id={:?} error={}", id, e),
-            }
-        }
-        success
     }
 
     fn update_local_serial(&self, serial: u64) -> u64 {
@@ -1115,534 +733,120 @@ where
         self.send_master_message(message).await
     }
 
-    async fn process_stream<Timeout: 'static + Send + Future<Output = ()>>(
+    async fn process_stream<T: 'static + Send + Future<Output = ()>>(
         self: Pin<Arc<Self>>,
         input: Receiver<Vec<u8>>,
         error_reports: Receiver<(u8, u64, HashSet<u8>)>,
         master_messages: Receiver<Message<G>>,
-        progress: UnboundedSender<()>,
-        timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
+        progress: Sender<()>,
+        bridges_out_tx: Sender<BridgeMessage>,
+        bridges_out_rx: Receiver<BridgeMessage>,
+        bridges_in_tx: Sender<(BridgeId, BridgeMessage)>,
+        bridges_in_rx: Receiver<(BridgeId, BridgeMessage)>,
+        timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
         spawn: impl Spawn + Clone + Send + Sync + 'static,
     ) -> Result<(), SessionError> {
-        let hall_of_fame: Arc<
-            RwLock<LruCache<u8, Mutex<LruCache<u64, HashMap<u8, Option<BridgeId>>>>>>,
-        > = Arc::new(RwLock::new(LruCache::new(256)));
-        let (bridges_out_tx, bridges_out_rx) = channel(4096);
-        let (bridges_in_tx, bridges_in_rx) = channel(4096);
-        let stream_polls: Arc<
-            RwLock<
-                HashMap<
-                    u8,
-                    (
-                        SessionStream,
-                        Pin<Box<dyn Sync + ClonableSendableFuture<()>>>,
-                    ),
-                >,
-            >,
-        > = <_>::default();
-        let bridges_out: Arc<
-            RwLock<
-                HashMap<
-                    BridgeId,
-                    Box<dyn Send + Sync + ClonableSink<BridgeMessage, GenericError> + Unpin>,
-                >,
-            >,
-        > = <_>::default();
-        let bridge_polls: Arc<
-            RwLock<
-                HashMap<BridgeId, Box<dyn Send + Sync + ClonableSendableFuture<BridgeId> + Unpin>>,
-            >,
-        > = <_>::default();
-        let error_reports = {
-            let hall_of_fame = Arc::clone(&hall_of_fame);
-            let receive_counter = self.receive_counter.clone();
-            let progress = progress.clone();
-            error_reports
-                .map(Ok)
-                .try_for_each(move |(stream, serial, errors)| {
-                    let hall_of_fame = hall_of_fame.clone();
-                    let receive_counter = receive_counter.clone();
-                    let mut progress = progress.clone();
-                    async move {
-                        let recvs = if let Some(stream) = hall_of_fame.read().await.peek(&stream) {
-                            if let Some(recvs) = stream.lock().await.pop(&serial) {
-                                recvs
-                            } else {
-                                return Ok(());
-                            }
-                        } else {
-                            return Ok(());
-                        };
-                        for bridge_id in recvs.into_iter().filter_map(|(id, bridge_id)| {
-                            if errors.contains(&id) {
-                                None
-                            } else {
-                                bridge_id
-                            }
-                        }) {
-                            if let Some(counter) =
-                                receive_counter.counters.read().await.get(&bridge_id)
-                            {
-                                counter.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                receive_counter
-                                    .counters
-                                    .write()
-                                    .await
-                                    .entry(bridge_id)
-                                    .or_default()
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        progress
-                            .send(())
-                            .await
-                            .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))
-                    }
-                })
-        };
-        let mut error_reports = spawn.spawn(error_reports).boxed().fuse();
-        let input = input.map(Ok).try_for_each_concurrent(2, {
-            let role = self.role;
-            let stream_polls = Arc::clone(&stream_polls);
-            let timeout_generator = timeout_generator.clone();
-            move |input| {
-                let role = role;
-                let stream_polls = Arc::clone(&stream_polls);
+        let mut error_reports = spawn
+            .spawn({
+                let this = Pin::clone(&self);
+                let progress = progress.clone();
+                async move {
+                    this.as_ref()
+                        .handle_error_reports(error_reports, progress)
+                        .await
+                }
+            })
+            .boxed()
+            .fuse();
+        let mut input = spawn
+            .spawn({
+                let this = Pin::clone(&self);
+                let timeout_generator = timeout_generator.clone();
+                async move { this.as_ref().handle_input(input, timeout_generator).await }
+            })
+            .boxed()
+            .fuse();
+        let mut poll_bridges_out = spawn
+            .spawn({
+                let this = Pin::clone(&self);
                 let timeout_generator = timeout_generator.clone();
                 async move {
-                    let mut input_tx = loop {
-                        trace!("{:?}: find usable stream", role);
-                        let stream_polls = stream_polls.read().await;
-                        if let Some((_, (session_stream, _))) =
-                            stream_polls.iter().choose(&mut StdRng::from_entropy())
-                        {
-                            break session_stream.input_tx.clone();
-                        } else {
-                            // explicit drop
-                            drop(stream_polls);
-                            timeout_generator(Duration::new(1, 0)).await;
-                        }
-                    };
-                    input_tx.send(input).await
+                    this.as_ref()
+                        .handle_bridges_out(bridges_out_rx, timeout_generator)
+                        .await
                 }
-            }
-        });
-        let mut input = spawn.spawn(input).boxed().fuse();
-        let poll_bridges_out = bridges_out_rx
-            .map(Ok::<_, String>)
-            .try_for_each_concurrent(2, {
-                let role = self.role;
-                let bridges_out = Arc::clone(&bridges_out);
+            })
+            .boxed()
+            .fuse();
+        let mut poll_bridges_in = spawn
+            .spawn({
+                let this = Pin::clone(&self);
                 let timeout_generator = timeout_generator.clone();
-                let send_counter = self.send_counter.clone();
-                move |outbound| {
-                    let bridges_out = Arc::clone(&bridges_out);
-                    let timeout_generator = timeout_generator.clone();
-                    let send_counter = send_counter.clone();
-                    async move {
-                        let mut rng = StdRng::from_entropy();
-                        let (bridge_id, mut tx) = loop {
-                            trace!("{:?}: find usable bridge", role);
-                            let bridges_out = bridges_out.read().await;
-                            if let Some((bridge_id, bridge)) = bridges_out.iter().choose(&mut rng) {
-                                break (bridge_id.clone(), ClonableSink::clone_pin_box(&**bridge));
-                            } else {
-                                drop(bridges_out);
-                                timeout_generator(Duration::new(1, 0)).await;
-                            }
-                        };
-                        match tx.send(outbound).await {
-                            Err(e) => error!("poll_bridges_out: {}", e),
-                            _ => (),
-                        }
-                        if let Some(counter) = send_counter.counters.read().await.get(&bridge_id) {
-                            counter.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            send_counter
-                                .counters
-                                .write()
-                                .await
-                                .entry(bridge_id)
-                                .or_default()
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(())
-                    }
-                }
-            });
-        let mut poll_bridges_out = spawn.spawn(poll_bridges_out).boxed().fuse();
-        let poll_bridges_in = bridges_in_rx.for_each_concurrent(2, {
-            let stream_polls = Arc::clone(&stream_polls);
-            let hall_of_fame = Arc::clone(&hall_of_fame);
-            let timeout_generator = timeout_generator.clone();
-            move |(bridge_id, inbound)| {
-                let timeout_generator = timeout_generator.clone();
-                let stream_polls = Arc::clone(&stream_polls);
-                let hall_of_fame = Arc::clone(&hall_of_fame);
                 async move {
-                    let stream = match &inbound {
-                        BridgeMessage::PayloadFeedback { stream, .. } => *stream,
-                        BridgeMessage::Payload { raw_shard_id, .. } => raw_shard_id.stream,
-                    };
-                    let report = if let BridgeMessage::Payload {
-                        raw_shard_id: RawShardId { stream, serial, id },
-                        ..
-                    } = &inbound
-                    {
-                        Some((*stream, *serial, *id, bridge_id))
-                    } else {
-                        None
-                    };
-                    match loop {
-                        let stream_polls = stream_polls.read().await;
-                        if let Some((session_stream, _)) = stream_polls.get(&stream) {
-                            break ClonableSink::clone_pin_box(&*session_stream.bridges_in_tx);
-                        } else {
-                            drop(stream_polls);
-                            timeout_generator(Duration::new(1, 0)).await;
-                        }
-                    }
-                    .send(inbound)
-                    .await
-                    {
-                        Ok(_) => {
-                            if let Some((stream, serial, id, bridge_id)) = report {
-                                let fame = hall_of_fame.read().await;
-                                if let Some(stream) = fame.peek(&stream) {
-                                    let mut stream = stream.lock().await;
-                                    if let Some(serial) = stream.peek_mut(&serial) {
-                                        let id = serial.entry(id).or_default();
-                                        if id.is_some() {
-                                            id.take();
-                                        }
-                                    } else {
-                                        let mut map = HashMap::new();
-                                        map.insert(id, Some(bridge_id));
-                                        stream.put(serial, map);
-                                    }
-                                } else {
-                                    drop(fame);
-                                    let mut fame = hall_of_fame.write().await;
-                                    if let Some(stream) = fame.peek(&stream) {
-                                        let mut stream = stream.lock().await;
-                                        if let Some(serial) = stream.peek_mut(&serial) {
-                                            let id = serial.entry(id).or_default();
-                                            if let Some(bridge_id_) = id {
-                                                if *bridge_id_ != bridge_id {
-                                                    id.take();
-                                                }
-                                            }
-                                        } else {
-                                            let mut map = HashMap::new();
-                                            map.insert(id, Some(bridge_id));
-                                            stream.put(serial, map);
-                                        }
-                                    } else {
-                                        let mut table = LruCache::new(255);
-                                        let mut map = HashMap::new();
-                                        map.insert(id, Some(bridge_id));
-                                        table.put(serial, map);
-                                        fame.put(stream, Mutex::new(table));
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => error!("poll_bridges_in: {}", e),
-                    }
+                    this.as_ref()
+                        .handle_bridges_in(bridges_in_rx, timeout_generator)
+                        .await
                 }
-            }
-        });
-        let mut poll_bridges_in = spawn.spawn(poll_bridges_in).boxed().fuse();
-        let poll_master_messages = master_messages.map(Ok).try_for_each({
-            let this = Pin::clone(&self);
-            let stream_polls = Arc::clone(&stream_polls);
-            let bridge_polls = Arc::clone(&bridge_polls);
-            let bridges_in_tx = bridges_in_tx.clone();
-            let bridges_out_tx = bridges_out_tx.clone();
-            let bridges_out = Arc::clone(&bridges_out);
-            let timeout_generator = timeout_generator.clone();
-            let progress = progress.clone();
-            let spawn = spawn.clone();
-            move |request| {
-                let this = Pin::clone(&this);
-                let stream_polls = Arc::clone(&stream_polls);
-                let bridge_polls = Arc::clone(&bridge_polls);
-                let bridges_in_tx = bridges_in_tx.clone();
-                let bridges_out_tx = bridges_out_tx.clone();
-                let bridges_out = Arc::clone(&bridges_out);
+            })
+            .boxed()
+            .fuse();
+        let mut poll_master_messages = spawn
+            .spawn({
+                let this = Pin::clone(&self);
+                let progress = progress.clone();
                 let timeout_generator = timeout_generator.clone();
-                let mut progress = progress.clone();
                 let spawn = spawn.clone();
+                let bridges_out_tx = bridges_out_tx.clone();
                 async move {
-                    match request {
-                        Message::Client(ClientMessage {
-                            serial,
-                            session,
-                            variant: Redact(variant),
-                        }) => {
-                            trace!("{:?}: incoming client message", this.role);
-                            let tag = (session.clone(), serial);
-                            match variant.decode_with_tag(&this.inbound_guard, &tag) {
-                                Ok(variant) => {
-                                    // prevent replay
-                                    if let Err(local_serial) = this.assert_valid_serial(serial) {
-                                        info!(
-                                            "{:?}: outdated serial, should be at least {}",
-                                            this.role, local_serial
-                                        );
-                                        return this
-                                            .as_ref()
-                                            .notify_serial(local_serial, true)
-                                            .await;
-                                    }
-                                    match variant {
-                                        ClientMessageVariant::BridgeNegotiate(negotiation) => {
-                                            trace!(
-                                                "{:?}: incoming bridge negotiation message",
-                                                this.role
-                                            );
-                                            match negotiation {
-                                                BridgeNegotiationMessage::ProposeAsk => {
-                                                    trace!(
-                                                        "{:?}: peer wants new bridges",
-                                                        this.role
-                                                    );
-                                                    this.as_ref().answer_ask_proposal().await?
-                                                }
-                                                BridgeNegotiationMessage::Ask(proposals) => {
-                                                    trace!(
-                                                        "{:?}: peer wants new bridge rendevous",
-                                                        this.role
-                                                    );
-                                                    this.as_ref()
-                                                        .apply_proposal(
-                                                            &proposals,
-                                                            &mut *bridge_polls.write().await,
-                                                            bridges_in_tx.clone(),
-                                                            &mut *bridges_out.write().await,
-                                                            spawn.clone(),
-                                                        )
-                                                        .await;
-                                                }
-                                                BridgeNegotiationMessage::Retract(bridges_) => {
-                                                    trace!(
-                                                        "{:?}: peer wants to tear down bridges",
-                                                        this.role
-                                                    );
-                                                    let mut bridges_out = bridges_out.write().await;
-                                                    for BridgeRetract(id) in bridges_ {
-                                                        bridges_out.remove(&id);
-                                                        bridge_polls.write().await.remove(&id);
-                                                    }
-                                                }
-                                                BridgeNegotiationMessage::AskProposal(
-                                                    proposals,
-                                                ) => {
-                                                    trace!(
-                                                        "{:?}: peer sends some bridge proposals",
-                                                        this.role
-                                                    );
-                                                    let asks = this
-                                                        .as_ref()
-                                                        .apply_proposal(
-                                                            &proposals,
-                                                            &mut *bridge_polls.write().await,
-                                                            bridges_in_tx.clone(),
-                                                            &mut *bridges_out.write().await,
-                                                            spawn.clone(),
-                                                        )
-                                                        .await;
-                                                    this.as_ref().ask_bridge(asks).await?
-                                                }
-                                                BridgeNegotiationMessage::QueryHealth => {
-                                                    trace!(
-                                                        "{:?}: peer queries bridge health",
-                                                        this.role
-                                                    );
-                                                    this.as_ref()
-                                                        .answer_bridge_health_query()
-                                                        .await?
-                                                }
-                                                BridgeNegotiationMessage::Health(health) => {
-                                                    trace!(
-                                                        "{:?}: peer answers bridge health",
-                                                        this.role
-                                                    );
-                                                    let mut counters = this
-                                                        .send_success_counter
-                                                        .counters
-                                                        .write()
-                                                        .await;
-                                                    for (id, count) in health {
-                                                        counters
-                                                            .entry(id)
-                                                            .or_default()
-                                                            .fetch_add(count, Ordering::Relaxed);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        ClientMessageVariant::Stream(request) => match request {
-                                            StreamRequest::Reset { stream, window } => {
-                                                trace!("{:?}: peer resets a stream", this.role);
-                                                let (session_stream, poll) = this.new_stream(
-                                                    stream,
-                                                    window,
-                                                    bridges_out_tx.clone(),
-                                                    timeout_generator.clone(),
-                                                    spawn.clone(),
-                                                );
-                                                stream_polls.write().await.insert(
-                                                    stream,
-                                                    (session_stream, Box::pin(poll.shared())),
-                                                );
-                                            }
-                                        },
-                                        ClientMessageVariant::Ok | ClientMessageVariant::Err => {
-                                            trace!("{:?}: peer answers", this.role);
-                                            this.update_remote_serial(serial);
-                                            return progress.send(()).await.map_err(|e| {
-                                                SessionError::BrokenPipe(
-                                                    Box::new(e),
-                                                    <_>::default(),
-                                                )
-                                            });
-                                        }
-                                    }
-                                    this.as_ref()
-                                        .notify_serial(this.update_local_serial(serial), false)
-                                        .await?;
-                                    progress.send(()).await.map_err(|e| {
-                                        SessionError::BrokenPipe(Box::new(e), <_>::default())
-                                    })
-                                }
-                                Err(e) => {
-                                    error!("decode error: {}", e);
-                                    Ok(())
-                                }
-                            }
-                        }
-                        _ => {
-                            info!("unknown message, ignored");
-                            Ok(())
-                        }
-                    }
+                    this.handle_master_messages(
+                        master_messages,
+                        bridges_in_tx,
+                        bridges_out_tx,
+                        progress,
+                        timeout_generator,
+                        spawn,
+                    )
+                    .await
                 }
-            }
-        });
-        let mut poll_master_messages = spawn.spawn(poll_master_messages).boxed().fuse();
+            })
+            .boxed()
+            .fuse();
 
-        let poll_streams = {
-            let this = Pin::clone(&self);
-            let stream_polls = Arc::clone(&stream_polls);
-            let timeout_generator = timeout_generator.clone();
-            let spawn = spawn.clone();
-            let mut progress = progress.clone();
-            async move {
-                loop {
-                    let polls: Vec<_> = stream_polls
-                        .read()
+        let mut poll_streams = spawn
+            .spawn({
+                let this = Pin::clone(&self);
+                let timeout_generator = timeout_generator.clone();
+                let spawn = spawn.clone();
+                let progress = progress.clone();
+                async move {
+                    this.as_ref()
+                        .handle_streams(bridges_out_tx, progress, timeout_generator, spawn)
                         .await
-                        .iter()
-                        .map(|(stream, (_, polls))| {
-                            let stream: u8 = *stream;
-                            let polls = ClonableSendableFuture::clone_pin_box(&**polls);
-                            polls.map(move |_| stream).boxed()
-                        })
-                        .collect();
-                    if polls.is_empty() {
-                        let (session_stream, poll) = this.as_ref().get_ref().new_stream(
-                            0,
-                            this.params.window,
-                            bridges_out_tx.clone(),
-                            timeout_generator.clone(),
-                            spawn.clone(),
-                        );
-                        stream_polls
-                            .write()
-                            .await
-                            .insert(0, (session_stream, Box::pin(poll.shared())));
-                        this.as_ref().reset_remote_stream(0).await?
-                    } else {
-                        let (stream, _, _) = future::select_all(polls).await;
-                        stream_polls.write().await.remove(&stream);
-                    }
-                    progress
-                        .send(())
-                        .await
-                        .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?
                 }
-            }
-        };
-        let mut poll_streams = poll_streams.boxed().fuse();
-        let poll_bridges = {
-            let this = Pin::clone(&self);
-            let mut progress = progress.clone();
-            let invite_cooldown = Duration::new(10, 0);
-            let role = self.role;
-            let timeout_generator = timeout_generator.clone();
-            async move {
-                let mut last_invite = Instant::now() - Duration::new(10, 0);
-                loop {
-                    trace!("{:?}: poll_bridges", role);
-                    let polls: Vec<_> = bridge_polls
-                        .read()
+            })
+            .boxed()
+            .fuse();
+        let mut poll_bridges = spawn
+            .spawn({
+                let this = Pin::clone(&self);
+                let progress = progress.clone();
+                let invite_cooldown = Duration::new(10, 0);
+                let timeout_generator = timeout_generator.clone();
+                async move {
+                    this.as_ref()
+                        .handle_bridges(invite_cooldown, progress, timeout_generator)
                         .await
-                        .values()
-                        .map(|poll| ClonableSendableFuture::clone_pin_box(&**poll))
-                        .collect();
-                    if polls.is_empty() {
-                        trace!("{:?}: poll_bridges: no bridges, inviting", role);
-                        let now = Instant::now();
-                        let duration_since = now.duration_since(last_invite);
-                        if duration_since > invite_cooldown {
-                            this.as_ref().invite_bridge_proposal().await?;
-                            last_invite = Instant::now();
-                        } else {
-                            trace!(
-                                "{:?}: poll_bridges: last invitation too recent, elapsed={:?}",
-                                role,
-                                duration_since
-                            );
-                            timeout_generator(Duration::new(1, 0)).await;
-                            continue;
-                        }
-                    } else {
-                        let (bridge, _, _) = future::select_all(polls).await;
-                        bridge_polls.write().await.remove(&bridge);
-                        this.send_counter.counters.write().await.remove(&bridge);
-                        this.send_success_counter
-                            .counters
-                            .write()
-                            .await
-                            .remove(&bridge);
-                        this.receive_counter.counters.write().await.remove(&bridge);
-                    }
-                    progress
-                        .send(())
-                        .await
-                        .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?
                 }
-            }
-        };
-        let mut poll_bridges = poll_bridges.boxed().fuse();
-        let poll_bridge_drivers = {
-            let this = Pin::clone(&self);
-            async move {
-                loop {
-                    trace!("{:?}: poll_bridge_drivers", this.role);
-                    let mut bridge_drivers = this.bridge_drivers.write().await;
-                    if bridge_drivers.len() > 0 {
-                        bridge_drivers.next().await;
-                    } else {
-                        drop(bridge_drivers);
-                        timeout_generator(Duration::new(1, 0)).await;
-                    }
-                }
-            }
-        };
-        let mut poll_bridge_drivers = poll_bridge_drivers.boxed().fuse();
+            })
+            .boxed()
+            .fuse();
+        let mut poll_bridge_drivers = spawn
+            .spawn({
+                let this = Pin::clone(&self);
+                async move { this.as_ref().handle_bridge_drivers(timeout_generator).await }
+            })
+            .boxed()
+            .fuse();
         select! {
             result = error_reports => match result {
                 Ok(Err(e)) => {
@@ -1659,10 +863,28 @@ where
             _ = poll_bridges_out => Ok(()),
             _ = poll_master_messages => Ok(()),
             _ = poll_bridge_drivers => Ok(()),
-            result = poll_streams => result,
-            result = poll_bridges => result,
+            r = poll_streams => match r {
+                Ok(Err(e)) => {
+                    Err(e)
+                }
+                Err(e) => {
+                    error!("{:?}: poll_streams: {:?}", self.role, e);
+                    Ok(())
+                }
+                _ => Ok(()),
+            },
+            r = poll_bridges => match r {
+                Ok(Err(e)) => {
+                    Err(e)
+                }
+                Err(e) => {
+                    error!("{:?}: poll_streams: {:?}", self.role, e);
+                    Ok(())
+                }
+                _ => Ok(()),
+            },
             result = input => match result {
-                Ok(Err(e)) => Err(SessionError::BrokenPipe(Box::new(e), <_>::default())),
+                Ok(Err(e)) => Err(e),
                 Err(e) => {
                     error!("{:?}: input: {:?}", self.role, e);
                     Ok(())
@@ -1670,402 +892,6 @@ where
                 _ => Ok(()),
             }
         }
-    }
-
-    pub fn new_stream<T, S>(
-        &self,
-        stream: u8,
-        window: usize,
-        bridges_out_tx: Sender<BridgeMessage>,
-        timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
-        spawn: S,
-    ) -> (SessionStream, impl 'static + Future<Output = ()> + Send)
-    where
-        T: 'static + Send + Future<Output = ()>,
-        S: Spawn + Clone + Send + Sync + 'static,
-        S::Error: 'static,
-    {
-        let (input_tx, input_rx) = channel(window);
-        let (task_notifiers_tx, task_notifiers_rx) = channel(window);
-        let (bridges_in_tx, bridges_in_rx) = unbounded();
-        let bridges_in_tx = Box::new(
-            bridges_in_tx
-                .sink_map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default())),
-        ) as _;
-        let task_notifiers_tx = task_notifiers_tx.sink_map_err(|e| Box::new(e) as GenericError);
-        let (payload_tx, payload_rx) = unbounded();
-        let (feedback_tx, feedback_rx) = unbounded();
-        let poll_bridges_in = bridges_in_rx.map(Ok::<_, GenericError>).try_fold(
-            (payload_tx, feedback_tx),
-            move |(mut payload_tx, mut feedback_tx), message| {
-                async move {
-                    match message {
-                        BridgeMessage::Payload {
-                            raw_shard,
-                            raw_shard_id,
-                        } => {
-                            payload_tx.send((raw_shard, raw_shard_id)).await?;
-                        }
-                        BridgeMessage::PayloadFeedback {
-                            feedback,
-                            stream: stream_,
-                        } if stream == stream_ => {
-                            feedback_tx.send(feedback).await?;
-                        }
-                        _ => eprintln!("unknown message"),
-                    }
-                    Ok((payload_tx, feedback_tx))
-                }
-            },
-        );
-        let spawn_ = spawn.clone();
-        let poll_bridges_in = async move { spawn_.spawn(poll_bridges_in).await };
-        let task_notifiers: Arc<RwLock<BTreeMap<u64, TaskProgressNotifier>>> = <_>::default();
-        let poll_task_notifiers = task_notifiers_rx.for_each({
-            let task_notifiers = Arc::clone(&task_notifiers);
-            move |(serial, task_notifier)| {
-                let task_notifiers = Arc::clone(&task_notifiers);
-                async move {
-                    task_notifiers.write().await.insert(serial, task_notifier);
-                }
-            }
-        });
-        let spawn_ = spawn.clone();
-        let poll_task_notifiers = async move { spawn_.spawn(poll_task_notifiers).await };
-
-        let send_queue = Arc::new(SendQueue::new(
-            stream,
-            window,
-            Box::new(task_notifiers_tx) as _,
-        ));
-        let receive_queue = Arc::new(ReceiveQueue::new());
-
-        let poll_feedback = {
-            let task_notifiers_ptr = Arc::clone(&task_notifiers);
-            let send_queue = Arc::clone(&send_queue);
-            let timeout_generator = timeout_generator.clone();
-            let send_cooldown = self.send_cooldown;
-            let mut feedback_rx = feedback_rx.fuse();
-            let role = self.role;
-            async move {
-                loop {
-                    trace!("{:?}: poll_feedback", role);
-                    let task_notifiers = task_notifiers_ptr.read().await;
-                    if task_notifiers.len() > window {
-                        drop(task_notifiers);
-                        let mut task_notifiers = task_notifiers_ptr.write().await;
-                        let serials: HashSet<_> = task_notifiers.keys().copied().collect();
-                        if task_notifiers.len() > window {
-                            for serial in serials {
-                                if let None = task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    task_notifiers.remove(&serial);
-                                }
-                            }
-                        }
-                    } else if let Some(feedback) = feedback_rx.next().await {
-                        match feedback {
-                            PayloadFeedback::Ok { serial, id, quorum } => {
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) =
-                                        notifier.lock().await.send(Ok((id, quorum))).await
-                                    {
-                                        error!("pipe: {}", e);
-                                    }
-                                }
-                            }
-                            PayloadFeedback::Duplicate { serial, id, quorum } => {
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) =
-                                        notifier.lock().await.send(Ok((id, quorum))).await
-                                    {
-                                        error!("pipe: {}", e);
-                                    }
-                                }
-                            }
-                            PayloadFeedback::Full { serial, queue_len } => {
-                                error!("backpressure, serial={}, queue={}", serial, queue_len);
-                                send_queue
-                                    .block_sending(timeout_generator(send_cooldown))
-                                    .await
-                            }
-                            PayloadFeedback::OutOfBound {
-                                serial,
-                                start,
-                                queue_len,
-                            } => error!(
-                                "out of bound: serial={}, start={}, queue={}",
-                                serial, start, queue_len
-                            ),
-                            PayloadFeedback::Malformed { serial } => {
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) = notifier
-                                        .lock()
-                                        .await
-                                        .send(Err(RemoteRecvError::Malformed))
-                                        .await
-                                    {
-                                        error!("pipe: {}", e);
-                                    }
-                                }
-                            }
-                            PayloadFeedback::Complete { serial } => {
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) = notifier
-                                        .lock()
-                                        .await
-                                        .send(Err(RemoteRecvError::Complete))
-                                        .await
-                                    {
-                                        error!("pipe: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-        };
-        let spawn_ = spawn.clone();
-        let poll_feedback = async move { spawn_.spawn(poll_feedback).await };
-
-        let poll_send_pending = {
-            let role = self.role;
-            unfold(
-                (Arc::clone(&send_queue), timeout_generator.clone()),
-                move |(send_queue, timeout_generator)| {
-                    async move {
-                        trace!("{:?}: poll_send_pending", role);
-                        loop {
-                            trace!("trying poll from send queue");
-                            if let Some(send) = send_queue.pop().await {
-                                break Some((send, (send_queue, timeout_generator)));
-                            } else {
-                                timeout_generator(Duration::new(1, 0)).await;
-                            }
-                        }
-                    }
-                },
-            )
-            .map(|(raw_shard, raw_shard_id)| {
-                Ok(BridgeMessage::Payload {
-                    raw_shard,
-                    raw_shard_id,
-                })
-            })
-            .forward(bridges_out_tx.clone())
-            .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))
-        };
-        let spawn_ = spawn.clone();
-        let poll_send_pending = async move { spawn_.spawn(poll_send_pending).await };
-
-        let poll_recv = {
-            unfold(
-                (
-                    Arc::clone(&receive_queue),
-                    Arc::clone(&self.codec),
-                    timeout_generator.clone(),
-                ),
-                |(receive_queue, codec, timeout_generator)| {
-                    async move {
-                        trace!("poll_recv");
-                        loop {
-                            trace!("trying poll from receive queue");
-                            if let Some(recv) = receive_queue.poll(&codec).await {
-                                break Some((recv, (receive_queue, codec, timeout_generator)));
-                            } else {
-                                timeout_generator(Duration::new(1, 0)).await
-                            }
-                        }
-                    }
-                },
-            )
-        };
-        let poll_recv = {
-            let receive_queue = Arc::clone(&receive_queue);
-            let codec = Arc::clone(&self.codec);
-            let timeout = Duration::new(1, 0)/* self.receive_timeout */;
-            let timeout_generator = timeout_generator.clone();
-            let mut bridges_out_tx = bridges_out_tx.clone();
-            let mut error_reports = self.error_reports.clone();
-            let mut output = self.output.clone();
-            let role = self.role;
-            async move {
-                let mut poll_recv = Box::pin(poll_recv.fuse());
-                loop {
-                    trace!("{:?}: poll_recv, timeout={:?}", role, timeout);
-                    let front = select! {
-                        front = poll_recv.next() => {
-                            if let Some(front) = front {
-                                front
-                            } else {
-                                break
-                            }
-                        },
-                        _ = timeout_generator(timeout).fuse() => {
-                            if let Some(front) = receive_queue.pop_front().await {
-                                front.poll(&codec)
-                            } else {
-                                continue
-                            }
-                        }
-                    };
-                    match front {
-                        Ok((serial, data, errors)) => {
-                            // hall of shame
-                            let (data, errors) = join!(
-                                output.send(data),
-                                error_reports.send((stream, serial, errors))
-                            );
-                            data?;
-                            errors?;
-                            bridges_out_tx
-                                .send(BridgeMessage::PayloadFeedback {
-                                    stream,
-                                    feedback: PayloadFeedback::Complete { serial },
-                                })
-                                .await?;
-                        }
-                        Err(e) => {
-                            // TODO: fine grained error reporting
-                            error!("pop front: {}", e)
-                        }
-                    }
-                }
-                Ok::<_, GenericError>(())
-            }
-        };
-        let spawn_ = spawn.clone();
-        let poll_recv = async move { spawn_.spawn(poll_recv).await };
-
-        let mut shard_state = ShardState::default();
-        for chunk in sha3::Sha3_512::digest(&self.session_key).chunks(32) {
-            for (s, c) in chunk.iter().zip(shard_state.key.iter_mut()) {
-                *c ^= s
-            }
-        }
-        for chunk in sha3::Sha3_512::new()
-            .chain(&self.session_key)
-            .chain(b", stream=")
-            .chain(&[stream])
-            .result()
-            .chunks(32)
-        {
-            for (s, c) in chunk.iter().zip(shard_state.stream_key.iter_mut()) {
-                *c ^= s
-            }
-        }
-
-        let poll_admit = {
-            let receive_queue = Arc::clone(&receive_queue);
-            let shard_state = shard_state;
-            payload_rx
-                .fuse()
-                .filter_map(move |(raw_shard, raw_shard_id)| {
-                    let receive_queue = Arc::clone(&receive_queue);
-                    let serial = raw_shard_id.serial;
-                    async move {
-                        match receive_queue
-                            .admit(raw_shard, raw_shard_id, &shard_state)
-                            .await
-                        {
-                            Ok((id, quorum_size)) => Some(PayloadFeedback::Ok {
-                                serial,
-                                id,
-                                quorum: quorum_size,
-                            }),
-                            Err(ReceiveError::Full(queue_len)) => {
-                                Some(PayloadFeedback::Full { queue_len, serial })
-                            }
-                            Err(ReceiveError::OutOfBound(start, queue_len)) => {
-                                Some(PayloadFeedback::OutOfBound {
-                                    start,
-                                    queue_len,
-                                    serial,
-                                })
-                            }
-                            Err(ReceiveError::Quorum(QuorumError::Duplicate(id, quorum))) => {
-                                Some(PayloadFeedback::Duplicate { serial, id, quorum })
-                            }
-                            Err(ReceiveError::Quorum(QuorumError::Malformed { .. }))
-                            | Err(ReceiveError::Quorum(QuorumError::MismatchContent(..))) => {
-                                Some(PayloadFeedback::Malformed { serial })
-                            }
-                            Err(e) => {
-                                error!("admission: {}", e);
-                                None
-                            }
-                        }
-                    }
-                })
-                .map(move |feedback| Ok(BridgeMessage::PayloadFeedback { stream, feedback }))
-                .forward(bridges_out_tx.clone())
-        };
-        let spawn_ = spawn.clone();
-        let poll_admit = async move { spawn_.spawn(poll_admit).await };
-
-        let poll_send = input_rx.map(Ok).try_for_each_concurrent(2, {
-            let send_queue = Arc::clone(&send_queue);
-            let shard_state = shard_state;
-            let codec = Arc::clone(&self.codec);
-            let timeout_generator = timeout_generator.clone();
-            let timeout = self.send_cooldown;
-            move |input| {
-                let send_queue = Arc::clone(&send_queue);
-                let codec = Arc::clone(&codec);
-                let timeout_generator = timeout_generator.clone();
-                async move {
-                    match send_queue
-                        .send(&input, &shard_state, &codec, timeout_generator, timeout)
-                        .await
-                    {
-                        Ok(_) => (),
-                        Err(SendError::BrokenPipe) => {
-                            return Err(SessionError::BrokenPipe(
-                                Box::new(SendError::BrokenPipe.compat()),
-                                <_>::default(),
-                            ))
-                        }
-                        Err(e) => error!("send: {}", e),
-                    }
-                    Ok(())
-                }
-            }
-        });
-        let spawn_ = spawn.clone();
-        let poll_send = async move { spawn_.spawn(poll_send).await };
-
-        let poll_all = async move {
-            select! {
-                _ = poll_bridges_in.boxed().fuse() => (),
-                _ = poll_task_notifiers.boxed().fuse() => (),
-                _ = poll_feedback.boxed().fuse() => (),
-                _ = poll_send_pending.boxed().fuse() => (),
-                _ = poll_recv.fuse() => (),
-                _ = poll_admit.boxed().fuse() => (),
-                _ = poll_send.boxed().fuse() => (),
-            }
-        };
-
-        (
-            SessionStream {
-                send_queue,
-                receive_queue,
-                bridges_in_tx,
-                input_tx,
-            },
-            poll_all,
-        )
     }
 }
 
@@ -2271,9 +1097,7 @@ where
             .aead
             .encrypt(GenericArray::from_slice(&nonce), &payload[..])
             .expect("correct key sizes and bounds");
-        // error!("encode: ctxt={:?}, nonce={:?}", buf, nonce);
         buf.splice(..0, nonce.to_vec());
-        // error!("encode: ctxt+nonce={:?}", buf);
         buf
     }
     fn encode_with_tag(&self, payload: P, tag: &T) -> Vec<u8> {
@@ -2292,20 +1116,16 @@ where
                 },
             )
             .expect("correct key sizes and bounds");
-        // error!("encode: ctxt={:?}, nonce={:?}, tag={:?}", buf, nonce, tag);
         buf.splice(..0, nonce.to_vec());
-        // error!("encode: ctxt+nonce={:?}", buf);
         buf
     }
     fn decode(&self, data: &[u8]) -> Result<P, Self::Error> {
         if data.len() < 12 {
             return Err(Box::new(err_msg("truncated data").compat()));
         }
-        // error!("decode: ctxt+nonce={:?}", data);
         let mut nonce = [0u8; 12];
         nonce[..].copy_from_slice(&data[..12]);
         let (_, data) = data.split_at(12);
-        // error!("decode: ctxt={:?}, nonce={:?}", data, nonce);
         let buf = self
             .aead
             .decrypt(GenericArray::from_slice(&nonce), data)
@@ -2320,12 +1140,10 @@ where
         if data.len() < 12 {
             return Err(Box::new(err_msg("truncated data").compat()));
         }
-        // error!("decode: ctxt+nonce={:?}", data);
         let mut nonce = [0u8; 12];
         nonce[..].copy_from_slice(&data[..12]);
         let (_, data) = data.split_at(12);
         let tag = tag.into_bytes();
-        // error!("decode: ctxt={:?}, nonce={:?}, tag={:?}", data, nonce, tag);
         let buf = self
             .aead
             .decrypt(

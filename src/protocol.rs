@@ -1,25 +1,31 @@
-use std::{
-    collections::{HashSet, VecDeque},
+use core::{
     mem::{transmute, MaybeUninit},
     num::Wrapping,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU64, Ordering},
+    pin::Pin,
+    task::{Context, Poll, Waker},
     time::Duration,
+};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex, RwLock, Weak},
 };
 
 use aead::{Aead, NewAead, Payload};
 use aes_gcm_siv::Aes256GcmSiv;
-use async_std::sync::{Arc, Mutex, RwLock, Weak};
+use async_std::sync::Mutex as AsyncMutex;
 use crossbeam::queue::ArrayQueue;
 use failure::{Backtrace, Fail};
 use futures::{channel::mpsc::unbounded, future::BoxFuture, prelude::*, select};
 use generic_array::GenericArray;
 use lazy_static::lazy_static;
-use log::trace;
+use log::debug;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 use rayon::prelude::*;
 use sha3::{Digest, Sha3_512};
+use slab::Slab;
 use sss::{
     field::GF2561D,
     fourier::{GF2561DG2_255_FFT, GF2561DG2_UNITY_ROOT},
@@ -256,8 +262,15 @@ pub enum QuorumError {
     Mismatch(u8),
     #[fail(display = "mismatch shard content")]
     MismatchContent(u8),
-    #[fail(display = "threshold not met")]
-    Absent(Option<usize>),
+    #[fail(
+        display = "threshold not met: threshold={}, current={}, block={:?}",
+        threshold, current, block
+    )]
+    Absent {
+        threshold: u8,
+        current: u8,
+        block: Option<usize>,
+    },
     #[fail(display = "malformed input")]
     Malformed { data: Vec<u8>, errors: Vec<u8> },
     #[fail(display = "reed solomon: {}", _0)]
@@ -304,12 +317,17 @@ impl Quorum {
 
     pub fn poll(&self, codec: &RSCodec) -> Result<(u64, Vec<u8>, HashSet<u8>), QuorumError> {
         if self.quorum.len() < codec.data as usize {
-            return Err(QuorumError::Absent(Some(codec.data as usize)));
+            return Err(QuorumError::Absent {
+                threshold: codec.data as u8,
+                current: self.quorum.len() as u8,
+                block: None,
+            });
         }
-        let data = self
-            .data
-            .as_ref()
-            .ok_or_else(|| QuorumError::Absent(None))?;
+        let data = self.data.as_ref().ok_or_else(|| QuorumError::Absent {
+            threshold: codec.data as u8,
+            current: 0,
+            block: None,
+        })?;
         let mut all_errors: HashSet<_> = <_>::default();
         let mut result = vec![];
         for (block, report) in codec
@@ -330,7 +348,11 @@ impl Quorum {
                     if self.quorum.len() == 255 {
                         return Err(QuorumError::Lost);
                     } else {
-                        return Err(QuorumError::Absent(Some(block)));
+                        return Err(QuorumError::Absent {
+                            threshold: codec.data as u8,
+                            current: self.quorum.len() as u8,
+                            block: Some(block),
+                        });
                     }
                 }
             }
@@ -525,6 +547,7 @@ pub struct ReceiveQueue {
     queue: RwLock<VecDeque<Mutex<Quorum>>>,
     start: RwLock<Wrapping<u64>>,
     window: Option<u32>,
+    wait_queue: WakerQueue,
 }
 
 #[derive(Fail, Debug, From)]
@@ -545,10 +568,11 @@ impl ReceiveQueue {
             queue: <_>::default(),
             start: <_>::default(),
             window: <_>::default(),
+            wait_queue: <_>::default(),
         }
     }
 
-    pub async fn admit(
+    pub fn admit(
         &self,
         raw_shard: RawShard,
         raw_shard_id: RawShardId,
@@ -559,20 +583,21 @@ impl ReceiveQueue {
         let shard = raw_shard.clone().verify_proof(shard_id.into_inner())?;
 
         let window = self.window.unwrap_or(256) as usize;
-        let start = self.start.read().await;
+        let start = self.start.read().unwrap_or_else(|e| e.into_inner());
         let Wrapping(idx) = Wrapping(serial) - *start;
         let idx = idx as usize;
         if idx < 4 * window {
-            let queue = self.queue.read().await;
+            let queue = self.queue.read().unwrap_or_else(|e| e.into_inner());
             if idx >= queue.len() {
                 drop(queue);
-                let mut queue = self.queue.write().await;
+                let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
                 let len = queue.len();
                 queue.resize_with(std::cmp::max(len, idx + 1), <_>::default);
             }
-            let queue = self.queue.read().await;
-            let mut q = queue[idx].lock().await;
+            let queue = self.queue.read().unwrap_or_else(|e| e.into_inner());
+            let mut q = queue[idx].lock().unwrap_or_else(|e| e.into_inner());
             let result = q.insert(serial, shard)?;
+            self.wait_queue.try_notify_next();
             if idx > window {
                 Err(ReceiveError::Full(queue.len()))
             } else {
@@ -581,30 +606,31 @@ impl ReceiveQueue {
         } else {
             Err(ReceiveError::OutOfBound(
                 start.0,
-                self.queue.read().await.len(),
+                self.queue.read().unwrap_or_else(|e| e.into_inner()).len(),
             ))
         }
     }
 
-    pub async fn pop_front(&self) -> Option<Quorum> {
-        let mut start = self.start.write().await;
-        let mut queue = self.queue.write().await;
+    pub fn pop_front(&self) -> Option<Quorum> {
+        let mut start = self.start.write().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
         if let Some(q) = queue.pop_front() {
             *start += Wrapping(1);
-            Some(q.into_inner())
+            self.wait_queue.try_notify_next();
+            Some(q.into_inner().unwrap_or_else(|e| e.into_inner()))
         } else {
             None
         }
     }
 
-    pub async fn poll(
+    fn try_poll(
         &self,
         codec: &RSCodec,
     ) -> Option<Result<(u64, Vec<u8>, HashSet<u8>), QuorumError>> {
-        let mut start = self.start.write().await;
-        let mut queue = self.queue.write().await;
+        let mut start = self.start.write().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
         if let Some(front) = queue.front() {
-            let front = front.lock().await;
+            let front = front.lock().unwrap_or_else(|e| e.into_inner());
             let result = front.poll(&codec);
             if result.is_ok() {
                 drop(front);
@@ -617,11 +643,105 @@ impl ReceiveQueue {
         }
     }
 
-    pub async fn reset(&self) {
-        let mut start = self.start.write().await;
-        let mut queue = self.queue.write().await;
+    pub fn poll<'a, 'b>(&'a self, codec: &'b RSCodec) -> ReceiveQueuePoll<'a, 'b> {
+        ReceiveQueuePoll {
+            queue: self,
+            codec,
+            key: None,
+        }
+    }
+
+    pub fn reset(&self) {
+        let mut start = self.start.write().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
         *start = Wrapping(0);
         queue.drain(..);
+    }
+}
+
+#[derive(Default)]
+struct WakerQueue {
+    wait_queue: Mutex<(VecDeque<usize>, Slab<Option<Waker>>)>,
+}
+
+impl WakerQueue {
+    fn register_poll_waker(&self, key: Option<usize>, w: Waker) -> Option<usize> {
+        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = key {
+            if let Some(entry) = wakers.get_mut(key) {
+                debug!("reload waker");
+                *entry = Some(w);
+                return Some(key);
+            }
+        }
+        debug!("register waker");
+        let entry = wakers.vacant_entry();
+        let key = entry.key();
+        entry.insert(Some(w));
+        queue.push_back(key);
+        Some(key)
+    }
+
+    fn deregister_poll_waker(&self, key: Option<usize>) {
+        if let Some(key) = key {
+            debug!("deregister waker");
+            let (_, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = wakers.get_mut(key) {
+                *entry = None;
+            }
+        }
+    }
+
+    fn try_notify_next(&self) {
+        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(head) = queue.pop_front() {
+            if let Some(Some(waker)) = wakers.get(head) {
+                debug!("waking one poll");
+                waker.wake_by_ref();
+                queue.push_back(head);
+                return;
+            }
+        }
+        wakers.clear();
+    }
+
+    fn try_notify_all(&self) {
+        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let all_keys: Vec<_> = queue.drain(..).collect();
+        for key in all_keys {
+            if let Some(Some(waker)) = wakers.get(key) {
+                waker.wake_by_ref();
+                queue.push_back(key);
+                return;
+            }
+        }
+    }
+}
+
+pub struct ReceiveQueuePoll<'a, 'b> {
+    queue: &'a ReceiveQueue,
+    codec: &'b RSCodec,
+    key: Option<usize>,
+}
+
+impl<'a, 'b> Future for ReceiveQueuePoll<'a, 'b> {
+    type Output = (u64, Vec<u8>, HashSet<u8>);
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        use Poll::*;
+        debug!("recv q poll");
+        if let Some(Ok(result)) = self.queue.try_poll(self.codec) {
+            debug!("recv q ready");
+            self.queue.wait_queue.deregister_poll_waker(self.key);
+            self.queue.wait_queue.try_notify_next();
+            Ready(result)
+        } else {
+            debug!("recv q not ready");
+            self.key = self
+                .queue
+                .wait_queue
+                .register_poll_waker(self.key, cx.waker().clone());
+            Pending
+        }
     }
 }
 
@@ -649,8 +769,9 @@ pub enum RemoteRecvError {
     Decode,
 }
 
-pub type TaskProgressNotifier =
-    Weak<Mutex<dyn Sink<Result<(u8, u8), RemoteRecvError>, Error = GenericError> + Unpin + Send>>;
+pub type TaskProgressNotifier = Weak<
+    AsyncMutex<dyn Sink<Result<(u8, u8), RemoteRecvError>, Error = GenericError> + Unpin + Send>,
+>;
 
 pub type TaskProgressNotifierSink =
     Box<dyn Sink<(u64, TaskProgressNotifier), Error = GenericError> + Unpin + Send>;
@@ -659,14 +780,15 @@ pub struct SendQueue {
     queue: RwLock<ArrayQueue<(RawShard, RawShardId)>>,
     stream: u8,
     serial: AtomicU64,
-    task_notifiers: Mutex<TaskProgressNotifierSink>,
+    task_notifiers: AsyncMutex<TaskProgressNotifierSink>,
     window: usize,
     block_sending: Mutex<Option<BoxFuture<'static, ()>>>,
+    wait_queue: WakerQueue,
 }
 
 impl SendQueue {
     pub fn new(stream: u8, window: usize, task_notifiers: TaskProgressNotifierSink) -> Self {
-        let task_notifiers = Mutex::new(task_notifiers);
+        let task_notifiers = AsyncMutex::new(task_notifiers);
         Self {
             stream,
             window,
@@ -674,15 +796,16 @@ impl SendQueue {
             serial: AtomicU64::default(),
             queue: RwLock::new(ArrayQueue::new(window)),
             block_sending: <_>::default(),
+            wait_queue: <_>::default(),
         }
     }
 
-    pub async fn block_sending(&self, condition: impl 'static + Future<Output = ()> + Send) {
-        *self.block_sending.lock().await = Some(condition.boxed())
+    pub fn block_sending(&self, condition: impl 'static + Future<Output = ()> + Send) {
+        *self.block_sending.lock().unwrap_or_else(|e| e.into_inner()) = Some(condition.boxed())
     }
 
-    pub async fn reset(&self) {
-        let mut queue = self.queue.write().await;
+    pub fn reset(&self) {
+        let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
         *queue = ArrayQueue::new(self.window);
     }
 
@@ -692,19 +815,43 @@ impl SendQueue {
     ) -> Result<(), (RawShard, RawShardId)> {
         use crossbeam::queue::PushError;
 
-        let block_sending = self.block_sending.lock().await.take();
+        let block_sending = self
+            .block_sending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(block_sending) = block_sending {
+            debug!("send queue: back pressure");
             block_sending.await
         }
-        if let Err(PushError(data)) = self.queue.read().await.push(data) {
+        let push = self
+            .queue
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(data);
+        if let Err(PushError(data)) = push {
+            debug!("send queue: full");
             Err(data)
         } else {
             Ok(())
         }
     }
 
-    pub async fn pop(&self) -> Option<(RawShard, RawShardId)> {
-        self.queue.read().await.pop().ok()
+    fn try_pop(&self) -> Option<(RawShard, RawShardId)> {
+        let result = self
+            .queue
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .ok();
+        result
+    }
+
+    pub fn pop<'a>(&'a self) -> SendQueuePop<'a> {
+        SendQueuePop {
+            queue: self,
+            key: None,
+        }
     }
 
     pub async fn send<Timeout>(
@@ -730,7 +877,9 @@ impl SendQueue {
             .collect();
 
         let (tx, rx) = unbounded();
-        let tx = Arc::new(Mutex::new(tx.sink_map_err(|e| Box::new(e) as GenericError)));
+        let tx = Arc::new(AsyncMutex::new(
+            tx.sink_map_err(|e| Box::new(e) as GenericError),
+        ));
         self.task_notifiers
             .lock()
             .await
@@ -742,7 +891,6 @@ impl SendQueue {
         let threshold = codec.threshold();
         for (mut shard, mut shard_id) in shards.drain(..threshold) {
             loop {
-                trace!("enqueue");
                 if let Err((shard_, shard_id_)) = self.enqueue((shard, shard_id)).await {
                     shard = shard_;
                     shard_id = shard_id_;
@@ -779,7 +927,6 @@ impl SendQueue {
         // and we need to try harder now
         for (mut shard, mut shard_id) in shards {
             loop {
-                trace!("enqueue");
                 if let Err((shard_, shard_id_)) = self.enqueue((shard, shard_id)).await {
                     shard = shard_;
                     shard_id = shard_id_;
@@ -809,6 +956,29 @@ impl SendQueue {
         }
         // okay, maybe we have to drop it
         Err(SendError::Exhausted)
+    }
+}
+
+pub struct SendQueuePop<'a> {
+    queue: &'a SendQueue,
+    key: Option<usize>,
+}
+
+impl<'a> Future for SendQueuePop<'a> {
+    type Output = (RawShard, RawShardId);
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        use Poll::*;
+        if let Some(result) = self.queue.try_pop() {
+            self.queue.wait_queue.deregister_poll_waker(self.key);
+            self.queue.wait_queue.try_notify_next();
+            Ready(result)
+        } else {
+            self.key = self
+                .queue
+                .wait_queue
+                .register_poll_waker(self.key, cx.waker().clone());
+            Pending
+        }
     }
 }
 
@@ -847,8 +1017,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_receive() -> Result<(), ReceiveError> {
+        let _guard = slog_envlogger::init();
+        debug!("send_receive");
         let codec = RSCodec::new(31).unwrap();
-        let recv_q = ReceiveQueue::new();
+        let recv_q = Arc::new(ReceiveQueue::new());
         let input_data = &[33, 55, 23, 251];
         let shards = Shard::from_codes(codec.encode(input_data).unwrap());
         let mut key = [0; 32];
@@ -860,17 +1032,29 @@ mod tests {
         let state = ShardState { key, stream_key };
         let stream = 0;
         let serial = 0;
+        let handle = async_std::task::spawn({
+            let recv_q = Arc::clone(&recv_q);
+            async move {
+                let (serial_, result, _) = recv_q.poll(&codec).await;
+                assert_eq!(serial, serial_);
+                assert_eq!(result, input_data);
+            }
+        });
+        debug!("pause");
+        async_std::task::sleep(Duration::new(1, 0)).await;
         futures::stream::iter(shards.iter().take(193))
             .map(|shard| {
-                let (raw_shard, raw_shard_id) = shard.encode_shard(stream, serial, &state);
-                recv_q.admit(raw_shard, raw_shard_id, &state)
+                let recv_q = Arc::clone(&recv_q);
+                async move {
+                    debug!("checking in");
+                    let (raw_shard, raw_shard_id) = shard.encode_shard(stream, serial, &state);
+                    recv_q.admit(raw_shard, raw_shard_id, &state)
+                }
             })
             .buffer_unordered(20)
             .try_collect::<Vec<_>>()
             .await?;
-        let (serial_, result, _) = recv_q.poll(&codec).await.unwrap()?;
-        assert_eq!(serial, serial_);
-        assert_eq!(result, input_data);
+        handle.await;
         Ok(())
     }
 }
