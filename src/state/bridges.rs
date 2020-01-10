@@ -29,6 +29,7 @@ where
                 .map(|poll| ClonableSendableFuture::clone_pin_box(&**poll))
                 .collect();
             if polls.is_empty() {
+                drop(polls);
                 trace!("{:?}: poll_bridges: no bridges, inviting", self.role);
                 let now = Instant::now();
                 let duration_since = now.duration_since(last_invite);
@@ -46,6 +47,7 @@ where
                 }
             } else {
                 let (bridge, _, _) = future::select_all(polls).await;
+                trace!("{:?}: bridge: {:?} terminated", self.role, bridge);
                 self.bridge_polls.write().await.remove(&bridge);
                 self.send_counter.counters.write().await.remove(&bridge);
                 self.send_success_counter

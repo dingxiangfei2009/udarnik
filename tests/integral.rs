@@ -156,8 +156,6 @@ fn entry() {
     let mut rt = tokio::runtime::Builder::new()
         .threaded_scheduler()
         .enable_all()
-        .core_threads(512)
-        // .thread_stack_size(32 << 30)
         .build()
         .unwrap();
     let h = rt.spawn(start(rt.handle().clone()));

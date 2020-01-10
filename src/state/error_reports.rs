@@ -19,14 +19,16 @@ where
             .try_for_each(|(stream, serial, errors)| {
                 let mut progress = progress.clone();
                 async move {
-                    let recvs = if let Some(stream) = self.hall_of_fame.read().await.peek(&stream) {
-                        if let Some(recvs) = stream.lock().await.pop(&serial) {
-                            recvs
+                    let recvs = {
+                        if let Some(stream) = self.hall_of_fame.read().await.peek(&stream) {
+                            if let Some(recvs) = stream.lock().await.pop(&serial) {
+                                recvs
+                            } else {
+                                return Ok(());
+                            }
                         } else {
                             return Ok(());
                         }
-                    } else {
-                        return Ok(());
                     };
                     for bridge_id in recvs.into_iter().filter_map(|(id, bridge_id)| {
                         if errors.contains(&id) {

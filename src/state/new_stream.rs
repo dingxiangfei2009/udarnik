@@ -128,10 +128,24 @@ where
                                 serial,
                                 start,
                                 queue_len,
-                            } => error!(
-                                "out of bound: serial={}, start={}, queue={}",
-                                serial, start, queue_len
-                            ),
+                            } => {
+                                error!(
+                                    "out of bound: serial={}, start={}, queue={}",
+                                    serial, start, queue_len
+                                );
+                                if let Some(notifier) =
+                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
+                                {
+                                    if let Err(e) = notifier
+                                        .lock()
+                                        .await
+                                        .send(Err(RemoteRecvError::Complete))
+                                        .await
+                                    {
+                                        error!("pipe: {}", e);
+                                    }
+                                }
+                            }
                             PayloadFeedback::Malformed { serial } => {
                                 if let Some(notifier) =
                                     task_notifiers.get(&serial).and_then(|n| n.upgrade())
@@ -206,18 +220,9 @@ where
                 |(receive_queue, codec, timeout_generator, role)| {
                     async move {
                         // TODO: BAD LOOP
-                        loop {
-                            select! {
-                                recv = receive_queue.poll(&codec).fuse() => {
-                                    trace!("{:?}: poll_recv: incoming data", role);
-                                    break Some((
-                                        Ok(recv),
-                                        (receive_queue, codec, timeout_generator, role),
-                                    ));
-                                }
-                                _ = timeout_generator(Duration::new(0, 1000000)).fuse() => ()
-                            }
-                        }
+                        let recv = receive_queue.poll(&codec).await;
+                        trace!("{:?}: poll_recv: incoming data", role);
+                        Some((Ok(recv), (receive_queue, codec, timeout_generator, role)))
                     }
                 },
             )
@@ -241,12 +246,12 @@ where
                                 debug!("{:?}: poll_recv: next", role);
                                 front
                             } else {
-                                debug!("{:?}: poll_recv: terminated", role);
+                                error!("{:?}: poll_recv: terminated", role);
                                 break
                             }
                         },
                         _ = timeout_generator(timeout).fuse() => {
-                            debug!("{:?}: poll_recv: timed out", role);
+                            error!("{:?}: poll_recv: timed out({:?})", role, timeout);
                             if let Some(front) = receive_queue.pop_front() {
                                 front.poll(&codec)
                             } else {
@@ -257,6 +262,7 @@ where
                     match front {
                         Ok((serial, data, errors)) => {
                             // hall of shame
+                            error!("{:?}: poll_recv: good packet {}: {:?}", role, serial, data); // TODO: REMOVE
                             let (data, errors) = join!(
                                 output.send(data),
                                 error_reports.send((stream, serial, errors))
@@ -326,11 +332,14 @@ where
                                 })
                             }
                             Err(ReceiveError::Full(queue_len)) => {
-                                trace!("{:?}: poll_admit: full", role);
+                                error!("{:?}: poll_admit: full", role);
                                 Some(PayloadFeedback::Full { queue_len, serial })
                             }
                             Err(ReceiveError::OutOfBound(start, queue_len)) => {
-                                trace!("{:?}: poll_admit: out of bound", role);
+                                error!(
+                                    "{:?}: poll_admit: out of bound, serial={}, start={}, queue={}",
+                                    role, serial, start, queue_len
+                                );
                                 Some(PayloadFeedback::OutOfBound {
                                     start,
                                     queue_len,
@@ -338,12 +347,15 @@ where
                                 })
                             }
                             Err(ReceiveError::Quorum(QuorumError::Duplicate(id, quorum))) => {
-                                trace!("{:?}: poll_admit: duplicate", role);
+                                error!("{:?}: poll_admit: duplicate", role);
                                 Some(PayloadFeedback::Duplicate { serial, id, quorum })
                             }
                             Err(ReceiveError::Quorum(QuorumError::Malformed { .. }))
                             | Err(ReceiveError::Quorum(QuorumError::MismatchContent(..))) => {
-                                trace!("{:?}: poll_admit: malformed/mismatch", role);
+                                error!(
+                                    "{:?}: poll_admit: data {} malformed/mismatch",
+                                    role, serial
+                                );
                                 Some(PayloadFeedback::Malformed { serial })
                             }
                             Err(e) => {
@@ -364,26 +376,29 @@ where
             let codec = Arc::clone(&self.codec);
             let timeout_generator = timeout_generator.clone();
             let timeout = self.send_cooldown;
+            let spawn = spawn.clone();
             move |input| {
                 let send_queue = Arc::clone(&send_queue);
                 let codec = Arc::clone(&codec);
                 let timeout_generator = timeout_generator.clone();
-                async move {
-                    match send_queue
-                        .send(&input, &shard_state, &codec, timeout_generator, timeout)
-                        .await
-                    {
-                        Ok(_) => (),
-                        Err(SendError::BrokenPipe) => {
-                            return Err(SessionError::BrokenPipe(
-                                Box::new(SendError::BrokenPipe.compat()),
-                                <_>::default(),
-                            ))
+                spawn
+                    .spawn(async move {
+                        match send_queue
+                            .send(&input, &shard_state, &codec, timeout_generator, timeout)
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(SendError::BrokenPipe) => {
+                                return Err(SessionError::BrokenPipe(
+                                    Box::new(SendError::BrokenPipe.compat()),
+                                    <_>::default(),
+                                ))
+                            }
+                            Err(e) => error!("send: {}", e),
                         }
-                        Err(e) => error!("send: {}", e),
-                    }
-                    Ok(())
-                }
+                        Ok(())
+                    })
+                    .unwrap_or_else(|e| Ok(error!("spawn: {:?}", e)))
             }
         });
         let poll_send = spawn.spawn(poll_send);

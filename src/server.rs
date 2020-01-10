@@ -156,16 +156,19 @@ where
                                 let master_out = {
                                     let mut progress = progress_tx;
                                     async move {
-                                        while let Some(msg) =
-                                            { master_out.lock().await.next() }.await
-                                        {
-                                            message_sink.send(msg).await?;
-                                            progress.send(()).await.map_err(|e| {
-                                                SessionError::BrokenPipe(
-                                                    Box::new(e),
-                                                    <_>::default(),
-                                                )
-                                            })?;
+                                        loop {
+                                            let msg = { master_out.lock().await.next().await };
+                                            if let Some(msg) = msg {
+                                                message_sink.send(msg).await?;
+                                                progress.send(()).await.map_err(|e| {
+                                                    SessionError::BrokenPipe(
+                                                        Box::new(e),
+                                                        <_>::default(),
+                                                    )
+                                                })?;
+                                            } else {
+                                                break;
+                                            }
                                         }
                                         Ok::<_, SessionError>(())
                                     }
