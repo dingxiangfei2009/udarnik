@@ -53,7 +53,7 @@ fn main() -> Result<(), Error> {
             private,
             public,
         } => {
-            let init: RawInit = serde_json::from_reader(std::fs::File::open(init)?)?;
+            let init: RawInit = serde_json::from_reader(File::open(init)?)?;
             let init = Init::try_from(init)?;
             let (prikey, pubkey) = keygen(&mut rng, &init);
             let prikey = RawPrivateKey::from(prikey);

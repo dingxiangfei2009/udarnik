@@ -3,6 +3,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Mutex;
 
+use dyn_clone::{clone_box, DynClone};
 use futures::{
     future::{Either, FusedFuture},
     prelude::*,
@@ -365,5 +366,53 @@ impl Spawn for TokioSpawn {
         T: Send + 'static,
     {
         Box::new(Box::pin(self.0.spawn(f)))
+    }
+}
+
+pub trait ClonableFuture<O>: DynClone + Future<Output = O> {
+    fn clone_box(&self) -> Box<dyn ClonableFuture<O>>;
+    fn clone_pin_box(&self) -> Pin<Box<dyn ClonableFuture<O>>> {
+        ClonableFuture::clone_box(self).into()
+    }
+}
+
+impl<T, O> ClonableFuture<O> for T
+where
+    T: 'static + Clone + Future<Output = O>,
+{
+    fn clone_box(&self) -> Box<dyn ClonableFuture<O>> {
+        clone_box(self)
+    }
+}
+
+pub trait ClonableSendableFuture<O>: Send + ClonableFuture<O> {
+    fn clone_box(&self) -> Box<dyn Send + ClonableSendableFuture<O>>;
+    fn clone_pin_box(&self) -> Pin<Box<dyn Send + ClonableSendableFuture<O>>> {
+        ClonableSendableFuture::clone_box(self).into()
+    }
+}
+
+impl<T, O> ClonableSendableFuture<O> for T
+where
+    T: 'static + Send + Clone + Future<Output = O>,
+{
+    fn clone_box(&self) -> Box<dyn Send + ClonableSendableFuture<O>> {
+        clone_box(self)
+    }
+}
+
+pub trait ClonableSink<T, E>: DynClone + Sink<T, Error = E> {
+    fn clone_box(&self) -> Box<dyn Send + Sync + ClonableSink<T, E>>;
+    fn clone_pin_box(&self) -> Pin<Box<dyn Send + Sync + ClonableSink<T, E>>> {
+        ClonableSink::clone_box(self).into()
+    }
+}
+
+impl<X, T, E> ClonableSink<T, E> for X
+where
+    X: 'static + Send + Sync + Clone + Sink<T, Error = E>,
+{
+    fn clone_box(&self) -> Box<dyn Send + Sync + ClonableSink<T, E>> {
+        clone_box(self)
     }
 }

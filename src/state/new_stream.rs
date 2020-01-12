@@ -1,5 +1,7 @@
 use super::*;
 
+use log::warn;
+
 impl<G> Session<G>
 where
     G: 'static
@@ -22,6 +24,7 @@ where
         S: Spawn + Clone + Send + Sync + 'static,
         S::Error: 'static,
     {
+        let (progress_tx, mut progress) = channel(4096);
         let (input_tx, input_rx) = channel(window);
         let (task_notifiers_tx, task_notifiers_rx) = channel(window);
         let (bridges_in_tx, bridges_in_rx) = channel(4096);
@@ -59,6 +62,7 @@ where
         let task_notifiers: Arc<RwLock<BTreeMap<u64, TaskProgressNotifier>>> = <_>::default();
         let poll_task_notifiers = task_notifiers_rx.for_each({
             let task_notifiers = Arc::clone(&task_notifiers);
+            let role = self.role;
             move |(serial, task_notifier)| {
                 let task_notifiers = Arc::clone(&task_notifiers);
                 async move {
@@ -81,102 +85,112 @@ where
             let timeout_generator = timeout_generator.clone();
             let send_cooldown = self.send_cooldown;
             let mut feedback_rx = feedback_rx.fuse();
+            let mut progress = progress_tx.clone();
+            let role = self.role;
             async move {
-                loop {
-                    let task_notifiers = task_notifiers_ptr.read().await;
-                    if task_notifiers.len() > window {
-                        drop(task_notifiers);
-                        let mut task_notifiers = task_notifiers_ptr.write().await;
-                        let serials: HashSet<_> = task_notifiers.keys().copied().collect();
+                while let Some(feedback) = feedback_rx.next().await {
+                    {
+                        let task_notifiers = task_notifiers_ptr.read().await;
                         if task_notifiers.len() > window {
-                            for serial in serials {
-                                if let None = task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    task_notifiers.remove(&serial);
-                                }
-                            }
-                        }
-                    } else if let Some(feedback) = feedback_rx.next().await {
-                        match feedback {
-                            PayloadFeedback::Ok { serial, id, quorum } => {
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) =
-                                        notifier.lock().await.send(Ok((id, quorum))).await
+                            debug!("{:?}: task notifier overflow, cleaning", role);
+                            drop(task_notifiers);
+                            let mut task_notifiers = task_notifiers_ptr.write().await;
+                            let serials: HashSet<_> = task_notifiers.keys().copied().collect();
+                            if task_notifiers.len() > window {
+                                for serial in serials {
+                                    if let None =
+                                        task_notifiers.get(&serial).and_then(|n| n.upgrade())
                                     {
-                                        error!("pipe: {}", e);
-                                    }
-                                }
-                            }
-                            PayloadFeedback::Duplicate { serial, id, quorum } => {
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) =
-                                        notifier.lock().await.send(Ok((id, quorum))).await
-                                    {
-                                        error!("pipe: {}", e);
-                                    }
-                                }
-                            }
-                            PayloadFeedback::Full { serial, queue_len } => {
-                                error!("backpressure, serial={}, queue={}", serial, queue_len);
-                                send_queue.block_sending(timeout_generator(send_cooldown))
-                            }
-                            PayloadFeedback::OutOfBound {
-                                serial,
-                                start,
-                                queue_len,
-                            } => {
-                                error!(
-                                    "out of bound: serial={}, start={}, queue={}",
-                                    serial, start, queue_len
-                                );
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) = notifier
-                                        .lock()
-                                        .await
-                                        .send(Err(RemoteRecvError::Complete))
-                                        .await
-                                    {
-                                        error!("pipe: {}", e);
-                                    }
-                                }
-                            }
-                            PayloadFeedback::Malformed { serial } => {
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) = notifier
-                                        .lock()
-                                        .await
-                                        .send(Err(RemoteRecvError::Malformed))
-                                        .await
-                                    {
-                                        error!("pipe: {}", e);
-                                    }
-                                }
-                            }
-                            PayloadFeedback::Complete { serial } => {
-                                if let Some(notifier) =
-                                    task_notifiers.get(&serial).and_then(|n| n.upgrade())
-                                {
-                                    if let Err(e) = notifier
-                                        .lock()
-                                        .await
-                                        .send(Err(RemoteRecvError::Complete))
-                                        .await
-                                    {
-                                        error!("pipe: {}", e);
+                                        task_notifiers.remove(&serial);
                                     }
                                 }
                             }
                         }
-                    } else {
-                        break;
+                    }
+                    let task_notifiers = task_notifiers_ptr.read().await;
+                    match feedback {
+                        PayloadFeedback::Ok { serial, id, quorum } => {
+                            if let Some(mut notifier) = task_notifiers
+                                .get(&serial)
+                                .and_then(|n| n.upgrade())
+                                .map(|n| ClonableSink::clone_pin_box(&**n))
+                            {
+                                if let Err(e) = notifier.send(Ok((id, quorum))).await {
+                                    error!("pipe: {}", e);
+                                }
+                            }
+                            if let Err(e) = progress.send(()).await {
+                                error!("pipe: {}", e);
+                                break;
+                            }
+                        }
+                        PayloadFeedback::Duplicate { serial, id, quorum } => {
+                            if let Some(mut notifier) = task_notifiers
+                                .get(&serial)
+                                .and_then(|n| n.upgrade())
+                                .map(|n| ClonableSink::clone_pin_box(&**n))
+                            {
+                                if let Err(e) = notifier.send(Ok((id, quorum))).await {
+                                    error!("pipe: {}", e);
+                                }
+                            }
+                        }
+                        PayloadFeedback::Full { serial, queue_len } => {
+                            warn!("backpressure, serial={}, queue={}", serial, queue_len);
+                            send_queue.block_sending(timeout_generator(send_cooldown));
+                            info!(
+                                "{:?}: feedback: full, serial={}, queue={}",
+                                role, serial, queue_len
+                            );
+                        }
+                        PayloadFeedback::OutOfBound {
+                            serial,
+                            start,
+                            queue_len,
+                        } => {
+                            error!(
+                                "out of bound: serial={}, start={}, queue={}",
+                                serial, start, queue_len
+                            );
+                            if let Some(mut notifier) = task_notifiers
+                                .get(&serial)
+                                .and_then(|n| n.upgrade())
+                                .map(|n| ClonableSink::clone_pin_box(&**n))
+                            {
+                                if let Err(e) = notifier.send(Err(RemoteRecvError::Complete)).await
+                                {
+                                    error!("pipe: {}", e);
+                                }
+                            }
+                        }
+                        PayloadFeedback::Malformed { serial } => {
+                            if let Some(mut notifier) = task_notifiers
+                                .get(&serial)
+                                .and_then(|n| n.upgrade())
+                                .map(|n| ClonableSink::clone_pin_box(&**n))
+                            {
+                                if let Err(e) = notifier.send(Err(RemoteRecvError::Malformed)).await
+                                {
+                                    error!("pipe: {}", e);
+                                }
+                            }
+                        }
+                        PayloadFeedback::Complete { serial } => {
+                            if let Some(mut notifier) = task_notifiers
+                                .get(&serial)
+                                .and_then(|n| n.upgrade())
+                                .map(|n| ClonableSink::clone_pin_box(&**n))
+                            {
+                                if let Err(e) = notifier.send(Err(RemoteRecvError::Complete)).await
+                                {
+                                    error!("pipe: {}", e);
+                                }
+                            }
+                            if let Err(e) = progress.send(()).await {
+                                error!("pipe: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -198,13 +212,20 @@ where
                     }
                 },
             )
-            .map(|(raw_shard, raw_shard_id)| {
-                Ok(BridgeMessage::Payload {
-                    raw_shard,
-                    raw_shard_id,
-                })
-            })
-            .forward(bridges_out_tx.clone())
+                .map(Ok)
+                .try_for_each({
+                    let bridges_out_tx = bridges_out_tx.clone();
+                    let progress = progress_tx.clone();
+                    move |(raw_shard, raw_shard_id)| {
+                        let mut bridges_out_tx = bridges_out_tx.clone();
+                        let mut progress = progress.clone();
+                        async move {
+                        bridges_out_tx.send(BridgeMessage::Payload {
+                            raw_shard,
+                            raw_shard_id,
+                        }).await?;
+                        progress.send(()).await
+                    }}})
             .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))
         };
         let poll_send_pending = spawn.spawn(poll_send_pending);
@@ -235,11 +256,17 @@ where
             let mut bridges_out_tx = bridges_out_tx.clone();
             let mut error_reports = self.error_reports.clone();
             let mut output = self.output.clone();
+            let mut progress = progress_tx.clone();
             let role = self.role;
             async move {
                 let mut poll_recv = Box::pin(poll_recv.fuse());
                 loop {
-                    trace!("{:?}: poll_recv, timeout={:?}", role, timeout);
+                    trace!(
+                        "{:?}: stream {}: poll_recv, timeout={:?}",
+                        role,
+                        stream,
+                        timeout
+                    );
                     let front = select! {
                         front = poll_recv.next() => {
                             if let Some(front) = front {
@@ -251,7 +278,7 @@ where
                             }
                         },
                         _ = timeout_generator(timeout).fuse() => {
-                            error!("{:?}: poll_recv: timed out({:?})", role, timeout);
+                            error!("{:?}: stream {}: poll_recv: timed out({:?})", role, stream, timeout);
                             if let Some(front) = receive_queue.pop_front() {
                                 front.poll(&codec)
                             } else {
@@ -262,7 +289,10 @@ where
                     match front {
                         Ok((serial, data, errors)) => {
                             // hall of shame
-                            error!("{:?}: poll_recv: good packet {}: {:?}", role, serial, data); // TODO: REMOVE
+                            error!(
+                                "{:?}: stream {}: poll_recv: good packet {}: {:?}",
+                                role, stream, serial, data
+                            ); // TODO: REMOVE
                             let (data, errors) = join!(
                                 output.send(data),
                                 error_reports.send((stream, serial, errors))
@@ -275,6 +305,7 @@ where
                                     feedback: PayloadFeedback::Complete { serial },
                                 })
                                 .await?;
+                            progress.send(()).await?;
                         }
                         Err(e) => {
                             // TODO: fine grained error reporting
@@ -403,6 +434,19 @@ where
         });
         let poll_send = spawn.spawn(poll_send);
 
+        let poll_progress = spawn.spawn(async move {
+            loop {
+                select! {
+                    r = progress.next().fuse() => {
+                        if let None = r {
+                            break
+                        }
+                    },
+                    _ = timeout_generator(Duration::new(300, 0)).fuse() => break,
+                }
+            }
+        });
+
         let poll_all = async move {
             select! {
                 r = poll_bridges_in.boxed().fuse() => match r {
@@ -468,6 +512,12 @@ where
                     }
                     _ => error!("stream: poll_send: terminated"),
                 },
+                r = poll_progress.boxed().fuse() => match r {
+                    Err(e) => {
+                        error!("stream: poll_send: spawn: {:?}", e);
+                    }
+                    _ => error!("stream: no activity"),
+                }
             }
         };
 

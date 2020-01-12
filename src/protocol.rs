@@ -17,10 +17,10 @@ use aes_gcm_siv::Aes256GcmSiv;
 use async_std::sync::Mutex as AsyncMutex;
 use crossbeam::queue::ArrayQueue;
 use failure::{Backtrace, Fail};
-use futures::{channel::mpsc::unbounded, future::BoxFuture, prelude::*, select};
+use futures::{channel::mpsc::channel, future::BoxFuture, prelude::*, select};
 use generic_array::GenericArray;
 use lazy_static::lazy_static;
-use log::debug;
+use log::{debug, info, warn};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 use rayon::prelude::*;
@@ -34,6 +34,7 @@ use sss::{
 
 use crate::{
     common::{Verifiable, Verified},
+    utils::ClonableSink,
     GenericError,
 };
 
@@ -671,12 +672,10 @@ impl WakerQueue {
         let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(key) = key {
             if let Some(entry) = wakers.get_mut(key) {
-                debug!("reload waker");
                 *entry = Some(w);
                 return Some(key);
             }
         }
-        debug!("register waker");
         let entry = wakers.vacant_entry();
         let key = entry.key();
         entry.insert(Some(w));
@@ -686,7 +685,6 @@ impl WakerQueue {
 
     fn deregister_poll_waker(&self, key: Option<usize>) {
         if let Some(key) = key {
-            debug!("deregister waker");
             let (_, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = wakers.get_mut(key) {
                 *entry = None;
@@ -698,7 +696,6 @@ impl WakerQueue {
         let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(head) = queue.pop_front() {
             if let Some(Some(waker)) = wakers.get(head) {
-                debug!("waking one poll");
                 waker.wake_by_ref();
                 queue.push_back(head);
                 return;
@@ -730,14 +727,11 @@ impl<'a, 'b> Future for ReceiveQueuePoll<'a, 'b> {
     type Output = (u64, Vec<u8>, HashSet<u8>);
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         use Poll::*;
-        debug!("recv q poll");
         if let Some(Ok(result)) = self.queue.try_poll(self.codec) {
-            debug!("recv q ready");
             self.queue.wait_queue.deregister_poll_waker(self.key);
             self.queue.wait_queue.try_notify_next();
             Ready(result)
         } else {
-            debug!("recv q not ready");
             self.key = self
                 .queue
                 .wait_queue
@@ -771,9 +765,8 @@ pub enum RemoteRecvError {
     Decode,
 }
 
-pub type TaskProgressNotifier = Weak<
-    AsyncMutex<dyn Sink<Result<(u8, u8), RemoteRecvError>, Error = GenericError> + Unpin + Send>,
->;
+pub type TaskProgressNotifier =
+    Weak<Box<dyn ClonableSink<Result<(u8, u8), RemoteRecvError>, GenericError> + Send + Sync>>;
 
 pub type TaskProgressNotifierSink =
     Box<dyn Sink<(u64, TaskProgressNotifier), Error = GenericError> + Unpin + Send>;
@@ -888,10 +881,11 @@ impl SendQueue {
             .map(|shard| shard.encode_shard(self.stream, serial, &shard_state))
             .collect();
 
-        let (tx, rx) = unbounded();
-        let tx = Arc::new(AsyncMutex::new(
-            tx.sink_map_err(|e| Box::new(e) as GenericError),
-        ));
+        let (tx, rx) = channel(256);
+        let tx = Arc::new(Box::new(tx.sink_map_err(|e| Box::new(e) as GenericError))
+            as Box<
+                dyn Send + Sync + ClonableSink<Result<(u8, u8), RemoteRecvError>, GenericError>,
+            >);
         {
             self.task_notifiers
                 .lock()
@@ -913,45 +907,57 @@ impl SendQueue {
             select! {
                 status = status.next() => {
                     match status {
-                        None => return Err(SendError::RemoteLost(<_>::default())),
+                        None => {
+                            warn!("feedback: remote lost");
+                            return Err(SendError::RemoteLost(<_>::default()))
+                        }
                         Some(status) => match status {
                             Ok((id, quorum_size)) => {
                                 quorum.insert(id);
                             }
                             Err(RemoteRecvError::Complete) => {
+                                info!("feedback: complete");
                                 return Ok(())
                             }
                             Err(e) => {
+                                warn!("feedback: {}", e);
                                 return Err(SendError::Remote(e))
                             }
                         }
                     }
                 },
-                _ = timeout_generator(timeout).fuse() => (),
+                _ = timeout_generator(Duration::new(0, 5_000_000)).fuse() => (),
             }
         }
 
         // and we need to try harder now
+        warn!("send: try harder");
         for (shard, shard_id) in shards {
             self.enqueue((shard, shard_id)).await;
             select! {
                 status = status.next() => {
                     match status {
-                        None => return Err(SendError::RemoteLost(<_>::default())),
+                        None => {
+                            info!("feedback: remote lost");
+                            return Err(SendError::RemoteLost(<_>::default()))
+                        }
                         Some(status) => match status {
                             Ok((id, quorum_size)) => {
+                                info!("feedback: ok");
                                 quorum.insert(id);
                             }
                             Err(RemoteRecvError::Complete) => {
+                                info!("feedback: complete");
                                 return Ok(())
                             }
                             Err(e) => {
+                                info!("feedback: {}", e);
                                 return Err(SendError::Remote(e))
                             }
                         }
                     }
                 },
-                _ = timeout_generator(timeout).fuse() => (),
+                _ = timeout_generator(Duration::new(0, 5_000_000)).fuse() => (),
             }
         }
         // okay, maybe we have to drop it
@@ -1047,7 +1053,6 @@ mod tests {
     #[tokio::test]
     async fn send_receive() -> Result<(), ReceiveError> {
         let _guard = slog_envlogger::init();
-        debug!("send_receive");
         let codec = RSCodec::new(31).unwrap();
         let recv_q = Arc::new(ReceiveQueue::new());
         let input_data = &[33, 55, 23, 251];
@@ -1069,13 +1074,11 @@ mod tests {
                 assert_eq!(result, input_data);
             }
         });
-        debug!("pause");
         async_std::task::sleep(Duration::new(1, 0)).await;
         futures::stream::iter(shards.iter().take(193))
             .map(|shard| {
                 let recv_q = Arc::clone(&recv_q);
                 async move {
-                    debug!("checking in");
                     let (raw_shard, raw_shard_id) = shard.encode_shard(stream, serial, &state);
                     recv_q.admit(raw_shard, raw_shard_id, &state)
                 }
