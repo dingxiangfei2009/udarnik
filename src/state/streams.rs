@@ -34,8 +34,11 @@ where
                 })
                 .collect();
             if polls.is_empty() {
-                info!("{:?}: reset stream 0 since there is no stream", self.role);
                 let stream = rng.next_u32() as u8;
+                info!(
+                    "{:?}: reset stream {} since there is no stream",
+                    self.role, stream
+                );
                 let (session_stream, poll) = self.as_ref().get_ref().new_stream(
                     stream,
                     self.params.window,

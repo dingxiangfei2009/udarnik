@@ -1,3 +1,4 @@
+#![type_length_limit = "4000000"]
 #[macro_use]
 extern crate derive_more;
 
@@ -5,26 +6,36 @@ use std::{
     collections::{BTreeMap, HashMap},
     convert::TryFrom,
     fs::File,
-    io::Write,
     net::SocketAddr,
     path::PathBuf,
+    time::Duration,
 };
 
+use async_std::{
+    io::{stdin, BufReader},
+    task::sleep,
+};
 use failure::Fail;
 use futures::{
-    channel::{mpsc::channel, oneshot::channel as oneshot},
+    channel::{
+        mpsc::{channel, SendError},
+        oneshot::channel as oneshot,
+    },
     prelude::*,
+    select,
 };
+use http::Uri;
 use log::{error, info};
 use sss::lattice::{keygen, Init, PrivateKey, PublicKey, SigningKey};
 use structopt::StructOpt;
-use tokio::runtime::Handle;
 use udarnik::{
-    keyman::{Error as KeyError, RawInit, RawPrivateKey},
+    client::{client, ClientBootstrap},
+    keyman::{
+        Error as KeyError, RawInit, RawPrivateKey, RawPublicKey, RawSigningKey, RawVerificationKey,
+    },
     server::{server, ServerBootstrap},
-    state::{Identity, InitIdentity},
+    state::{Identity, InitIdentity, Params},
     utils::TokioSpawn,
-    GenericError,
 };
 
 #[derive(Debug, StructOpt)]
@@ -45,9 +56,11 @@ enum Error {
     Io(#[cause] std::io::Error),
     #[fail(display = "key: {}", _0)]
     Key(#[cause] KeyError),
+    #[fail(display = "pipe: {}", _0)]
+    Pipe(SendError),
 }
 
-async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
+async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error> {
     let Config { key, init, addr } = cfg;
     let init: RawInit = serde_json::from_reader(File::open(init)?)?;
     let init = Init::try_from(init)?;
@@ -56,7 +69,6 @@ async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
     let pubkey = prikey.public_key(&init);
     let sign_key = SigningKey::from_private_key(&prikey);
     let verify_key = sign_key.verification_key(&init);
-    let (new_channel_tx, mut new_channel) = channel(32);
 
     let mut init_db = BTreeMap::default();
     init_db.insert(InitIdentity::from(&init), init.clone());
@@ -88,39 +100,47 @@ async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
     let identity_sequence = vec![(InitIdentity::from(&init), Identity::from(&pubkey))];
 
     let spawn = TokioSpawn(handle.clone());
-    let server = server(
-        ServerBootstrap {
-            addr: addr.clone(),
-            allowed_identities: allowed_identities.clone(),
+    let (mut input, input_rx) = channel(4096);
+    let (output_tx, mut output) = channel(4096);
+    let (terminate, terminate_rx) = oneshot();
+    let client = client(
+        ClientBootstrap {
+            addr: format!("http://{}", addr).parse().unwrap(),
+            params: Params {
+                correction: 4,
+                entropy: 0,
+                window: 4096,
+            },
+            allowed_identities,
             anke_data: vec![],
             boris_data: vec![],
-            identity_db: identity_db.clone(),
-            init_db: init_db.clone(),
-            identity_sequence: identity_sequence.clone(),
+            identity_db,
+            identity_sequence,
+            init_db,
             retries: Some(3),
-            verify_db: verify_db.clone(),
+            sign_db,
         },
-        new_channel_tx,
-        spawn.clone(),
+        input_rx,
+        output_tx,
+        terminate_rx,
+        spawn,
         |duration| tokio::time::delay_for(duration),
     );
-    handle.spawn({
-        let handle = handle.clone();
-        async move {
-            while let Some((input, output)) = new_channel.next().await {
-                info!("server: new channel, short-circuiting");
-                handle.spawn(async {
-                    output
-                        .map(Ok)
-                        .inspect_ok(|m| info!("got {:?}", m))
-                        .forward(input)
-                        .await
-                        .unwrap_or_else(|e| error!("server: channel: {}", e))
-                });
-            }
-        }
-    });
-    Ok(server.await.unwrap())
+    let client = handle.spawn(client);
+    let stdin = stdin();
+    let stdin = BufReader::new(stdin.lock().await);
+    let stdin = handle.spawn(
+        stdin
+            .lines()
+            .map_ok(|s| s.into_bytes())
+            .map_err(Error::Io)
+            .forward(input.clone().sink_map_err(Error::Pipe)),
+    );
+    select! {
+        r = stdin.fuse() => r.unwrap().unwrap(),
+        r = client.fuse() => r.unwrap().unwrap(),
+    }
+    Ok(())
 }
 
 fn main() {

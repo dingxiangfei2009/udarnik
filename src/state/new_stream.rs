@@ -1,5 +1,6 @@
 use super::*;
 
+use futures::{channel::oneshot::channel as oneshot_channel, pin_mut, stream::FusedStream};
 use log::warn;
 
 impl<G> Session<G>
@@ -24,6 +25,8 @@ where
         S: Spawn + Clone + Send + Sync + 'static,
         S::Error: 'static,
     {
+        let (terminate_tx, terminate) = oneshot_channel();
+        let terminate = terminate.shared();
         let (progress_tx, mut progress) = channel(4096);
         let (input_tx, input_rx) = channel(window);
         let (task_notifiers_tx, task_notifiers_rx) = channel(window);
@@ -62,7 +65,6 @@ where
         let task_notifiers: Arc<RwLock<BTreeMap<u64, TaskProgressNotifier>>> = <_>::default();
         let poll_task_notifiers = task_notifiers_rx.for_each({
             let task_notifiers = Arc::clone(&task_notifiers);
-            let role = self.role;
             move |(serial, task_notifier)| {
                 let task_notifiers = Arc::clone(&task_notifiers);
                 async move {
@@ -197,37 +199,42 @@ where
         };
         let poll_feedback = spawn.spawn(poll_feedback);
 
-        let poll_send_pending = {
+        let poll_send_pending =
             unfold(
-                (Arc::clone(&send_queue), timeout_generator.clone()),
-                move |(send_queue, timeout_generator)| {
+                (Arc::clone(&send_queue), timeout_generator.clone(), terminate.clone().fuse()),
+                move |(send_queue, timeout_generator, mut terminate)| {
                     async move {
-                        // TODO: BAD LOOP
                         loop {
                             select! {
-                                send = send_queue.pop().fuse() => break Some((send, (send_queue, timeout_generator))),
+                                send = send_queue.pop().fuse() =>
+                                    break Some((send, (send_queue, timeout_generator, terminate))),
                                 _ = timeout_generator(Duration::new(0, 1000000)).fuse() => (),
+                                _ = terminate => break None,
                             }
                         }
                     }
                 },
             )
-                .map(Ok)
-                .try_for_each({
-                    let bridges_out_tx = bridges_out_tx.clone();
-                    let progress = progress_tx.clone();
-                    move |(raw_shard, raw_shard_id)| {
-                        let mut bridges_out_tx = bridges_out_tx.clone();
-                        let mut progress = progress.clone();
-                        async move {
-                        bridges_out_tx.send(BridgeMessage::Payload {
-                            raw_shard,
-                            raw_shard_id,
-                        }).await?;
+            .map(Ok);
+        let poll_send_pending = poll_send_pending
+            .try_for_each({
+                let bridges_out_tx = bridges_out_tx.clone();
+                let progress = progress_tx.clone();
+                move |(raw_shard, raw_shard_id)| {
+                    let mut bridges_out_tx = bridges_out_tx.clone();
+                    let mut progress = progress.clone();
+                    async move {
+                        bridges_out_tx
+                            .send(BridgeMessage::Payload {
+                                raw_shard,
+                                raw_shard_id,
+                            })
+                            .await?;
                         progress.send(()).await
-                    }}})
-            .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))
-        };
+                    }
+                }
+            })
+            .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()));
         let poll_send_pending = spawn.spawn(poll_send_pending);
 
         let poll_recv = {
@@ -236,14 +243,36 @@ where
                     Arc::clone(&receive_queue),
                     Arc::clone(&self.codec),
                     timeout_generator.clone(),
+                    progress_tx.clone(),
+                    terminate.clone().fuse(),
                     self.role,
                 ),
-                |(receive_queue, codec, timeout_generator, role)| {
+                |(receive_queue, codec, timeout_generator, mut progress, mut terminate, role)| {
                     async move {
-                        // TODO: BAD LOOP
-                        let recv = receive_queue.poll(&codec).await;
+                        let recv = select! {
+                            recv = receive_queue.poll(&codec).fuse() => recv,
+                            _ = terminate => {
+                                error!("{:?}: poll_recv: terminated", role);
+                                return None
+                            },
+                        };
                         trace!("{:?}: poll_recv: incoming data", role);
-                        Some((Ok(recv), (receive_queue, codec, timeout_generator, role)))
+                        if let Err(_) = progress.send(()).await {
+                            info!("{:?}: poll_recv: progress is gone", role);
+                            None
+                        } else {
+                            Some((
+                                Ok(recv),
+                                (
+                                    receive_queue,
+                                    codec,
+                                    timeout_generator,
+                                    progress,
+                                    terminate,
+                                    role,
+                                ),
+                            ))
+                        }
                     }
                 },
             )
@@ -259,14 +288,13 @@ where
             let mut progress = progress_tx.clone();
             let role = self.role;
             async move {
-                let mut poll_recv = Box::pin(poll_recv.fuse());
+                let poll_recv = poll_recv.fuse();
+                pin_mut!(poll_recv);
                 loop {
-                    trace!(
-                        "{:?}: stream {}: poll_recv, timeout={:?}",
-                        role,
-                        stream,
-                        timeout
-                    );
+                    if poll_recv.is_terminated() {
+                        info!("{:?}: stream {}: poll_recv: closed", role, stream);
+                        break;
+                    }
                     let front = select! {
                         front = poll_recv.next() => {
                             if let Some(front) = front {
@@ -442,9 +470,10 @@ where
                             break
                         }
                     },
-                    _ = timeout_generator(Duration::new(300, 0)).fuse() => break,
+                    _ = timeout_generator(Duration::new(60, 0)).fuse() => break,
                 }
             }
+            warn!("stream: killing progress");
         });
 
         let poll_all = async move {
@@ -514,11 +543,12 @@ where
                 },
                 r = poll_progress.boxed().fuse() => match r {
                     Err(e) => {
-                        error!("stream: poll_send: spawn: {:?}", e);
+                        error!("stream: poll_progress: spawn: {:?}", e);
                     }
                     _ => error!("stream: no activity"),
                 }
             }
+            let _ = terminate_tx.send(());
         };
 
         (
