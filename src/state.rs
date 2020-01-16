@@ -1,20 +1,23 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+use core::{
     convert::TryInto,
-    fmt::Debug,
-    fmt::{Formatter, Result as FmtResult},
+    fmt::{Debug, Formatter, Result as FmtResult},
     marker::PhantomData,
-    net::SocketAddr,
     num::Wrapping,
-    path::PathBuf,
     pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
+    task::{Context, Poll},
+    time::Duration,
+};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    time::Instant,
 };
 
 use aead::{Aead, NewAead, Payload};
 use aes_gcm_siv::Aes256GcmSiv;
-use async_std::sync::{Arc, Mutex, RwLock};
+use async_std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use failure::{err_msg, Backtrace, Error as TopError, Fail};
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
@@ -43,7 +46,7 @@ use crate::{
         CodecError, QuorumError, RSCodec, RawShard, RawShardId, ReceiveError, ReceiveQueue,
         RemoteRecvError, SendError, SendQueue, ShardState, TaskProgressNotifier,
     },
-    utils::{ClonableSendableFuture, ClonableSink, Spawn},
+    utils::{ClonableSendableFuture, ClonableSink, Spawn, WakerQueue},
     GenericError, Redact,
 };
 
@@ -303,6 +306,22 @@ pub struct BridgeId {
 #[derive(From, Hash, Clone, Display, Debug, PartialEq, Eq, PartialOrd, Ord, Deref)]
 pub struct SessionId(String);
 
+type StreamPolls = HashMap<
+    u8,
+    (
+        SessionStream,
+        Pin<Box<dyn Sync + ClonableSendableFuture<()>>>,
+    ),
+>;
+
+type BridgePolls = HashMap<
+    BridgeId,
+    (
+        Box<dyn Send + Sync + ClonableSink<BridgeMessage, GenericError> + Unpin>,
+        Box<dyn Send + Sync + ClonableSendableFuture<BridgeId> + Unpin>,
+    ),
+>;
+
 pub struct Session<G> {
     local_serial: AtomicU64,
     remote_serial: AtomicU64,
@@ -324,28 +343,10 @@ pub struct Session<G> {
     bridge_drivers: Pin<
         Arc<RwLock<FuturesUnordered<Fuse<Box<dyn Future<Output = ()> + Send + Sync + Unpin>>>>>,
     >,
-    stream_polls: Arc<
-        RwLock<
-            HashMap<
-                u8,
-                (
-                    SessionStream,
-                    Pin<Box<dyn Sync + ClonableSendableFuture<()>>>,
-                ),
-            >,
-        >,
-    >,
-    bridges_out: Arc<
-        RwLock<
-            HashMap<
-                BridgeId,
-                Box<dyn Send + Sync + ClonableSink<BridgeMessage, GenericError> + Unpin>,
-            >,
-        >,
-    >,
-    bridge_polls: Arc<
-        RwLock<HashMap<BridgeId, Box<dyn Send + Sync + ClonableSendableFuture<BridgeId> + Unpin>>>,
-    >,
+    stream_polls: Arc<RwLock<StreamPolls>>,
+    stream_polls_waker_queue: WakerQueue,
+    bridge_polls_waker_queue: WakerQueue,
+    bridge_polls: Arc<RwLock<BridgePolls>>,
     hall_of_fame: Arc<RwLock<LruCache<u8, Mutex<LruCache<u64, HashMap<u8, Option<BridgeId>>>>>>>,
     role: KeyExchangeRole,
     pub session_id: SessionId,
@@ -435,12 +436,14 @@ where
             output,
             receive_timeout: Duration::new(0, 1_000_000_00),
             send_cooldown: Duration::new(0, 1_000_000_00),
+            stream_polls_waker_queue: <_>::default(),
+            bridge_polls_waker_queue: <_>::default(),
+
             error_reports,
             master_sink,
             bridge_builder: BridgeBuilder::new(),
             bridge_drivers: Arc::pin(RwLock::new(bridge_drivers)),
             stream_polls: <_>::default(),
-            bridges_out: <_>::default(),
             bridge_polls: <_>::default(),
             hall_of_fame: Arc::new(RwLock::new(LruCache::new(256))),
 
@@ -456,10 +459,10 @@ where
                 error_reports_rx,
                 master_messages,
                 progress,
-                bridges_in_tx,
-                bridges_in_rx,
                 bridges_out_tx,
                 bridges_out_rx,
+                bridges_in_tx,
+                bridges_in_rx,
                 timeout_generator.clone(),
                 spawn,
             )
@@ -712,20 +715,18 @@ where
         let mut input = spawn
             .spawn({
                 let this = Pin::clone(&self);
-                let timeout_generator = timeout_generator.clone();
-                async move { this.as_ref().handle_input(input, timeout_generator).await }
+                async move {
+                    info!("input start");
+                    this.as_ref().handle_input(input).await.unwrap(); // TODO: don't panic
+                    Ok(())
+                }
             })
             .boxed()
             .fuse();
         let mut poll_bridges_out = spawn
             .spawn({
                 let this = Pin::clone(&self);
-                let timeout_generator = timeout_generator.clone();
-                async move {
-                    this.as_ref()
-                        .handle_bridges_out(bridges_out_rx, timeout_generator)
-                        .await
-                }
+                async move { this.as_ref().handle_bridges_out(bridges_out_rx).await }
             })
             .boxed()
             .fuse();
@@ -768,10 +769,9 @@ where
                 let this = Pin::clone(&self);
                 let timeout_generator = timeout_generator.clone();
                 let spawn = spawn.clone();
-                let progress = progress.clone();
                 async move {
                     this.as_ref()
-                        .handle_streams(bridges_out_tx, progress, timeout_generator, spawn)
+                        .handle_streams(bridges_out_tx, timeout_generator, spawn)
                         .await
                 }
             })
@@ -784,8 +784,7 @@ where
                 let invite_cooldown = Duration::new(10, 0);
                 let timeout_generator = timeout_generator.clone();
                 async move {
-                    this.as_ref()
-                        .handle_bridges(invite_cooldown, progress, timeout_generator)
+                    this.handle_bridges(invite_cooldown, progress, timeout_generator)
                         .await
                 }
             })
@@ -835,7 +834,10 @@ where
                 _ => Ok(()),
             },
             result = input => match result {
-                Ok(Err(e)) => Err(e),
+                Ok(Err(e)) => {
+                    error!("{:?}: input: {:?}", self.role, e);
+                    Err(e)
+                },
                 Err(e) => {
                     error!("{:?}: input: {:?}", self.role, e);
                     Ok(())

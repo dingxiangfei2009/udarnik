@@ -12,7 +12,7 @@ use std::{
 };
 
 use async_std::{
-    io::{stdin, BufReader},
+    io::{stdin, stdout, BufReader, BufWriter},
     task::sleep,
 };
 use failure::Fail;
@@ -23,6 +23,7 @@ use futures::{
     },
     prelude::*,
     select,
+    stream::repeat,
 };
 use http::Uri;
 use log::{error, info};
@@ -100,8 +101,8 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
     let identity_sequence = vec![(InitIdentity::from(&init), Identity::from(&pubkey))];
 
     let spawn = TokioSpawn(handle.clone());
-    let (mut input, input_rx) = channel(4096);
-    let (output_tx, mut output) = channel(4096);
+    let (input, input_rx) = channel(4096);
+    let (output_tx, output) = channel(4096);
     let (terminate, terminate_rx) = oneshot();
     let client = client(
         ClientBootstrap {
@@ -127,18 +128,30 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
         |duration| tokio::time::delay_for(duration),
     );
     let client = handle.spawn(client);
-    let stdin = stdin();
-    let stdin = BufReader::new(stdin.lock().await);
+    // let stdin = stdin();
+    // let stdin = BufReader::new(stdin.lock().await);
     let stdin = handle.spawn(
-        stdin
-            .lines()
-            .map_ok(|s| s.into_bytes())
-            .map_err(Error::Io)
+        repeat(vec![1])
+            .map(Ok)
             .forward(input.clone().sink_map_err(Error::Pipe)),
+    );
+    let stdout = stdout();
+    let stdout = BufWriter::new(stdout.lock().await);
+    let stdout = handle.spawn(
+        output
+            .map(Ok)
+            .try_fold(stdout, move |mut stdout, output| {
+                async move {
+                    stdout.write_all(&output).await?;
+                    Ok::<_, std::io::Error>(stdout)
+                }
+            })
+            .map_ok(|_| ()),
     );
     select! {
         r = stdin.fuse() => r.unwrap().unwrap(),
         r = client.fuse() => r.unwrap().unwrap(),
+        r = stdout.fuse() => r.unwrap().unwrap(),
     }
     Ok(())
 }

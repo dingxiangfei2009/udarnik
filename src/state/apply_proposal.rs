@@ -43,29 +43,23 @@ where
                             {
                                 Ok(Bridge { tx, rx, poll }) => {
                                     info!("{:?}: bridge: id={:?}, captured", this.role, id);
-                                    let mut bridges_out = this.bridges_out.write().await;
-                                    let mut bridge_polls = this.bridge_polls.write().await;
                                     let (mapping_tx, mapping_rx) = channel(4096);
                                     let inbound_guard = Arc::clone(&this.inbound_guard);
                                     let outbound_guard = Arc::clone(&this.outbound_guard);
-                                    bridges_out.insert(
-                                        id.clone(),
-                                        Box::new(
-                                            mapping_tx
-                                                .sink_map_err(|e| Box::new(e) as GenericError),
-                                        ) as _,
+                                    let sink = Box::new(
+                                        mapping_tx.sink_map_err(|e| Box::new(e) as GenericError),
                                     );
-                                    let mut poll_outbound = mapping_rx
+                                    let mut poll_outbound = spawn.spawn(mapping_rx
                                         .map(move |m| Ok(Pomerium::encode(&*outbound_guard, m)))
                                         .forward(tx)
                                         .unwrap_or_else({
                                             move |e| {
                                                 error!("poll_outbound: {}", e);
                                             }
-                                        })
+                                        }))
                                         .boxed()
                                         .fuse();
-                                    let mut poll_inbound = rx
+                                    let mut poll_inbound = spawn.spawn(rx
                                         .and_then(move |p| {
                                             let inbound_guard = Arc::clone(&inbound_guard);
                                             async move { p.decode(&inbound_guard) }
@@ -79,24 +73,42 @@ where
                                             move |e| {
                                                 error!("bridges_in_tx: {}", e);
                                             }
-                                        })
+                                        }))
                                         .boxed()
                                         .fuse();
                                     let mut poll = poll.fuse();
-                                    bridge_polls.insert(id.clone(), {
-                                        let id = id.clone();
-                                        Box::new(
-                                            async move {
-                                                select! {
-                                                    () = poll_inbound => id,
-                                                    () = poll_outbound => id,
-                                                    () = poll => id,
-                                                }
-                                            }
-                                            .boxed()
-                                            .shared(),
-                                        )
-                                    });
+                                    {
+                                        this.bridge_polls.write().await.insert(id.clone(), {
+                                            let id = id.clone();
+                                            (
+                                                sink,
+                                                Box::new(
+                                                    async move {
+                                                        select! {
+                                                            r = poll_inbound => {
+                                                                match r {
+                                                                    Err(e) => error!("bridge: poll_inbound: {:?}", e),
+                                                                    _ => (),
+                                                                }
+                                                                id
+                                                            },
+                                                            r = poll_outbound => {
+                                                                match r {
+                                                                    Err(e) => error!("bridge: poll_inbound: {:?}", e),
+                                                                    _ => (),
+                                                                }
+                                                                id
+                                                            },
+                                                            r = poll => id,
+                                                        }
+                                                    }
+                                                    .boxed()
+                                                    .shared(),
+                                                ),
+                                            )
+                                        });
+                                    }
+                                    this.bridge_polls_waker_queue.try_notify_all();
                                     Some(BridgeAsk {
                                         r#type: r#type.clone(),
                                         id: id.clone(),

@@ -9,31 +9,38 @@ where
         + Guard<ClientMessageVariant, (SessionId, u64), Error = GenericError>
         + Guard<BridgeMessage, (), Error = GenericError>,
 {
-    pub(super) async fn handle_bridges_out<T: 'static + Send + Future<Output = ()>>(
+    pub(super) async fn handle_bridges_out(
         self: Pin<&Self>,
         bridges_out_rx: Receiver<BridgeMessage>,
-        timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
     ) -> Result<(), String> {
         bridges_out_rx
             .map(Ok::<_, String>)
-            .try_for_each_concurrent(4096, {
-                let timeout_generator = timeout_generator.clone();
+            .try_for_each({
                 move |outbound| {
-                    let timeout_generator = timeout_generator.clone();
                     async move {
                         let mut rng = StdRng::from_entropy();
-                        let (bridge_id, mut tx) = loop {
+                        let (bridge_id, mut tx) = {
                             trace!("{:?}: bridges_out: find usable bridge", self.role);
-                            let bridges_out = self.bridges_out.read().await;
-                            if let Some((bridge_id, bridge)) = bridges_out.iter().choose(&mut rng) {
+                            let bridge_polls = BridgeExists {
+                                session: self.as_ref().get_ref(),
+                                bridge_polls: None,
+                                key: None,
+                            }
+                            .await;
+                            if let Some((bridge_id, (bridge, _))) =
+                                bridge_polls.iter().choose(&mut rng)
+                            {
                                 debug!(
                                     "{:?}: bridges_out: choose bridge {:?}",
                                     self.role, bridge_id
                                 );
-                                break (bridge_id.clone(), ClonableSink::clone_pin_box(&**bridge));
+                                (bridge_id.clone(), ClonableSink::clone_pin_box(&**bridge))
                             } else {
-                                drop(bridges_out);
-                                timeout_generator(Duration::new(1, 0)).await;
+                                trace!(
+                                    "{:?}: no usable bridge, but this might not correct",
+                                    self.role
+                                );
+                                return Ok(());
                             }
                         };
                         match tx.send(outbound).await {
@@ -66,5 +73,42 @@ where
                 }
             })
             .await
+    }
+}
+
+struct BridgeExists<'a, G> {
+    session: &'a Session<G>,
+    bridge_polls: Option<BoxFuture<'a, RwLockReadGuard<'a, BridgePolls>>>,
+    key: Option<usize>,
+}
+
+impl<'a, G> Future for BridgeExists<'a, G> {
+    type Output = RwLockReadGuard<'a, BridgePolls>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        use Poll::*;
+        let mut bridge_polls = self
+            .bridge_polls
+            .take()
+            .unwrap_or_else(|| self.session.bridge_polls.read().boxed());
+        match Pin::new(&mut bridge_polls).poll(cx) {
+            Ready(bridge_polls) => {
+                if !bridge_polls.is_empty() {
+                    self.session
+                        .bridge_polls_waker_queue
+                        .deregister_poll_waker(self.key);
+                    Ready(bridge_polls)
+                } else {
+                    self.key = self
+                        .session
+                        .bridge_polls_waker_queue
+                        .register_poll_waker(self.key, cx.waker().clone());
+                    Pending
+                }
+            }
+            Pending => {
+                self.bridge_polls = Some(bridge_polls);
+                Pending
+            }
+        }
     }
 }

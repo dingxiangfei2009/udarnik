@@ -139,7 +139,9 @@ where
                         }
                         PayloadFeedback::Full { serial, queue_len } => {
                             warn!("backpressure, serial={}, queue={}", serial, queue_len);
-                            send_queue.block_sending(timeout_generator(send_cooldown));
+                            send_queue
+                                .block_sending(timeout_generator(send_cooldown))
+                                .await;
                             info!(
                                 "{:?}: feedback: full, serial={}, queue={}",
                                 role, serial, queue_len
@@ -199,23 +201,21 @@ where
         };
         let poll_feedback = spawn.spawn(poll_feedback);
 
-        let poll_send_pending =
-            unfold(
-                (Arc::clone(&send_queue), timeout_generator.clone(), terminate.clone().fuse()),
-                move |(send_queue, timeout_generator, mut terminate)| {
-                    async move {
-                        loop {
-                            select! {
-                                send = send_queue.pop().fuse() =>
-                                    break Some((send, (send_queue, timeout_generator, terminate))),
-                                _ = timeout_generator(Duration::new(0, 1000000)).fuse() => (),
-                                _ = terminate => break None,
-                            }
+        let poll_send_pending = unfold(
+            (Arc::clone(&send_queue), terminate.clone().fuse()),
+            move |(send_queue, mut terminate)| {
+                async move {
+                    loop {
+                        select! {
+                            send = send_queue.pop().fuse() =>
+                                break Some((send, (send_queue, terminate))),
+                            _ = terminate => break None,
                         }
                     }
-                },
-            )
-            .map(Ok);
+                }
+            },
+        )
+        .map(Ok);
         let poll_send_pending = poll_send_pending
             .try_for_each({
                 let bridges_out_tx = bridges_out_tx.clone();
@@ -307,7 +307,7 @@ where
                         },
                         _ = timeout_generator(timeout).fuse() => {
                             error!("{:?}: stream {}: poll_recv: timed out({:?})", role, stream, timeout);
-                            if let Some(front) = receive_queue.pop_front() {
+                            if let Some(front) = receive_queue.pop_front().await {
                                 front.poll(&codec)
                             } else {
                                 continue
@@ -375,7 +375,10 @@ where
                     let receive_queue = Arc::clone(&receive_queue);
                     let serial = raw_shard_id.serial;
                     async move {
-                        match receive_queue.admit(raw_shard, raw_shard_id, &shard_state) {
+                        match receive_queue
+                            .admit(raw_shard, raw_shard_id, &shard_state)
+                            .await
+                        {
                             Ok((id, quorum_size)) => {
                                 trace!(
                                     "{:?}: poll_admit: admitted, serial={}, id={}, quorum_size={}",
@@ -429,7 +432,7 @@ where
         };
         let poll_admit = spawn.spawn(poll_admit);
 
-        let poll_send = input_rx.map(Ok).try_for_each_concurrent(2, {
+        let poll_send = input_rx.map(Ok).try_for_each({
             let send_queue = Arc::clone(&send_queue);
             let shard_state = shard_state;
             let codec = Arc::clone(&self.codec);

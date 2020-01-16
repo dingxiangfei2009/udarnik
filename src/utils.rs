@@ -1,8 +1,12 @@
 use core::fmt;
 use core::pin::Pin;
-use core::task::{Context, Poll};
-use std::sync::Mutex;
+use core::task::{Context, Poll, Waker};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
+use async_std::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use dyn_clone::{clone_box, DynClone};
 use futures::{
     future::{Either, FusedFuture},
@@ -10,6 +14,7 @@ use futures::{
     stream::{Fuse, FusedStream, Stream, StreamExt},
 };
 use pin_utils::{unsafe_pinned, unsafe_unpinned};
+use slab::Slab;
 
 /// A `Stream` that implements a `peek` method.
 ///
@@ -322,25 +327,6 @@ impl<T, E> Stream for TryFutureStream<T, E> {
 
 impl<T, E> Unpin for TryFutureStream<T, E> {}
 
-pub struct SyncFuture<F>(Mutex<F>);
-
-impl<F> SyncFuture<F> {
-    pub fn new(f: F) -> Self {
-        Self(Mutex::new(f))
-    }
-}
-
-impl<F> Future for SyncFuture<F>
-where
-    F: Future + Unpin,
-{
-    type Output = F::Output;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut f = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        Pin::new(&mut *f).poll(cx)
-    }
-}
-
 pub trait Spawn {
     type Error: core::fmt::Debug + Send + Sync;
     fn spawn<F, T>(
@@ -414,5 +400,60 @@ where
 {
     fn clone_box(&self) -> Box<dyn Send + Sync + ClonableSink<T, E>> {
         clone_box(self)
+    }
+}
+
+#[derive(Default)]
+pub struct WakerQueue {
+    wait_queue: Mutex<(VecDeque<usize>, Slab<Option<Waker>>)>,
+}
+
+impl WakerQueue {
+    pub fn register_poll_waker(&self, key: Option<usize>, w: Waker) -> Option<usize> {
+        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = key {
+            if let Some(entry) = wakers.get_mut(key) {
+                *entry = Some(w);
+                return Some(key);
+            }
+        }
+        let entry = wakers.vacant_entry();
+        let key = entry.key();
+        entry.insert(Some(w));
+        queue.push_back(key);
+        Some(key)
+    }
+
+    pub fn deregister_poll_waker(&self, key: Option<usize>) {
+        if let Some(key) = key {
+            let (_, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = wakers.get_mut(key) {
+                *entry = None;
+            }
+        }
+    }
+
+    pub fn try_notify_next(&self) {
+        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(head) = queue.pop_front() {
+            if let Some(Some(waker)) = wakers.get(head) {
+                waker.wake_by_ref();
+                queue.push_back(head);
+                return;
+            }
+        }
+        wakers.clear();
+    }
+
+    pub fn try_notify_all(&self) {
+        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let all_keys: Vec<_> = queue.drain(..).collect();
+        for key in all_keys {
+            if let Some(Some(waker)) = wakers.get(key) {
+                waker.wake_by_ref();
+                queue.push_back(key);
+                return;
+            }
+        }
     }
 }

@@ -88,14 +88,10 @@ where
                                                             "{:?}: peer wants to tear down bridges",
                                                             this.role
                                                         );
-                                                        let mut bridges_out =
-                                                            this.bridges_out.write().await;
+                                                        let mut bridge_polls =
+                                                            this.bridge_polls.write().await;
                                                         for BridgeRetract(id) in bridges_ {
-                                                            bridges_out.remove(&id);
-                                                            this.bridge_polls
-                                                                .write()
-                                                                .await
-                                                                .remove(&id);
+                                                            bridge_polls.remove(&id);
                                                         }
                                                     }
                                                     BridgeNegotiationMessage::AskProposal(
@@ -160,13 +156,21 @@ where
                                                                 timeout_generator.clone(),
                                                                 spawn.clone(),
                                                             );
-                                                        this.stream_polls.write().await.insert(
-                                                            stream,
-                                                            (
-                                                                session_stream,
-                                                                Box::pin(poll.shared()),
-                                                            ),
+                                                        {
+                                                            this.stream_polls.write().await.insert(
+                                                                stream,
+                                                                (
+                                                                    session_stream,
+                                                                    Box::pin(poll.shared()),
+                                                                ),
+                                                            );
+                                                        }
+                                                        info!(
+                                                            "{:?}: stream {}: reset",
+                                                            this.role, stream
                                                         );
+                                                        this.stream_polls_waker_queue
+                                                            .try_notify_all();
                                                     }
                                                 }
                                             }

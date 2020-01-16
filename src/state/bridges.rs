@@ -10,7 +10,7 @@ where
         + Guard<BridgeMessage, (), Error = GenericError>,
 {
     pub(super) async fn handle_bridges<T>(
-        self: Pin<&Self>,
+        self: Pin<Arc<Self>>,
         invite_cooldown: Duration,
         mut progress: Sender<()>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
@@ -21,13 +21,14 @@ where
         let mut last_invite = Instant::now() - Duration::new(10, 0);
         loop {
             trace!("{:?}: poll_bridges", self.role);
-            let polls: Vec<_> = self
-                .bridge_polls
-                .read()
-                .await
-                .values()
-                .map(|poll| ClonableSendableFuture::clone_pin_box(&**poll))
-                .collect();
+            let polls: Vec<_> = {
+                self.bridge_polls
+                    .read()
+                    .await
+                    .values()
+                    .map(|(_, poll)| ClonableSendableFuture::clone_pin_box(&**poll))
+                    .collect()
+            };
             if polls.is_empty() {
                 drop(polls);
                 trace!("{:?}: poll_bridges: no bridges, inviting", self.role);

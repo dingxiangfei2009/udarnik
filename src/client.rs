@@ -69,6 +69,8 @@ pub enum ClientError {
     Transport(tonic::transport::Error, Backtrace),
     #[fail(display = "key exchange: {}", _0)]
     KeyExchange(KeyExchangeError),
+    #[fail(display = "spawn: {}", _0)]
+    Spawn(String),
 }
 
 async fn reconnect<G>(
@@ -226,12 +228,12 @@ where
         master_messages,
         master_sink,
         timeout_generator.clone(),
-        spawn,
+        spawn.clone(),
     )?;
     info!("client: session assigned, {}", session.session_id);
     let master_in = crate::utils::Peekable::new(master_in);
     let timeout_generator_ = timeout_generator.clone();
-    let mut master_adapter =
+    let master_adapter =
         async move {
             pin_mut!(master_in);
             while let Some(_) = master_in.as_mut().peek().await {
@@ -306,43 +308,58 @@ where
                 }
             }
             Ok::<_, ClientError>(())
-        }
+        };
+    let mut master_adapter = spawn
+        .spawn(master_adapter)
+        .map_err(|e| ClientError::Spawn(format!("{:?}", e)))
         .boxed()
         .fuse();
-    let mut progress = async move {
+    let progress = async move {
         loop {
             select! {
                 () = progress.select_next_some().fuse() => (),
                 () = timeout_generator(Duration::new(300, 0)).fuse() => break,
             }
         }
-    }
-    .boxed()
-    .fuse();
-    let mut terminate = terminate.fuse();
-    let mut poll = poll.fuse();
-    let mut input = input
-        .map(Ok)
-        .forward(session_input)
-        .map_err(|_| ClientError::Pipe(<_>::default()))
+    };
+    let mut progress = spawn
+        .spawn(progress)
+        .map_err(|e| ClientError::Spawn(format!("{:?}", e)))
         .boxed()
         .fuse();
-    let mut output = session_output
+    let mut terminate = terminate.fuse();
+    let mut poll = spawn
+        .spawn(poll)
+        .map_err(|e| ClientError::Spawn(format!("{:?}", e)))
+        .fuse();
+    let input = input.map(Ok).forward(session_input).map_err(|e| {
+        error!("session_input: {:?}", e);
+        ClientError::Pipe(<_>::default())
+    });
+    let mut input = spawn
+        .spawn(input)
+        .map_err(|e| ClientError::Spawn(format!("{:?}", e)))
+        .boxed()
+        .fuse();
+    let output = session_output
         .map(Ok)
-        .try_for_each_concurrent(2, move |m| {
+        .try_for_each(move |m| {
             let output = output.clone();
             async move { output.clone().send(m).await }
         })
-        .map_err(|_| ClientError::Pipe(<_>::default()))
+        .map_err(|_| ClientError::Pipe(<_>::default()));
+    let mut output = spawn
+        .spawn(output)
+        .map_err(|e| ClientError::Spawn(format!("{:?}", e)))
         .boxed()
         .fuse();
     select! {
-        r = master_adapter => r?,
-        () = progress => (),
+        r = master_adapter => r??,
+        r = progress => r?,
         r = terminate => r.map_err(|_| ClientError::Pipe(<_>::default()))?,
-        r = poll => r?,
-        r = input => r?,
-        r = output => r?,
+        r = poll => r??,
+        r = input => r??,
+        r = output => r??,
     }
     Ok(())
 }

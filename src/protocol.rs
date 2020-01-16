@@ -3,18 +3,18 @@ use core::{
     num::Wrapping,
     ops::{Deref, DerefMut},
     pin::Pin,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
     time::Duration,
 };
 use std::{
     collections::{HashSet, VecDeque},
     sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{Arc, RwLock, Weak},
 };
 
 use aead::{Aead, NewAead, Payload};
 use aes_gcm_siv::Aes256GcmSiv;
-use async_std::sync::Mutex as AsyncMutex;
+use async_std::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use crossbeam::queue::ArrayQueue;
 use failure::{Backtrace, Fail};
 use futures::{channel::mpsc::channel, future::BoxFuture, prelude::*, select};
@@ -25,7 +25,6 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 use rayon::prelude::*;
 use sha3::{Digest, Sha3_512};
-use slab::Slab;
 use sss::{
     field::GF2561D,
     fourier::{GF2561DG2_255_FFT, GF2561DG2_UNITY_ROOT},
@@ -34,7 +33,7 @@ use sss::{
 
 use crate::{
     common::{Verifiable, Verified},
-    utils::ClonableSink,
+    utils::{ClonableSink, WakerQueue},
     GenericError,
 };
 
@@ -544,9 +543,14 @@ impl Shard {
     }
 }
 
+#[derive(Default)]
+struct ReceiveQueueState {
+    queue: VecDeque<AsyncMutex<Quorum>>,
+    start: Wrapping<u64>,
+}
+
 pub struct ReceiveQueue {
-    queue: RwLock<VecDeque<Mutex<Quorum>>>,
-    start: RwLock<Wrapping<u64>>,
+    state: AsyncRwLock<ReceiveQueueState>,
     window: Option<u32>,
     wait_queue: WakerQueue,
 }
@@ -566,14 +570,13 @@ pub enum ReceiveError {
 impl ReceiveQueue {
     pub fn new() -> Self {
         Self {
-            queue: <_>::default(),
-            start: <_>::default(),
+            state: <_>::default(),
             window: <_>::default(),
             wait_queue: <_>::default(),
         }
     }
 
-    pub fn admit(
+    pub async fn admit(
         &self,
         raw_shard: RawShard,
         raw_shard_id: RawShardId,
@@ -584,61 +587,57 @@ impl ReceiveQueue {
         let shard = raw_shard.clone().verify_proof(shard_id.into_inner())?;
 
         let window = self.window.unwrap_or(256) as usize;
-        let start = self.start.read().unwrap_or_else(|e| e.into_inner());
-        let Wrapping(idx) = Wrapping(serial) - *start;
+        let state = self.state.read().await;
+        let Wrapping(idx) = Wrapping(serial) - state.start;
         let idx = idx as usize;
         if idx < 4 * window {
             {
-                let queue = self.queue.read().unwrap_or_else(|e| e.into_inner());
-                if idx >= queue.len() {
-                    drop(queue);
-                    let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
-                    let len = queue.len();
-                    queue.resize_with(std::cmp::max(len, idx + 1), <_>::default);
+                if idx >= state.queue.len() {
+                    drop(state);
+                    let mut state = self.state.write().await;
+                    let len = state.queue.len();
+                    state
+                        .queue
+                        .resize_with(std::cmp::max(len, idx + 1), <_>::default);
                 }
             }
-            let queue = self.queue.read().unwrap_or_else(|e| e.into_inner());
-            let mut q = queue[idx].lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.state.read().await;
+            let mut q = state.queue[idx].lock().await;
             let result = { q.insert(serial, shard)? };
             self.wait_queue.try_notify_next();
             if idx > window {
-                Err(ReceiveError::Full(queue.len()))
+                Err(ReceiveError::Full(state.queue.len()))
             } else {
                 Ok(result)
             }
         } else {
-            Err(ReceiveError::OutOfBound(
-                start.0,
-                self.queue.read().unwrap_or_else(|e| e.into_inner()).len(),
-            ))
+            Err(ReceiveError::OutOfBound(state.start.0, state.queue.len()))
         }
     }
 
-    pub fn pop_front(&self) -> Option<Quorum> {
-        let mut start = self.start.write().unwrap_or_else(|e| e.into_inner());
-        let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(q) = queue.pop_front() {
-            *start += Wrapping(1);
+    pub async fn pop_front(&self) -> Option<Quorum> {
+        let mut state = self.state.write().await;
+        if let Some(q) = state.queue.pop_front() {
+            state.start += Wrapping(1);
             self.wait_queue.try_notify_next();
-            Some(q.into_inner().unwrap_or_else(|e| e.into_inner()))
+            Some(q.into_inner())
         } else {
             None
         }
     }
 
-    fn try_poll(
+    async fn try_poll(
         &self,
         codec: &RSCodec,
     ) -> Option<Result<(u64, Vec<u8>, HashSet<u8>), QuorumError>> {
-        let mut start = self.start.write().unwrap_or_else(|e| e.into_inner());
-        let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(front) = queue.front() {
-            let front = front.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.write().await;
+        if let Some(front) = state.queue.front() {
+            let front = front.lock().await;
             let result = front.poll(&codec);
             if result.is_ok() {
                 drop(front);
-                *start += Wrapping(1);
-                queue.pop_front();
+                state.start += Wrapping(1);
+                state.queue.pop_front();
             }
             Some(result)
         } else {
@@ -646,97 +645,57 @@ impl ReceiveQueue {
         }
     }
 
-    pub fn poll<'a, 'b>(&'a self, codec: &'b RSCodec) -> ReceiveQueuePoll<'a, 'b> {
+    pub fn poll<'a, 'b: 'a>(&'a self, codec: &'b RSCodec) -> ReceiveQueuePoll<'a> {
         ReceiveQueuePoll {
             queue: self,
             codec,
             key: None,
+            poll: None,
         }
     }
 
-    pub fn reset(&self) {
-        let mut start = self.start.write().unwrap_or_else(|e| e.into_inner());
-        let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
-        *start = Wrapping(0);
-        queue.drain(..);
+    pub async fn reset(&self) {
+        let mut state = self.state.write().await;
+        state.start = Wrapping(0);
+        state.queue.clear();
     }
 }
 
-#[derive(Default)]
-struct WakerQueue {
-    wait_queue: Mutex<(VecDeque<usize>, Slab<Option<Waker>>)>,
-}
-
-impl WakerQueue {
-    fn register_poll_waker(&self, key: Option<usize>, w: Waker) -> Option<usize> {
-        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(key) = key {
-            if let Some(entry) = wakers.get_mut(key) {
-                *entry = Some(w);
-                return Some(key);
-            }
-        }
-        let entry = wakers.vacant_entry();
-        let key = entry.key();
-        entry.insert(Some(w));
-        queue.push_back(key);
-        Some(key)
-    }
-
-    fn deregister_poll_waker(&self, key: Option<usize>) {
-        if let Some(key) = key {
-            let (_, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = wakers.get_mut(key) {
-                *entry = None;
-            }
-        }
-    }
-
-    fn try_notify_next(&self) {
-        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(head) = queue.pop_front() {
-            if let Some(Some(waker)) = wakers.get(head) {
-                waker.wake_by_ref();
-                queue.push_back(head);
-                return;
-            }
-        }
-        wakers.clear();
-    }
-
-    fn try_notify_all(&self) {
-        let (queue, wakers) = &mut *self.wait_queue.lock().unwrap_or_else(|e| e.into_inner());
-        let all_keys: Vec<_> = queue.drain(..).collect();
-        for key in all_keys {
-            if let Some(Some(waker)) = wakers.get(key) {
-                waker.wake_by_ref();
-                queue.push_back(key);
-                return;
-            }
-        }
-    }
-}
-
-pub struct ReceiveQueuePoll<'a, 'b> {
+pub struct ReceiveQueuePoll<'a> {
     queue: &'a ReceiveQueue,
-    codec: &'b RSCodec,
+    codec: &'a RSCodec,
     key: Option<usize>,
+    poll: Option<BoxFuture<'a, Option<Result<(u64, Vec<u8>, HashSet<u8>), QuorumError>>>>,
 }
 
-impl<'a, 'b> Future for ReceiveQueuePoll<'a, 'b> {
+impl<'a> Future for ReceiveQueuePoll<'a> {
     type Output = (u64, Vec<u8>, HashSet<u8>);
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         use Poll::*;
-        if let Some(Ok(result)) = self.queue.try_poll(self.codec) {
-            self.queue.wait_queue.deregister_poll_waker(self.key);
-            self.queue.wait_queue.try_notify_next();
-            Ready(result)
+        if let None = self.poll {
+            self.poll = Some(self.queue.try_poll(self.codec).boxed());
+        }
+        if let Some(mut poll) = self.poll.take() {
+            match Pin::new(&mut poll).poll(cx) {
+                Ready(Some(Ok(result))) => {
+                    self.queue.wait_queue.deregister_poll_waker(self.key);
+                    self.queue.wait_queue.try_notify_next();
+                    return Ready(result);
+                }
+                Pending => {
+                    self.poll = Some(poll);
+                    Pending
+                }
+                _ => {
+                    self.key = self
+                        .queue
+                        .wait_queue
+                        .register_poll_waker(self.key, cx.waker().clone());
+                    Pending
+                }
+            }
         } else {
-            self.key = self
-                .queue
-                .wait_queue
-                .register_poll_waker(self.key, cx.waker().clone());
-            Pending
+            unreachable!()
         }
     }
 }
@@ -772,12 +731,12 @@ pub type TaskProgressNotifierSink =
     Box<dyn Sink<(u64, TaskProgressNotifier), Error = GenericError> + Unpin + Send>;
 
 pub struct SendQueue {
-    queue: RwLock<ArrayQueue<(RawShard, RawShardId)>>,
+    queue: AsyncRwLock<ArrayQueue<(RawShard, RawShardId)>>,
     stream: u8,
     serial: AtomicU64,
     task_notifiers: AsyncMutex<TaskProgressNotifierSink>,
     window: usize,
-    block_sending: Mutex<Option<BoxFuture<'static, ()>>>,
+    block_sending: AsyncMutex<Option<BoxFuture<'static, ()>>>,
     wait_pop: WakerQueue,
     wait_enqueue: WakerQueue,
 }
@@ -790,30 +749,29 @@ impl SendQueue {
             window,
             task_notifiers,
             serial: AtomicU64::default(),
-            queue: RwLock::new(ArrayQueue::new(window)),
+            queue: AsyncRwLock::new(ArrayQueue::new(window)),
             block_sending: <_>::default(),
             wait_pop: <_>::default(),
             wait_enqueue: <_>::default(),
         }
     }
 
-    pub fn block_sending(&self, condition: impl 'static + Future<Output = ()> + Send) {
-        *self.block_sending.lock().unwrap_or_else(|e| e.into_inner()) = Some(condition.boxed())
+    pub async fn block_sending(&self, condition: impl 'static + Future<Output = ()> + Send) {
+        *self.block_sending.lock().await = Some(condition.boxed())
     }
 
-    pub fn reset(&self) {
-        let mut queue = self.queue.write().unwrap_or_else(|e| e.into_inner());
+    pub async fn reset(&self) {
+        let mut queue = self.queue.write().await;
         *queue = ArrayQueue::new(self.window);
     }
 
-    fn try_enqueue(&self, data: (RawShard, RawShardId)) -> Result<(), (RawShard, RawShardId)> {
+    async fn try_enqueue(
+        &self,
+        data: (RawShard, RawShardId),
+    ) -> Result<(), (RawShard, RawShardId)> {
         use crossbeam::queue::PushError;
 
-        let push = self
-            .queue
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(data);
+        let push = self.queue.read().await.push(data);
         if let Err(PushError(data)) = push {
             debug!("send queue: full");
             Err(data)
@@ -823,12 +781,7 @@ impl SendQueue {
     }
 
     pub async fn enqueue(&self, data: (RawShard, RawShardId)) {
-        let block_sending = {
-            self.block_sending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-        };
+        let block_sending = { self.block_sending.lock().await.take() };
         if let Some(block_sending) = block_sending {
             debug!("send queue: back pressure");
             block_sending.await
@@ -837,25 +790,20 @@ impl SendQueue {
             queue: self,
             key: None,
             data: Some(data),
+            poll: None,
         };
         enqueue.await;
     }
 
-    fn try_pop(&self) -> Option<(RawShard, RawShardId)> {
-        let result = self
-            .queue
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop()
-            .ok();
-        self.wait_enqueue.try_notify_next();
-        result
+    async fn try_pop(&self) -> Option<(RawShard, RawShardId)> {
+        self.queue.read().await.pop().ok()
     }
 
     pub fn pop<'a>(&'a self) -> SendQueuePop<'a> {
         SendQueuePop {
             queue: self,
             key: None,
+            poll: None,
         }
     }
 
@@ -968,22 +916,36 @@ impl SendQueue {
 pub struct SendQueuePop<'a> {
     queue: &'a SendQueue,
     key: Option<usize>,
+    poll: Option<BoxFuture<'a, Option<(RawShard, RawShardId)>>>,
 }
 
 impl<'a> Future for SendQueuePop<'a> {
     type Output = (RawShard, RawShardId);
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         use Poll::*;
-        if let Some(result) = self.queue.try_pop() {
-            self.queue.wait_pop.deregister_poll_waker(self.key);
-            self.queue.wait_pop.try_notify_next();
-            Ready(result)
+        let mut poll = if let Some(poll) = self.poll.take() {
+            poll
         } else {
-            self.key = self
-                .queue
-                .wait_pop
-                .register_poll_waker(self.key, cx.waker().clone());
-            Pending
+            self.queue.try_pop().boxed()
+        };
+        match Pin::new(&mut poll).poll(cx) {
+            Ready(Some(result)) => {
+                self.queue.wait_pop.deregister_poll_waker(self.key);
+                self.queue.wait_pop.try_notify_next();
+                self.queue.wait_enqueue.try_notify_next();
+                Ready(result)
+            }
+            Ready(None) => {
+                self.key = self
+                    .queue
+                    .wait_pop
+                    .register_poll_waker(self.key, cx.waker().clone());
+                Pending
+            }
+            Pending => {
+                self.poll = Some(poll);
+                Pending
+            }
         }
     }
 }
@@ -992,6 +954,7 @@ pub struct SendQueueEnqueue<'a> {
     queue: &'a SendQueue,
     key: Option<usize>,
     data: Option<(RawShard, RawShardId)>,
+    poll: Option<BoxFuture<'a, Result<(), (RawShard, RawShardId)>>>,
 }
 
 impl<'a> Future for SendQueueEnqueue<'a> {
@@ -999,21 +962,38 @@ impl<'a> Future for SendQueueEnqueue<'a> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         use Poll::*;
         if let Some(data) = self.data.take() {
-            if let Err(data) = self.queue.try_enqueue(data) {
-                self.data = Some(data);
-                self.key = self
-                    .queue
-                    .wait_enqueue
-                    .register_poll_waker(self.key, cx.waker().clone());
-                Pending
-            } else {
-                self.queue.wait_enqueue.deregister_poll_waker(self.key);
-                self.queue.wait_enqueue.try_notify_next();
-                Ready(())
+            self.poll = Some(self.queue.try_enqueue(data).boxed());
+        }
+        if let Some(mut poll) = self.poll.take() {
+            match Pin::new(&mut poll).poll(cx) {
+                Ready(Err(data)) => {
+                    self.data = Some(data);
+                    self.key = self
+                        .queue
+                        .wait_enqueue
+                        .register_poll_waker(self.key, cx.waker().clone());
+                    Pending
+                }
+                Ready(Ok(_)) => {
+                    self.queue.wait_enqueue.deregister_poll_waker(self.key);
+                    self.queue.wait_enqueue.try_notify_next();
+                    self.queue.wait_pop.try_notify_next();
+                    Ready(())
+                }
+                Pending => {
+                    self.poll = Some(poll);
+                    Pending
+                }
             }
         } else {
             panic!("poll after send queue enqueue succeeded")
         }
+    }
+}
+
+impl<'a> Drop for SendQueueEnqueue<'a> {
+    fn drop(&mut self) {
+        self.queue.wait_enqueue.deregister_poll_waker(self.key);
     }
 }
 
@@ -1080,7 +1060,7 @@ mod tests {
                 let recv_q = Arc::clone(&recv_q);
                 async move {
                     let (raw_shard, raw_shard_id) = shard.encode_shard(stream, serial, &state);
-                    recv_q.admit(raw_shard, raw_shard_id, &state)
+                    recv_q.admit(raw_shard, raw_shard_id, &state).await
                 }
             })
             .buffer_unordered(20)
