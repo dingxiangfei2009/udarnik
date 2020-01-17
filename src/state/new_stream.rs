@@ -1,7 +1,6 @@
 use super::*;
 
 use futures::{channel::oneshot::channel as oneshot_channel, pin_mut, stream::FusedStream};
-use log::warn;
 
 impl<G> Session<G>
 where
@@ -142,7 +141,7 @@ where
                             send_queue
                                 .block_sending(timeout_generator(send_cooldown))
                                 .await;
-                            info!(
+                            debug!(
                                 "{:?}: feedback: full, serial={}, queue={}",
                                 role, serial, queue_len
                             );
@@ -152,7 +151,7 @@ where
                             start,
                             queue_len,
                         } => {
-                            error!(
+                            debug!(
                                 "out of bound: serial={}, start={}, queue={}",
                                 serial, start, queue_len
                             );
@@ -394,11 +393,11 @@ where
                                 })
                             }
                             Err(ReceiveError::Full(queue_len)) => {
-                                error!("{:?}: poll_admit: full", role);
+                                debug!("{:?}: poll_admit: full", role);
                                 Some(PayloadFeedback::Full { queue_len, serial })
                             }
                             Err(ReceiveError::OutOfBound(start, queue_len)) => {
-                                error!(
+                                debug!(
                                     "{:?}: poll_admit: out of bound, serial={}, start={}, queue={}",
                                     role, serial, start, queue_len
                                 );
@@ -409,12 +408,12 @@ where
                                 })
                             }
                             Err(ReceiveError::Quorum(QuorumError::Duplicate(id, quorum))) => {
-                                error!("{:?}: poll_admit: duplicate", role);
+                                debug!("{:?}: poll_admit: duplicate", role);
                                 Some(PayloadFeedback::Duplicate { serial, id, quorum })
                             }
                             Err(ReceiveError::Quorum(QuorumError::Malformed { .. }))
                             | Err(ReceiveError::Quorum(QuorumError::MismatchContent(..))) => {
-                                error!(
+                                debug!(
                                     "{:?}: poll_admit: data {} malformed/mismatch",
                                     role, serial
                                 );

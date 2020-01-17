@@ -9,7 +9,7 @@ use core::{
     time::Duration,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     time::Instant,
@@ -28,7 +28,7 @@ use futures::{
     stream::{iter, unfold, FuturesUnordered},
 };
 use generic_array::GenericArray;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use lru::LruCache;
 use prost::Message as ProstMessage;
 use rand::{rngs::StdRng, seq::IteratorRandom, CryptoRng, RngCore, SeedableRng};
@@ -985,6 +985,7 @@ impl SafeGuard {
         buf
     }
     fn decode_message<P: ProstMessage + Default>(data: Vec<u8>) -> Result<P, GenericError> {
+        let data = VecDeque::from(data);
         P::decode(data).map_err(|e| Box::new(e) as GenericError)
     }
 }
