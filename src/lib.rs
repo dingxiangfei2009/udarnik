@@ -25,7 +25,7 @@ pub struct Redact<T>(pub T);
 
 impl<T> Debug for Redact<T> {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        write!(f, "<REDACTED>")
+        f.debug_struct("Redact").finish()
     }
 }
 

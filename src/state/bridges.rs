@@ -12,7 +12,6 @@ where
     pub(super) async fn handle_bridges<T>(
         self: Pin<Arc<Self>>,
         invite_cooldown: Duration,
-        mut progress: Sender<()>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
     ) -> Result<(), SessionError>
     where
@@ -58,10 +57,6 @@ where
                     .remove(&bridge);
                 self.receive_counter.counters.write().await.remove(&bridge);
             }
-            progress
-                .send(())
-                .await
-                .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?
         }
     }
 }

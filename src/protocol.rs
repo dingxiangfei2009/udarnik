@@ -13,7 +13,7 @@ use std::{
 };
 
 use aead::{Aead, NewAead, Payload};
-use aes_gcm_siv::Aes256GcmSiv;
+use chacha20poly1305::ChaCha20Poly1305;
 use async_std::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use crossbeam::queue::ArrayQueue;
 use failure::{Backtrace, Fail};
@@ -400,7 +400,7 @@ impl Verifiable for RawShard {
     fn verify(self, proof: Self::Proof) -> Result<Self::Output, Self::Error> {
         let RawShard { raw_data } = self;
 
-        let aead = Aes256GcmSiv::new(GenericArray::clone_from_slice(&proof.key));
+        let aead = ChaCha20Poly1305::new(GenericArray::clone_from_slice(&proof.key));
         let aad = proof.to_aad();
         let data = aead
             .decrypt(
@@ -514,7 +514,7 @@ impl Shard {
         state: &ShardState,
     ) -> (RawShard, RawShardId) {
         let proof = self.generate_shard_id(serial, state);
-        let aead = Aes256GcmSiv::new(GenericArray::clone_from_slice(&proof.key));
+        let aead = ChaCha20Poly1305::new(GenericArray::clone_from_slice(&proof.key));
         let aad = proof.to_aad();
 
         let mut data = vec![];

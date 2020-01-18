@@ -7,10 +7,8 @@ use std::{
     time::Duration,
 };
 
-use aes_gcm_siv::{
-    aead::{Aead, NewAead},
-    Aes256GcmSiv,
-};
+use aead::{Aead, NewAead};
+use chacha20poly1305::ChaCha20Poly1305;
 use async_std::{
     io::{Read as AsyncStdRead, Write as AsyncStdWrite},
     net::{TcpListener, TcpStream},
@@ -127,7 +125,7 @@ impl<S: Spawn> BridgeServer<S> {
         } else {
             return Err(Status::aborted("broken pipe"));
         };
-        let aead = Arc::pin(Aes256GcmSiv::new(*GenericArray::from_slice(&key)));
+        let aead = Arc::pin(ChaCha20Poly1305::new(*GenericArray::from_slice(&key)));
         let aead_ = Pin::clone(&aead);
         let nonce_ = Pin::clone(&nonce);
         let progress = self.progress.clone();
@@ -547,7 +545,7 @@ where
             error!("broken pipe: {}", e);
             Error::Pipe(<_>::default())
         })?;
-    let aead = Arc::pin(Aes256GcmSiv::new(*GenericArray::from_slice(&key)));
+    let aead = Arc::pin(ChaCha20Poly1305::new(*GenericArray::from_slice(&key)));
     let nonce = Arc::pin(nonce);
     let (tx, message_sink_transform) = std_channel(4096);
     let poll = spawn

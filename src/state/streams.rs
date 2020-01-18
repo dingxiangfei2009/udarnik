@@ -12,6 +12,7 @@ where
     pub(super) async fn handle_streams<T>(
         self: Pin<&Self>,
         bridges_out_tx: Sender<BridgeMessage>,
+        progress: Sender<()>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
         spawn: impl Spawn + Clone + Send + Sync + 'static,
     ) -> Result<(), SessionError>
@@ -43,6 +44,7 @@ where
                     stream,
                     self.params.window,
                     bridges_out_tx.clone(),
+                    progress.clone(),
                     timeout_generator.clone(),
                     spawn.clone(),
                 );

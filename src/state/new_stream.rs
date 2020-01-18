@@ -16,6 +16,7 @@ where
         stream: u8,
         window: usize,
         bridges_out_tx: Sender<BridgeMessage>,
+        session_progress: Sender<()>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
         spawn: S,
     ) -> (SessionStream, impl 'static + Future<Output = ()> + Send)
@@ -87,6 +88,7 @@ where
             let send_cooldown = self.send_cooldown;
             let mut feedback_rx = feedback_rx.fuse();
             let mut progress = progress_tx.clone();
+            let mut session_progress = session_progress.clone();
             let role = self.role;
             async move {
                 while let Some(feedback) = feedback_rx.next().await {
@@ -117,11 +119,15 @@ where
                                 .map(|n| ClonableSink::clone_pin_box(&**n))
                             {
                                 if let Err(e) = notifier.send(Ok((id, quorum))).await {
-                                    error!("pipe: {}", e);
+                                    debug!("notifer pipe: {}", e);
                                 }
                             }
                             if let Err(e) = progress.send(()).await {
-                                error!("pipe: {}", e);
+                                debug!("progress pipe: {}", e);
+                                break;
+                            }
+                            if let Err(e) = session_progress.send(()).await {
+                                debug!("session_progress pipe: {}", e);
                                 break;
                             }
                         }
@@ -132,7 +138,7 @@ where
                                 .map(|n| ClonableSink::clone_pin_box(&**n))
                             {
                                 if let Err(e) = notifier.send(Ok((id, quorum))).await {
-                                    error!("pipe: {}", e);
+                                    debug!("notifier pipe: {}", e);
                                 }
                             }
                         }
@@ -162,7 +168,7 @@ where
                             {
                                 if let Err(e) = notifier.send(Err(RemoteRecvError::Complete)).await
                                 {
-                                    error!("pipe: {}", e);
+                                    debug!("notifier pipe: {}", e);
                                 }
                             }
                         }
@@ -174,7 +180,7 @@ where
                             {
                                 if let Err(e) = notifier.send(Err(RemoteRecvError::Malformed)).await
                                 {
-                                    error!("pipe: {}", e);
+                                    debug!("notifier pipe: {}", e);
                                 }
                             }
                         }
@@ -186,11 +192,15 @@ where
                             {
                                 if let Err(e) = notifier.send(Err(RemoteRecvError::Complete)).await
                                 {
-                                    error!("pipe: {}", e);
+                                    debug!("notifier pipe: {}", e);
                                 }
                             }
                             if let Err(e) = progress.send(()).await {
-                                error!("pipe: {}", e);
+                                debug!("progress pipe: {}", e);
+                                break;
+                            }
+                            if let Err(e) = session_progress.send(()).await {
+                                debug!("session_progress pipe: {}", e);
                                 break;
                             }
                         }
@@ -219,9 +229,11 @@ where
             .try_for_each({
                 let bridges_out_tx = bridges_out_tx.clone();
                 let progress = progress_tx.clone();
+                let session_progress = session_progress.clone();
                 move |(raw_shard, raw_shard_id)| {
                     let mut bridges_out_tx = bridges_out_tx.clone();
                     let mut progress = progress.clone();
+                    let mut session_progress = session_progress.clone();
                     async move {
                         bridges_out_tx
                             .send(BridgeMessage::Payload {
@@ -229,7 +241,8 @@ where
                                 raw_shard_id,
                             })
                             .await?;
-                        progress.send(()).await
+                        progress.send(()).await?;
+                        session_progress.send(()).await
                     }
                 }
             })
@@ -285,6 +298,7 @@ where
             let mut error_reports = self.error_reports.clone();
             let mut output = self.output.clone();
             let mut progress = progress_tx.clone();
+            let mut session_progress = session_progress.clone();
             let role = self.role;
             async move {
                 let poll_recv = poll_recv.fuse();
@@ -305,7 +319,7 @@ where
                             }
                         },
                         _ = timeout_generator(timeout).fuse() => {
-                            error!("{:?}: stream {}: poll_recv: timed out({:?})", role, stream, timeout);
+                            info!("{:?}: stream {}: poll_recv: timed out({:?})", role, stream, timeout);
                             if let Some(front) = receive_queue.pop_front().await {
                                 front.poll(&codec)
                             } else {
@@ -316,7 +330,7 @@ where
                     match front {
                         Ok((serial, data, errors)) => {
                             // hall of shame
-                            error!(
+                            trace!(
                                 "{:?}: stream {}: poll_recv: good packet {}: {:?}",
                                 role, stream, serial, data
                             ); // TODO: REMOVE
@@ -333,6 +347,7 @@ where
                                 })
                                 .await?;
                             progress.send(()).await?;
+                            session_progress.send(()).await?;
                         }
                         Err(e) => {
                             // TODO: fine grained error reporting
@@ -449,6 +464,9 @@ where
                             .await
                         {
                             Ok(_) => (),
+                            Err(SendError::Exhausted) => {
+                                info!("send: has tried its best");
+                            }
                             Err(SendError::BrokenPipe) => {
                                 return Err(SessionError::BrokenPipe(
                                     Box::new(SendError::BrokenPipe.compat()),

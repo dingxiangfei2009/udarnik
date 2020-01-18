@@ -16,7 +16,7 @@ use std::{
 };
 
 use aead::{Aead, NewAead, Payload};
-use aes_gcm_siv::Aes256GcmSiv;
+use chacha20poly1305::ChaCha20Poly1305;
 use async_std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use failure::{err_msg, Backtrace, Error as TopError, Fail};
 use futures::{
@@ -767,11 +767,12 @@ where
         let mut poll_streams = spawn
             .spawn({
                 let this = Pin::clone(&self);
+                let progress = progress.clone();
                 let timeout_generator = timeout_generator.clone();
                 let spawn = spawn.clone();
                 async move {
                     this.as_ref()
-                        .handle_streams(bridges_out_tx, timeout_generator, spawn)
+                        .handle_streams(bridges_out_tx, progress, timeout_generator, spawn)
                         .await
                 }
             })
@@ -780,11 +781,10 @@ where
         let mut poll_bridges = spawn
             .spawn({
                 let this = Pin::clone(&self);
-                let progress = progress.clone();
                 let invite_cooldown = Duration::new(10, 0);
                 let timeout_generator = timeout_generator.clone();
                 async move {
-                    this.handle_bridges(invite_cooldown, progress, timeout_generator)
+                    this.handle_bridges(invite_cooldown, timeout_generator)
                         .await
                 }
             })
@@ -954,12 +954,12 @@ pub enum PayloadFeedback {
 }
 
 pub(crate) struct SafeGuard {
-    aead: Aes256GcmSiv,
+    aead: ChaCha20Poly1305,
 }
 
 impl Debug for SafeGuard {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        write!(f, "<SafeGuard>")
+        f.debug_struct("SafeGuard").finish()
     }
 }
 
@@ -976,7 +976,7 @@ impl SafeGuard {
     fn new(key: &[u8]) -> Self {
         let key = SafeGuard::derive_key(key);
         Self {
-            aead: Aes256GcmSiv::new(*GenericArray::from_slice(&key)),
+            aead: ChaCha20Poly1305::new(*GenericArray::from_slice(&key)),
         }
     }
     fn encode_message<P: ProstMessage>(payload: P) -> Vec<u8> {

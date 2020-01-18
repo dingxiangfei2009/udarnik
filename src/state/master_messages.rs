@@ -153,6 +153,7 @@ where
                                                                 stream,
                                                                 window,
                                                                 bridges_out_tx.clone(),
+                                                                progress.clone(),
                                                                 timeout_generator.clone(),
                                                                 spawn.clone(),
                                                             );

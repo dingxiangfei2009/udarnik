@@ -236,8 +236,17 @@ where
     let master_adapter =
         async move {
             pin_mut!(master_in);
-            while let Some(_) = master_in.as_mut().peek().await {
-                let timeout_generator = timeout_generator_.clone();
+            let timeout_generator = timeout_generator_;
+            loop {
+                select! {
+                    _ = timeout_generator(Duration::new(300, 0)).fuse() =>
+                        info!("client: reconnect to master to receive directives"),
+                    r = master_in.as_mut().peek().fuse() =>
+                        if let None = r {
+                            error!("client: master_in: broken pipe");
+                            break
+                        },
+                }
                 trace!("client: want to send message to master");
                 let (mut client_send, mut client_recv) =
                     match reconnect(&mut client, &session, &init_db, &sign_db, signature_hasher)
@@ -291,7 +300,10 @@ where
                     loop {
                         select! {
                             () = progress_rx.select_next_some().fuse() => (),
-                            () = timeout_generator(Duration::new(300, 0)).fuse() => break,
+                            () = timeout_generator(Duration::new(300, 0)).fuse() => {
+                                error!("client: master pipe: close connection due to inactivity");
+                                break
+                            }
                         }
                     }
                 }
@@ -318,7 +330,10 @@ where
         loop {
             select! {
                 () = progress.select_next_some().fuse() => (),
-                () = timeout_generator(Duration::new(300, 0)).fuse() => break,
+                () = timeout_generator(Duration::new(300, 0)).fuse() => {
+                    error!("client: stopping due to inactivity");
+                    break
+                }
             }
         }
     };
