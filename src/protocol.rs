@@ -13,8 +13,8 @@ use std::{
 };
 
 use aead::{Aead, NewAead, Payload};
-use chacha20poly1305::ChaCha20Poly1305;
 use async_std::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use chacha20poly1305::ChaCha20Poly1305;
 use crossbeam::queue::ArrayQueue;
 use failure::{Backtrace, Fail};
 use futures::{channel::mpsc::channel, future::BoxFuture, prelude::*, select};

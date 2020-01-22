@@ -332,7 +332,10 @@ where
                             // hall of shame
                             trace!(
                                 "{:?}: stream {}: poll_recv: good packet {}: {:?}",
-                                role, stream, serial, data
+                                role,
+                                stream,
+                                serial,
+                                data
                             ); // TODO: REMOVE
                             let (data, errors) = join!(
                                 output.send(data),

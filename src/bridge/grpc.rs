@@ -8,7 +8,6 @@ use std::{
 };
 
 use aead::{Aead, NewAead};
-use chacha20poly1305::ChaCha20Poly1305;
 use async_std::{
     io::{Read as AsyncStdRead, Write as AsyncStdWrite},
     net::{TcpListener, TcpStream},
@@ -17,6 +16,7 @@ use async_std::{
     task::sleep,
 };
 use async_trait::async_trait;
+use chacha20poly1305::ChaCha20Poly1305;
 use failure::{Backtrace, Fail};
 use futures::{
     channel::mpsc::{channel as std_channel, Sender as StdSender},

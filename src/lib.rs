@@ -16,6 +16,7 @@ pub mod protocol;
 pub mod pvss;
 pub mod server;
 pub mod state;
+pub mod tun;
 pub mod utils;
 
 pub type GenericError = Box<dyn 'static + StdError + Send + Sync>;

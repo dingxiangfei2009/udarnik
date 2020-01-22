@@ -16,8 +16,8 @@ use std::{
 };
 
 use aead::{Aead, NewAead, Payload};
-use chacha20poly1305::ChaCha20Poly1305;
 use async_std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use chacha20poly1305::ChaCha20Poly1305;
 use failure::{err_msg, Backtrace, Error as TopError, Fail};
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
