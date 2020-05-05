@@ -142,10 +142,8 @@ async fn start(handle: tokio::runtime::Handle) {
             sleep(Duration::new(8, 0)).await;
         }
     });
-    handle.spawn(output.for_each(|m| {
-        async move {
-            info!("client: output: {:?}", m);
-        }
+    handle.spawn(output.for_each(|m| async move {
+        info!("client: output: {:?}", m);
     }));
     sleep(Duration::new(10000, 0)).await;
 }

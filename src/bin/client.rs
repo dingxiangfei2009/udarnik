@@ -15,7 +15,6 @@ use async_std::{
     io::{stdin, stdout, BufReader, BufWriter},
     task::sleep,
 };
-use failure::Fail;
 use futures::{
     channel::{
         mpsc::{channel, SendError},
@@ -29,6 +28,7 @@ use http::Uri;
 use log::{error, info};
 use sss::lattice::{keygen, Init, PrivateKey, PublicKey, SigningKey};
 use structopt::StructOpt;
+use thiserror::Error;
 use udarnik::{
     client::{client, ClientBootstrap},
     keyman::{
@@ -49,16 +49,16 @@ struct Config {
     addr: SocketAddr,
 }
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug)]
 enum Error {
-    #[fail(display = "serialization: {}", _0)]
-    Serialization(#[cause] serde_json::Error),
-    #[fail(display = "io: {}", _0)]
-    Io(#[cause] std::io::Error),
-    #[fail(display = "key: {}", _0)]
-    Key(#[cause] KeyError),
-    #[fail(display = "pipe: {}", _0)]
-    Pipe(SendError),
+    #[error("serialization: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("key: {0}")]
+    Key(#[from] KeyError),
+    #[error("pipe: {0}")]
+    Pipe(#[from] SendError),
 }
 
 async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error> {
@@ -140,11 +140,9 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
     let stdout = handle.spawn(
         output
             .map(Ok)
-            .try_fold(stdout, move |mut stdout, output| {
-                async move {
-                    stdout.write_all(&output).await?;
-                    Ok::<_, std::io::Error>(stdout)
-                }
+            .try_fold(stdout, move |mut stdout, output| async move {
+                stdout.write_all(&output).await?;
+                Ok::<_, std::io::Error>(stdout)
             })
             .map_ok(|_| ()),
     );

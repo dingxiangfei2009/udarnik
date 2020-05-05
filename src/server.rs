@@ -9,7 +9,6 @@ use std::{
 };
 
 use async_std::sync::{Arc, Mutex, RwLock};
-use failure::Fail;
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
     future::{pending, select_all},
@@ -237,8 +236,8 @@ where
         request: Request<Streaming<wire::Message>>,
     ) -> Result<Response<Self::KeyExchangeStream>, Status> {
         info!("boris: incoming key exchange {:?}", request.remote_addr());
-        let request = request.into_inner().and_then(|m| {
-            async { Message::<G>::try_from(m).map_err(|e| Status::aborted(format!("{}", e))) }
+        let request = request.into_inner().and_then(|m| async {
+            Message::<G>::try_from(m).map_err(|e| Status::aborted(format!("{}", e)))
         });
         let request =
             Pin::from(Box::new(request)
@@ -264,16 +263,14 @@ where
         let kex_result = key_exchange_boris(kex, request, message_sink, seeder, session_id)
             .map_err(|e| {
                 info!("boris: error: {}", e);
-                Box::new(e.compat()) as GenericError
+                Box::new(e) as GenericError
             })
-            .and_then(move |r| {
-                async move {
-                    info!("new session");
-                    new_sessions.send(r).await.map_err(|e| {
-                        info!("boris: error: {}", e);
-                        Box::new(e) as GenericError
-                    })
-                }
+            .and_then(move |r| async move {
+                info!("new session");
+                new_sessions.send(r).await.map_err(|e| {
+                    info!("boris: error: {}", e);
+                    Box::new(e) as GenericError
+                })
             });
         let stream = TryFutureStream::new(
             Box::new(Pin::from(Box::new(kex_result))),
@@ -291,16 +288,10 @@ where
     ) -> Result<Response<Self::ClientStream>, Status> {
         let request = request
             .into_inner()
-            .and_then(|m| {
-                {
-                    async {
-                        Message::<G>::try_from(m).map_err(|e| Status::aborted(format!("{}", e)))
-                    }
-                }
+            .and_then(|m| async {
+                Message::<G>::try_from(m).map_err(|e| Status::aborted(format!("{}", e)))
             })
-            .map_err(|e| {
-                SessionError::Stream(Box::new(e.compat()) as GenericError, <_>::default())
-            });
+            .map_err(|e| SessionError::Stream(Box::new(e) as GenericError, <_>::default()));
         let request = Pin::from(Box::new(request)
             as Box<dyn Stream<Item = Result<Message<G>, SessionError>> + Send + Sync>);
         let (message_sink, stream) = channel(4096);

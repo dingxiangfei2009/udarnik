@@ -1,8 +1,8 @@
 use curve25519_dalek::{constants, edwards::EdwardsPoint, scalar::Scalar, traits::Identity};
-use failure::Fail;
 use rand::{CryptoRng, Error as RngError, RngCore};
 use sha3::digest::{FixedOutput, Input};
 use sha3::Sha3_256;
+use thiserror::Error;
 
 use crate::common::{Verifiable, Verified};
 
@@ -24,29 +24,29 @@ pub fn u64_to_scalar(value: u64) -> Scalar {
     Scalar::from_bytes_mod_order(v)
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[fail(display = "rng error: {}", _0)]
-    Rng(#[cause] RngError),
-    #[fail(display = "there should be at least one custodian")]
+    #[error("rng error: {0}")]
+    Rng(#[from] RngError),
+    #[error("there should be at least one custodian")]
     ZeroCustodian,
-    #[fail(display = "custodian id is zero")]
+    #[error("custodian id is zero")]
     ZeroCustodianId,
-    #[fail(display = "custodian id is invalid")]
+    #[error("custodian id is invalid")]
     InvalidCustodianId(u64),
-    #[fail(display = "custodian id is invalid")]
+    #[error("custodian id is invalid")]
     InvalidCustodianProof(dleq::Error),
-    #[fail(display = "no enough custodian")]
+    #[error("no enough custodian")]
     NoEnoughCustodian { allocated: usize, requested: usize },
-    #[fail(display = "invalid dealer proof: {}", _0)]
+    #[error("invalid dealer proof: {0}")]
     InvalidDealerProof(dleq::Error),
 }
 
-impl From<RngError> for Error {
-    fn from(err: RngError) -> Self {
-        Error::Rng(err)
-    }
-}
+// impl From<RngError> for Error {
+//     fn from(err: RngError) -> Self {
+//         Error::Rng(err)
+//     }
+// }
 
 pub struct Polynomial(Vec<Scalar>);
 

@@ -1,5 +1,5 @@
 use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
-use failure::Fail;
+use thiserror::Error;
 
 use crate::common::Verifiable;
 
@@ -29,9 +29,9 @@ pub struct Proof {
     pub response: Scalar,
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[fail(display = "invalid DLEQ proof")]
+    #[error("invalid DLEQ proof")]
     NotValid,
 }
 

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use failure::{Backtrace, Error as TopError, Fail};
+use backtrace::Backtrace as Bt;
 use futures::{
     channel::{
         mpsc::{channel, Receiver, Sender},
@@ -22,6 +22,7 @@ use rand::{CryptoRng, RngCore, SeedableRng};
 use sss::lattice::{
     Init, PrivateKey, PublicKey, SessionKeyPart, SessionKeyPartMix, SigningKey, SIGN_K,
 };
+use thiserror::Error;
 use tonic::{Request, Status};
 
 use crate::{
@@ -49,27 +50,27 @@ pub struct ClientBootstrap {
     pub sign_db: BTreeMap<InitIdentity, BTreeMap<Identity, SigningKey>>,
 }
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug, From)]
 pub enum ClientError {
-    #[fail(display = "connection reset")]
-    Reset(Backtrace),
-    #[fail(display = "broken pipe")]
-    Pipe(Backtrace),
-    #[fail(display = "network: {}", _0)]
-    Net(Status, Backtrace),
-    #[fail(display = "wire: {}", _0)]
-    Wire(WireError, Backtrace),
-    #[fail(display = "crypto: no init")]
+    #[error("connection reset")]
+    Reset(Bt),
+    #[error("broken pipe")]
+    Pipe(Bt),
+    #[error("network: {0}")]
+    Net(Status, Bt),
+    #[error("wire: {0}")]
+    Wire(WireError, Bt),
+    #[error("crypto: no init")]
     NoInit,
-    #[fail(display = "crypto: no signing key")]
+    #[error("crypto: no signing key")]
     NoSigningKey,
-    #[fail(display = "session: {}", _0)]
+    #[error("session: {0}")]
     Session(SessionError),
-    #[fail(display = "transport: {}", _0)]
-    Transport(tonic::transport::Error, Backtrace),
-    #[fail(display = "key exchange: {}", _0)]
+    #[error("transport: {0}")]
+    Transport(tonic::transport::Error, Bt),
+    #[error("key exchange: {0}")]
     KeyExchange(KeyExchangeError),
-    #[fail(display = "spawn: {}", _0)]
+    #[error("spawn: {0}")]
     Spawn(String),
 }
 
@@ -104,10 +105,8 @@ where
             .map_err(|e| ClientError::Net(e, <_>::default()))?
             .into_inner()
             .map_err(|e| ClientError::Net(e, <_>::default()))
-            .and_then(|m| {
-                async {
-                    Message::<G>::try_from(m).map_err(|e| ClientError::Wire(e, <_>::default()))
-                }
+            .and_then(|m| async {
+                Message::<G>::try_from(m).map_err(|e| ClientError::Wire(e, <_>::default()))
             }),
     )
         as Pin<Box<dyn Stream<Item = Result<Message<G>, ClientError>> + Send + Sync + 'static>>;
@@ -171,6 +170,10 @@ where
     TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
     Timeout: 'static + Future<Output = ()> + Send + Sync,
 {
+    #[derive(Error, Debug)]
+    #[error("{0}")]
+    struct BoxError(#[from] GenericError);
+
     let ClientBootstrap {
         addr,
         params,
@@ -193,10 +196,8 @@ where
         .map_err(|e| ClientError::Net(e, <_>::default()))?
         .into_inner()
         .map_err(|e| Box::new(e) as GenericError)
-        .and_then(|m| {
-            async { Message::<G>::try_from(m).map_err(|e| Box::new(e.compat()) as GenericError) }
-        })
-        .map_err(TopError::from_boxed_compat)
+        .and_then(|m| async { Message::<G>::try_from(m).map_err(|e| Box::new(e) as GenericError) })
+        .map_err(BoxError)
         .boxed();
     let kex = KeyExchange {
         retries,
@@ -216,7 +217,7 @@ where
 
     let (master_sink, master_in) = channel(4096);
     let (mut master_out, master_messages) = channel(4096);
-    let master_sink = Box::new(master_sink.sink_map_err(|e| Box::new(e) as GenericError)) as _;
+    let master_sink = Box::new(master_sink.sink_map_err(|e| Box::new(e) as GenericError));
     let SessionHandle {
         session,
         poll,
@@ -254,11 +255,11 @@ where
                     {
                         Ok(p) => p,
                         Err(ClientError::Pipe(e)) => {
-                            error!("pipe: {}", e);
+                            error!("pipe: {:?}", e);
                             continue;
                         }
                         Err(ClientError::Net(s, e)) => {
-                            error!("net: status: {}\n{}", s, e);
+                            error!("net: status: {}\n{:?}", s, e);
                             continue;
                         }
                         Err(e) => return Err(e),

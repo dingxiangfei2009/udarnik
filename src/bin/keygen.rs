@@ -1,11 +1,8 @@
-#[macro_use]
-extern crate derive_more;
-
 use std::{convert::TryFrom, fs::File, io::Write, path::PathBuf};
 
-use failure::Fail;
 use sss::lattice::{keygen, Init, PrivateKey, SigningKey};
 use structopt::StructOpt;
+use thiserror::Error;
 use udarnik::keyman::{
     Error as KeyError, RawInit, RawPrivateKey, RawPublicKey, RawSigningKey, RawVerificationKey,
 };
@@ -28,14 +25,14 @@ enum Opt {
     },
 }
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug)]
 enum Error {
-    #[fail(display = "serialization: {}", _0)]
-    Serialization(#[cause] serde_json::Error),
-    #[fail(display = "io: {}", _0)]
-    Io(#[cause] std::io::Error),
-    #[fail(display = "key: {}", _0)]
-    Key(#[cause] KeyError),
+    #[error("serialization: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("key: {0}")]
+    Key(#[from] KeyError),
 }
 
 fn main() -> Result<(), Error> {

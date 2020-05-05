@@ -6,7 +6,7 @@ use std::{
     thread,
 };
 
-use failure::{Backtrace, Fail};
+use backtrace::Backtrace as Bt;
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
     executor::block_on,
@@ -22,6 +22,7 @@ use nix::{
     unistd::close,
     Error as NixError,
 };
+use thiserror::Error;
 
 const IFHWADDRLEN: usize = 6;
 const IFNAMSIZ: usize = 16;
@@ -122,12 +123,12 @@ pub struct UtunDev {
     fd: Fd,
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[fail(display = "invalid name")]
+    #[error("invalid name")]
     Name,
-    #[fail(display = "os: {}, backtrace: {}", _0, _1)]
-    Os(nix::Error, Backtrace),
+    #[error("os: {0}, backtrace: {1:?}")]
+    Os(nix::Error, Bt),
 }
 
 fn name_to_ifrn_name(name: &str) -> Result<IfRN, Error> {
@@ -181,13 +182,13 @@ impl UtunDev {
             let fd = EventedFd(&tun_fd);
             let poll = match Poll::new() {
                 Err(e) => {
-                    error!("tun: {}, backtrace: {}", e, Backtrace::new());
+                    error!("tun: {}, backtrace: {:?}", e, Bt::new());
                     return;
                 }
                 Ok(poll) => poll,
             };
             if let Err(e) = poll.register(&fd, Token(0), Ready::writable(), PollOpt::edge()) {
-                error!("tun: {}, backtrace: {}", e, Backtrace::new());
+                error!("tun: {}, backtrace: {:?}", e, Bt::new());
                 return;
             }
             let mut events = Events::with_capacity(1);
@@ -197,14 +198,14 @@ impl UtunDev {
                         Ok(_) => break,
                         Err(NixError::Sys(EWOULDBLOCK)) => {}
                         Err(e) => {
-                            error!("tun: {}, backtrace: {}", e, Backtrace::new());
+                            error!("tun: {}, backtrace: {:?}", e, Bt::new());
                             return;
                         }
                     }
                     match poll.poll(&mut events, None) {
                         Ok(_) => {}
                         Err(e) => {
-                            error!("tun: {}, backtrace: {}", e, Backtrace::new());
+                            error!("tun: {}, backtrace: {:?}", e, Bt::new());
                             return;
                         }
                     }
@@ -217,13 +218,13 @@ impl UtunDev {
             let fd = EventedFd(&tun_fd);
             let poll = match Poll::new() {
                 Err(e) => {
-                    error!("tun: {}, backtrace: {}", e, Backtrace::new());
+                    error!("tun: {}, backtrace: {:?}", e, Bt::new());
                     return;
                 }
                 Ok(poll) => poll,
             };
             if let Err(e) = poll.register(&fd, Token(0), Ready::readable(), PollOpt::edge()) {
-                error!("tun: {}, backtrace: {}", e, Backtrace::new());
+                error!("tun: {}, backtrace: {:?}", e, Bt::new());
                 return;
             }
             let mut events = Events::with_capacity(1);
@@ -275,14 +276,14 @@ impl UtunDev {
                     Ok(_) => {}
                     Err(NixError::Sys(EWOULDBLOCK)) => {}
                     Err(e) => {
-                        error!("tun: {}, backtrace: {}", e, Backtrace::new());
+                        error!("tun: {}, backtrace: {:?}", e, Bt::new());
                         return;
                     }
                 }
                 match poll.poll(&mut events, None) {
                     Ok(_) => {}
                     Err(e) => {
-                        error!("tun: {}, backtrace: {}", e, Backtrace::new());
+                        error!("tun: {}, backtrace: {:?}", e, Bt::new());
                         return;
                     }
                 }

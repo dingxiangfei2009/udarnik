@@ -8,6 +8,9 @@ use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
 };
 
+use backtrace::Backtrace as Bt;
+use thiserror::Error;
+
 pub mod bridge;
 pub mod client;
 pub mod common;
@@ -20,6 +23,19 @@ pub mod tun;
 pub mod utils;
 
 pub type GenericError = Box<dyn 'static + StdError + Send + Sync>;
+
+pub fn err_msg<M: ToString>(m: M) -> GenericError {
+    #[derive(Error, Debug)]
+    #[error("{message}, backtrace: {backtrace:?}")]
+    struct StrError {
+        message: String,
+        backtrace: Bt,
+    }
+    Box::new(StrError {
+        message: m.to_string(),
+        backtrace: Bt::new(),
+    })
+}
 
 #[derive(Deref, From)]
 pub struct Redact<T>(pub T);

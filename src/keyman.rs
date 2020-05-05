@@ -1,8 +1,9 @@
 use std::convert::TryFrom;
 
-use failure::{Backtrace, Fail};
+use backtrace::Backtrace as Bt;
 use serde::{Deserialize, Serialize};
 use sss::lattice::{Init, Poly, PrivateKey, PublicKey, SigningKey, VerificationKey};
+use thiserror::Error;
 
 #[derive(Serialize, Deserialize)]
 pub struct RawInit(Vec<Vec<u8>>);
@@ -29,10 +30,10 @@ pub struct RawVerificationKey {
     v: Vec<Vec<u8>>,
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[fail(display = "malformed representation")]
-    Malformed(Backtrace),
+    #[error("malformed representation, backtrace: {0:?}")]
+    Malformed(Bt),
 }
 
 impl TryFrom<RawInit> for Init {

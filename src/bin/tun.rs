@@ -1,5 +1,5 @@
+use futures::{executor::block_on, prelude::*};
 use udarnik::tun::linux::UtunDev;
-use futures::{prelude::*, executor::block_on};
 
 fn main() {
     let _guard = slog_envlogger::init();

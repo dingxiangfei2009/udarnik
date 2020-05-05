@@ -10,7 +10,6 @@ use std::{
     path::PathBuf,
 };
 
-use failure::Fail;
 use futures::{
     channel::{mpsc::channel, oneshot::channel as oneshot},
     prelude::*,
@@ -18,6 +17,7 @@ use futures::{
 use log::{error, info};
 use sss::lattice::{keygen, Init, PrivateKey, PublicKey, SigningKey};
 use structopt::StructOpt;
+use thiserror::Error;
 use tokio::runtime::Handle;
 use udarnik::{
     keyman::{Error as KeyError, RawInit, RawPrivateKey},
@@ -37,14 +37,14 @@ struct Config {
     addr: SocketAddr,
 }
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug)]
 enum Error {
-    #[fail(display = "serialization: {}", _0)]
-    Serialization(#[cause] serde_json::Error),
-    #[fail(display = "io: {}", _0)]
-    Io(#[cause] std::io::Error),
-    #[fail(display = "key: {}", _0)]
-    Key(#[cause] KeyError),
+    #[error("serialization: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("key: {0}")]
+    Key(#[from] KeyError),
 }
 
 async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {

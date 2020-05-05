@@ -1,5 +1,7 @@
 use super::*;
 
+use std::error::Error as StdError;
+
 pub async fn key_exchange_anke<R, G, MsgStream, MsgSink, MsgStreamErr>(
     kex: KeyExchange<R>,
     message_stream: MsgStream,
@@ -13,14 +15,14 @@ where
     G::Error: Debug,
     MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
     MsgSink: Sink<Message<G>> + Unpin,
-    MsgStreamErr: 'static + Send + Sync,
-    TopError: From<MsgSink::Error> + From<MsgStreamErr>,
+    MsgStreamErr: 'static + StdError + Send + Sync,
+    MsgSink::Error: 'static + StdError + Send + Sync,
 {
     use bitvec::prelude::*;
     let mut message_stream =
-        message_stream.map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
+        message_stream.map_err(|e| KeyExchangeError::Message(Box::new(e), <_>::default()));
     let mut message_sink =
-        message_sink.sink_map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
+        message_sink.sink_map_err(|e| KeyExchangeError::Message(Box::new(e), <_>::default()));
     let KeyExchange {
         mut retries,
         init_db,
@@ -188,7 +190,7 @@ where
     MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
     MsgSink: Sink<Message<G>> + Unpin,
     MsgStreamErr: 'static + Send + Sync,
-    TopError: From<MsgSink::Error> + From<MsgStreamErr>,
+    GenericError: From<MsgSink::Error> + From<MsgStreamErr>,
 {
     use bitvec::prelude::*;
     let mut message_stream =

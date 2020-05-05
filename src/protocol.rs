@@ -9,14 +9,14 @@ use core::{
 use std::{
     collections::{HashSet, VecDeque},
     sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, RwLock, Weak},
+    sync::{Arc, Weak},
 };
 
 use aead::{Aead, NewAead, Payload};
 use async_std::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use backtrace::Backtrace as Bt;
 use chacha20poly1305::ChaCha20Poly1305;
 use crossbeam::queue::ArrayQueue;
-use failure::{Backtrace, Fail};
 use futures::{channel::mpsc::channel, future::BoxFuture, prelude::*, select};
 use generic_array::GenericArray;
 use lazy_static::lazy_static;
@@ -30,6 +30,7 @@ use sss::{
     fourier::{GF2561DG2_255_FFT, GF2561DG2_UNITY_ROOT},
     reed_solomon::{DecodeError, ReedSolomon},
 };
+use thiserror::Error;
 
 use crate::{
     common::{Verifiable, Verified},
@@ -48,12 +49,12 @@ pub struct RSCodec {
     codec: ReedSolomon<GF2561D>,
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum CodecError {
-    #[fail(display = "invalid codec config")]
+    #[error("invalid codec config")]
     RSCodec,
-    #[fail(display = "reed solomon: {}", _0)]
-    RS(#[cause] DecodeError, Backtrace),
+    #[error("reed solomon: {0}, backtrace: {1:?}")]
+    RS(DecodeError, Bt),
 }
 
 #[derive(Clone, Copy, From)]
@@ -158,7 +159,7 @@ impl RSCodec {
                 let code = self
                     .codec
                     .encode(&input)
-                    .map_err(|e| CodecError::RS(e, Backtrace::new()))?;
+                    .map_err(|e| CodecError::RS(e, Bt::new()))?;
                 let code = code.into_iter().map(|GF2561D(c)| c).collect();
                 Ok(Code::from_vec(code))
             })
@@ -210,7 +211,7 @@ impl RSCodec {
                         }
                     }
                     Err(DecodeError::TooManyError(..)) => Ok(DecodeReport::TooManyError),
-                    Err(e) => Err(CodecError::RS(e, Backtrace::new())),
+                    Err(e) => Err(CodecError::RS(e, Bt::new())),
                 }
             })
             .collect::<Result<_, _>>()?;
@@ -254,28 +255,25 @@ pub struct Quorum {
     data: Option<Vec<PartialCode>>,
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum QuorumError {
-    #[fail(display = "duplicate shard")]
+    #[error("duplicate shard")]
     Duplicate(u8, u8),
-    #[fail(display = "mismatch shard")]
+    #[error("mismatch shard")]
     Mismatch(u8),
-    #[fail(display = "mismatch shard content")]
+    #[error("mismatch shard content")]
     MismatchContent(u8),
-    #[fail(
-        display = "threshold not met: threshold={}, current={}, block={:?}",
-        threshold, current, block
-    )]
+    #[error("threshold not met: threshold={threshold}, current={current}, block={block:?}")]
     Absent {
         threshold: u8,
         current: u8,
         block: Option<usize>,
     },
-    #[fail(display = "malformed input")]
+    #[error("malformed input")]
     Malformed { data: Vec<u8>, errors: Vec<u8> },
-    #[fail(display = "reed solomon: {}", _0)]
-    RS(#[cause] CodecError),
-    #[fail(display = "completely lost")]
+    #[error("reed solomon: {0}")]
+    RS(#[from] CodecError),
+    #[error("completely lost")]
     Lost,
 }
 
@@ -361,11 +359,11 @@ impl Quorum {
     }
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum ShardError {
-    #[fail(display = "mismatching id")]
-    Mismatch(Backtrace),
-    #[fail(display = "decrypt: {}", _0)]
+    #[error("mismatching id")]
+    Mismatch(Bt),
+    #[error("decrypt: {0}")]
     Decrypt(String),
 }
 
@@ -536,7 +534,7 @@ impl Shard {
             RawShard { raw_data },
             RawShardId {
                 id: self.id,
-                serial: serial,
+                serial,
                 stream,
             },
         )
@@ -555,15 +553,15 @@ pub struct ReceiveQueue {
     wait_queue: WakerQueue,
 }
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug)]
 pub enum ReceiveError {
-    #[fail(display = "quorum: {}", _0)]
-    Quorum(#[cause] QuorumError),
-    #[fail(display = "queue is full, size={}", _0)]
+    #[error("quorum: {0}")]
+    Quorum(#[from] QuorumError),
+    #[error("queue is full, size={0}")]
     Full(usize),
-    #[fail(display = "shard recovery: {}", _0)]
-    Shard(#[cause] ShardError),
-    #[fail(display = "out of bounds, size={}", _0)]
+    #[error("shard recovery: {0}")]
+    Shard(#[from] ShardError),
+    #[error("out of bounds, size={0}")]
     OutOfBound(u64, usize),
 }
 
@@ -583,8 +581,13 @@ impl ReceiveQueue {
         shard_state: &ShardState,
     ) -> Result<(u8, u8), ReceiveError> {
         let serial = raw_shard_id.serial;
-        let shard_id = (raw_shard_id, shard_state).verify_proof(())?;
-        let shard = raw_shard.clone().verify_proof(shard_id.into_inner())?;
+        let shard_id = (raw_shard_id, shard_state)
+            .verify_proof(())
+            .map_err(ReceiveError::Shard)?;
+        let shard = raw_shard
+            .clone()
+            .verify_proof(shard_id.into_inner())
+            .map_err(ReceiveError::Shard)?;
 
         let window = self.window.unwrap_or(256) as usize;
         let state = self.state.read().await;
@@ -602,8 +605,13 @@ impl ReceiveQueue {
                 }
             }
             let state = self.state.read().await;
-            let mut q = state.queue[idx].lock().await;
-            let result = { q.insert(serial, shard)? };
+            let result = {
+                state.queue[idx]
+                    .lock()
+                    .await
+                    .insert(serial, shard)
+                    .map_err(ReceiveError::Quorum)?
+            };
             self.wait_queue.try_notify_next();
             if idx > window {
                 Err(ReceiveError::Full(state.queue.len()))
@@ -700,27 +708,27 @@ impl<'a> Future for ReceiveQueuePoll<'a> {
     }
 }
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug)]
 pub enum SendError {
-    #[fail(display = "codec: {}", _0)]
-    Codec(CodecError, Backtrace),
-    #[fail(display = "remote lost")]
-    RemoteLost(Backtrace),
-    #[fail(display = "remote: {}", _0)]
-    Remote(RemoteRecvError),
-    #[fail(display = "broken pipe")]
+    #[error("codec: {0}")]
+    Codec(#[from] CodecError),
+    #[error("remote lost, backtrace: {0:?}")]
+    RemoteLost(Bt),
+    #[error("remote: {0}")]
+    Remote(#[from] RemoteRecvError),
+    #[error("broken pipe")]
     BrokenPipe,
-    #[fail(display = "exhausted")]
+    #[error("exhausted")]
     Exhausted,
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum RemoteRecvError {
-    #[fail(display = "receive complete code")]
+    #[error("receive complete code")]
     Complete,
-    #[fail(display = "receive malformed code")]
+    #[error("receive malformed code")]
     Malformed,
-    #[fail(display = "decode failure")]
+    #[error("decode failure")]
     Decode,
 }
 
@@ -818,11 +826,7 @@ impl SendQueue {
     where
         Timeout: Future,
     {
-        let shards = Shard::from_codes(
-            codec
-                .encode(data.as_ref())
-                .map_err(|e| SendError::Codec(e, <_>::default()))?,
-        );
+        let shards = Shard::from_codes(codec.encode(data.as_ref()).map_err(SendError::Codec)?);
         let serial = self.serial.fetch_add(1, Ordering::Relaxed);
         let mut shards: Vec<_> = shards
             .iter()

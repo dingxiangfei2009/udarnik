@@ -16,60 +16,55 @@ where
         bridges_out_rx
             .map(Ok::<_, String>)
             .try_for_each({
-                move |outbound| {
-                    async move {
-                        let mut rng = StdRng::from_entropy();
-                        let (bridge_id, mut tx) = {
-                            trace!("{:?}: bridges_out: find usable bridge", self.role);
-                            let bridge_polls = BridgeExists {
-                                session: self.as_ref().get_ref(),
-                                bridge_polls: None,
-                                key: None,
-                            }
-                            .await;
-                            if let Some((bridge_id, (bridge, _))) =
-                                bridge_polls.iter().choose(&mut rng)
-                            {
-                                debug!(
-                                    "{:?}: bridges_out: choose bridge {:?}",
-                                    self.role, bridge_id
-                                );
-                                (bridge_id.clone(), ClonableSink::clone_pin_box(&**bridge))
-                            } else {
-                                trace!(
-                                    "{:?}: no usable bridge, but this might not correct",
-                                    self.role
-                                );
-                                return Ok(());
-                            }
-                        };
-                        match tx.send(outbound).await {
-                            Err(e) => error!("{:?}: bridges_out: {}", self.role, e),
-                            _ => debug!("{:?}: bridges_out: sent to {:?}", self.role, bridge_id),
+                move |outbound| async move {
+                    let mut rng = StdRng::from_entropy();
+                    let (bridge_id, mut tx) = {
+                        trace!("{:?}: bridges_out: find usable bridge", self.role);
+                        let bridge_polls = BridgeExists {
+                            session: self.as_ref().get_ref(),
+                            bridge_polls: None,
+                            key: None,
                         }
-                        if let Some(counter) =
-                            self.send_counter.counters.read().await.get(&bridge_id)
+                        .await;
+                        if let Some((bridge_id, (bridge, _))) = bridge_polls.iter().choose(&mut rng)
                         {
-                            counter.fetch_add(1, Ordering::Relaxed);
                             debug!(
-                                "{:?}: bridges_out: {:?} send counter updated",
+                                "{:?}: bridges_out: choose bridge {:?}",
                                 self.role, bridge_id
+                            );
+                            (bridge_id.clone(), ClonableSink::clone_pin_box(&**bridge))
+                        } else {
+                            trace!(
+                                "{:?}: no usable bridge, but this might not correct",
+                                self.role
                             );
                             return Ok(());
                         }
-                        self.send_counter
-                            .counters
-                            .write()
-                            .await
-                            .entry(bridge_id.clone())
-                            .or_default()
-                            .fetch_add(1, Ordering::Relaxed);
+                    };
+                    match tx.send(outbound).await {
+                        Err(e) => error!("{:?}: bridges_out: {}", self.role, e),
+                        _ => debug!("{:?}: bridges_out: sent to {:?}", self.role, bridge_id),
+                    }
+                    if let Some(counter) = self.send_counter.counters.read().await.get(&bridge_id) {
+                        counter.fetch_add(1, Ordering::Relaxed);
                         debug!(
-                            "{:?}: bridges_out: {:?} send counter initialized",
+                            "{:?}: bridges_out: {:?} send counter updated",
                             self.role, bridge_id
                         );
-                        Ok(())
+                        return Ok(());
                     }
+                    self.send_counter
+                        .counters
+                        .write()
+                        .await
+                        .entry(bridge_id.clone())
+                        .or_default()
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "{:?}: bridges_out: {:?} send counter initialized",
+                        self.role, bridge_id
+                    );
+                    Ok(())
                 }
             })
             .await

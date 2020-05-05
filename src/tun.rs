@@ -1,5 +1,6 @@
+use backtrace::Backtrace as Bt;
 use cfg_if::cfg_if;
-use failure::{Backtrace, Fail};
+use thiserror::Error;
 
 cfg_if! {
     if #[cfg(target_os = "linux")] {
@@ -9,10 +10,10 @@ cfg_if! {
 
 pub struct TunDevice {}
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[fail(display = "os: {}", _0)]
-    Os(String, Backtrace),
+    #[error("os: {0}, backtrace: {1:?}")]
+    Os(String, Bt),
 }
 
 impl TunDevice {

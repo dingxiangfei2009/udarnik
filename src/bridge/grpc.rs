@@ -16,8 +16,8 @@ use async_std::{
     task::sleep,
 };
 use async_trait::async_trait;
+use backtrace::Backtrace as Bt;
 use chacha20poly1305::ChaCha20Poly1305;
-use failure::{Backtrace, Fail};
 use futures::{
     channel::mpsc::{channel as std_channel, Sender as StdSender},
     prelude::*,
@@ -25,8 +25,9 @@ use futures::{
 };
 use generic_array::GenericArray;
 use http::Uri;
-use log::{error, info, trace};
+use log::{error, trace};
 use rand::{rngs::OsRng, RngCore};
+use thiserror::Error;
 use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
 use tonic::transport::{server::Connected, Channel, Endpoint, Server};
 use tonic::{Request, Response, Status, Streaming};
@@ -42,10 +43,10 @@ use crate::{
     GenericError,
 };
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug, From)]
 pub enum BridgeServerError {
-    #[fail(display = "broken pipe")]
-    Pipe(Backtrace),
+    #[error("broken pipe, backtrace: {0:?}")]
+    Pipe(Bt),
 }
 
 #[derive(Clone)]
@@ -142,14 +143,16 @@ impl<S: Spawn> BridgeServer<S> {
                             variant: Some(wire::raw_bridge_message::Variant::Raw(m)),
                         } => {
                             trace!("bridge: incoming data");
-                            let m = aead
-                                .decrypt(GenericArray::from_slice(&nonce), &m[..])
-                                .map_err(|e| {
+                            match aead.decrypt(GenericArray::from_slice(&nonce), &m[..]) {
+                                Ok(m) => {
+                                    send.send(m).await;
+                                    Ok(progress.send(()).await)
+                                }
+                                Err(e) => {
                                     error!("decrypt: {:?}", e);
-                                    Status::aborted("malformed data")
-                                })?;
-                            send.send(m).await;
-                            Ok(progress.send(()).await)
+                                    Ok(())
+                                }
+                            }
                         }
                         _ => Err(Status::aborted("malformed data")),
                     }
@@ -291,11 +294,9 @@ where
     let service = Server::builder()
         .add_service(service)
         .serve_with_incoming(incoming.map_ok(TcpStreamCompat))
-        .then(|r| {
-            async move {
-                if let Err(e) = r {
-                    error!("unix bridge: {}", e)
-                }
+        .then(|r| async move {
+            if let Err(e) = r {
+                error!("unix bridge: {}", e)
             }
         });
     let service = spawn
@@ -377,11 +378,9 @@ where
     let service = Server::builder()
         .add_service(service)
         .serve_with_incoming(incoming.map_ok(UnixStreamCompat))
-        .then(|r| {
-            async move {
-                if let Err(e) = r {
-                    error!("unix bridge: {}", e)
-                }
+        .then(|r| async move {
+            if let Err(e) = r {
+                error!("unix bridge: {}", e)
             }
         });
     let service = spawn
@@ -487,30 +486,24 @@ impl TokioAsyncWrite for TcpStreamCompat {
 
 pub struct GrpcBridge;
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[fail(display = "transport: {}", _0)]
-    Transport(#[cause] tonic::transport::Error),
-    #[fail(display = "uri: {}", _0)]
-    Uri(#[cause] http::Error),
-    #[fail(display = "net: {}", _0)]
-    Net(Status, Backtrace),
-    #[fail(display = "codec: {}", _0)]
-    Codec(GenericError, Backtrace),
-    #[fail(display = "broken pipe: {}", _0)]
-    Pipe(Backtrace),
-    #[fail(display = "malformed: {}", _0)]
-    Malformed(Backtrace),
-    #[fail(display = "crypto: {:?}", _0)]
-    Crypto(aead::Error, Backtrace),
-    #[fail(display = "io: {}", _0)]
+    #[error("transport: {0}")]
+    Transport(#[from] tonic::transport::Error),
+    #[error("uri: {0}")]
+    Uri(#[from] http::Error),
+    #[error("net: {0}, backtrace: {1:?}")]
+    Net(Status, Bt),
+    #[error("codec: {0}, backtrace: {1:?}")]
+    Codec(GenericError, Bt),
+    #[error("broken pipe: {0:?}")]
+    Pipe(Bt),
+    #[error("malformed, backtrace: {0:?}")]
+    Malformed(Bt),
+    #[error("crypto: {0:?}, backtrace: {1:?}")]
+    Crypto(aead::Error, Bt),
+    #[error("io: {0}")]
     Io(std::io::Error),
-}
-
-impl From<Error> for GenericError {
-    fn from(e: Error) -> Self {
-        Box::new(e.compat())
-    }
 }
 
 async fn grpc_bridge_client<G, S>(
@@ -576,14 +569,12 @@ where
                 })
                 .unwrap_or_else(|e| error!("bridge: {}", e)),
         )
-        .then(|r| {
-            async move {
-                match r {
-                    Err(e) => {
-                        error!("bridge: {:?}", e);
-                    }
-                    Ok(_) => (),
+        .then(|r| async move {
+            match r {
+                Err(e) => {
+                    error!("bridge: {:?}", e);
                 }
+                Ok(_) => (),
             }
         });
     let poll = Box::new(Box::pin(poll));
@@ -608,7 +599,7 @@ where
                     }
                 }
             })
-            .map_err(|e| Box::new(e.compat()) as GenericError),
+            .map_err(|e| Box::new(e) as GenericError),
     ));
     Ok(Bridge { tx, rx, poll })
 }
@@ -686,7 +677,7 @@ impl UnixBridge {
             async move {
                 UnixStream::connect(addr)
                     .await
-                    .map_err(Error::Io)
+                    .map_err(|e| Box::new(Error::Io(e)) as GenericError)
                     .map(UnixStreamCompat)
             }
         });

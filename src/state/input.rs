@@ -16,33 +16,31 @@ where
         input
             .map(Ok)
             .try_for_each({
-                |input| {
-                    async move {
-                        let mut input_tx = {
-                            let stream_polls = StreamExists {
-                                session: self.as_ref().get_ref(),
-                                stream_polls: None,
-                                key: None,
-                            }
-                            .await;
-                            if let Some((_, (session_stream, _))) =
-                                stream_polls.iter().choose(&mut StdRng::from_entropy())
-                            {
-                                session_stream.input_tx.clone()
-                            } else {
-                                trace!(
-                                    "{:?}: no usable stream, but this might not correct",
-                                    self.role
-                                );
-                                return Ok(());
-                            }
-                        };
-                        input_tx
-                            .send(input)
-                            .await
-                            .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?;
-                        Ok::<_, SessionError>(())
-                    }
+                |input| async move {
+                    let mut input_tx = {
+                        let stream_polls = StreamExists {
+                            session: self.as_ref().get_ref(),
+                            stream_polls: None,
+                            key: None,
+                        }
+                        .await;
+                        if let Some((_, (session_stream, _))) =
+                            stream_polls.iter().choose(&mut StdRng::from_entropy())
+                        {
+                            session_stream.input_tx.clone()
+                        } else {
+                            trace!(
+                                "{:?}: no usable stream, but this might not correct",
+                                self.role
+                            );
+                            return Ok(());
+                        }
+                    };
+                    input_tx
+                        .send(input)
+                        .await
+                        .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?;
+                    Ok::<_, SessionError>(())
                 }
             })
             .await

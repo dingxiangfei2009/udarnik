@@ -4,9 +4,13 @@ use std::{
     path::PathBuf,
 };
 
+use backtrace::Backtrace as Bt;
 use cfg_if::cfg_if;
-use failure::{Backtrace, Fail};
-use sss::lattice::{Int, Poly, Reconciliator, SessionKeyPart, Signature};
+use sss::{
+    adapter::Int,
+    lattice::{Poly, Reconciliator, SessionKeyPart, Signature},
+};
+use thiserror::Error;
 
 use super::{
     wire, BridgeAsk, BridgeId, BridgeMessage, BridgeNegotiationMessage, BridgeRetract, BridgeType,
@@ -211,23 +215,23 @@ impl From<PayloadFeedback> for wire::payload_feedback_inner::Variant {
     }
 }
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug)]
 pub enum WireError {
-    #[fail(display = "missing field {}", _0)]
-    Missing(String, Backtrace),
-    #[fail(display = "malformed messae")]
-    Malformed(Backtrace),
-    #[fail(display = "invalid integer: {}", _0)]
-    Int(#[cause] std::num::TryFromIntError),
-    #[fail(display = "invalid socket address: {}", _0)]
-    SocketAddr(#[cause] std::net::AddrParseError),
+    #[error("missing field {0}, backtrace: {1:?}")]
+    Missing(String, Bt),
+    #[error("malformed messae, {0:?}")]
+    Malformed(Bt),
+    #[error("invalid integer: {0}")]
+    Int(#[from] std::num::TryFromIntError),
+    #[error("invalid socket address: {0}")]
+    SocketAddr(#[from] std::net::AddrParseError),
 }
 
-impl From<WireError> for GenericError {
-    fn from(e: WireError) -> GenericError {
-        Box::new(e.compat())
-    }
-}
+// impl From<WireError> for GenericError {
+//     fn from(e: WireError) -> GenericError {
+//         Box::new(e.compat())
+//     }
+// }
 
 impl<G> TryFrom<wire::Message> for Message<G> {
     type Error = WireError;
@@ -271,7 +275,7 @@ impl TryFrom<wire::SessionLogOn> for SessionLogOn {
                 init_identity: init_identity.into(),
                 identity: identity.into(),
                 session: session.into(),
-                challenge: challenge,
+                challenge,
                 signature: signature.try_into()?,
             }),
             _ => return Err(WireError::Malformed(<_>::default())),

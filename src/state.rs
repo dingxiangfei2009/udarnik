@@ -10,6 +10,7 @@ use core::{
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    error::Error as StdError,
     net::SocketAddr,
     path::PathBuf,
     time::Instant,
@@ -17,8 +18,8 @@ use std::{
 
 use aead::{Aead, NewAead, Payload};
 use async_std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use backtrace::Backtrace as Bt;
 use chacha20poly1305::ChaCha20Poly1305;
-use failure::{err_msg, Backtrace, Error as TopError, Fail};
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
     future::{BoxFuture, Fuse},
@@ -39,9 +40,11 @@ use sss::lattice::{
     Reconciliator, SessionKeyPart, SessionKeyPartMix, SessionKeyPartMixParallelSampler,
     SessionKeyPartParallelSampler, Signature,
 };
+use thiserror::Error;
 
 use crate::{
     bridge::{grpc, BridgeHalf, ConstructibleBridge},
+    err_msg,
     protocol::{
         CodecError, QuorumError, RSCodec, RawShard, RawShardId, ReceiveError, ReceiveQueue,
         RemoteRecvError, SendError, SendQueue, ShardState, TaskProgressNotifier,
@@ -258,23 +261,23 @@ pub enum KeyExchangeMessage {
     BorisPart(Redact<SessionKeyPart>, Redact<Reconciliator>),
 }
 
-#[derive(Fail, Debug, From)]
+#[derive(Error, Debug)]
 pub enum KeyExchangeError {
-    #[fail(display = "unknown message received, {}", _0)]
-    UnknownMessage(Backtrace),
-    #[fail(display = "message decoding: {}", _0)]
-    Message(#[cause] TopError, Backtrace),
-    #[fail(display = "sending message: {}", _0)]
-    MessageSink(#[cause] TopError, Backtrace),
-    #[fail(display = "message receiving terminated: {}", _0)]
-    Terminated(Backtrace),
-    #[fail(display = "all authentication attempts failed")]
+    #[error("unknown message received, {0:?}")]
+    UnknownMessage(Bt),
+    #[error("message decoding: {0}, backtrace: {1:?}")]
+    Message(GenericError, Bt),
+    #[error("sending message: {0}, backtrace: {1:?}")]
+    MessageSink(GenericError, Bt),
+    #[error("message receiving terminated: {0:?}")]
+    Terminated(Bt),
+    #[error("all authentication attempts failed")]
     Authentication,
-    #[fail(display = "unknown init parameter")]
-    UnknownInit(Backtrace),
-    #[fail(display = "client key exchange need to supply channel parameters")]
+    #[error("unknown init parameter")]
+    UnknownInit(Bt),
+    #[error("client key exchange need to supply channel parameters")]
     NoParams,
-    #[fail(display = "session: {}", _0)]
+    #[error("session: {0}")]
     Session(GenericError),
 }
 
@@ -624,7 +627,7 @@ where
         trace!("{:?}: notify peer the serial", self.role);
         let tag = (self.session_id.clone(), serial);
         let message = Message::Client(ClientMessage {
-            serial: serial,
+            serial,
             session: self.session_id.clone(),
             variant: Redact(Pomerium::encode_with_tag(
                 &*self.outbound_guard,
@@ -848,20 +851,20 @@ where
     }
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum SessionError {
-    #[fail(display = "unknown bridge type")]
+    #[error("unknown bridge type")]
     UnknownBridgeType,
-    #[fail(display = "broken pipe: {}", _0)]
-    BrokenPipe(GenericError, Backtrace),
-    #[fail(display = "codec: {}", _0)]
-    Codec(#[cause] CodecError),
-    #[fail(display = "token: {:?}", _0)]
+    #[error("broken pipe: {0}, backtrace: {1:?}")]
+    BrokenPipe(GenericError, Bt),
+    #[error("codec: {0}")]
+    Codec(#[from] CodecError),
+    #[error("token: {0}")]
     SignOn(String),
-    #[fail(display = "stream: {}", _0)]
-    Stream(GenericError, Backtrace),
-    #[fail(display = "bridge: {}", _0)]
-    Bridge(GenericError, Backtrace),
+    #[error("stream: {0}, backtrace: {1:?}")]
+    Stream(GenericError, Bt),
+    #[error("bridge: {0}, backtrace: {1:?}")]
+    Bridge(GenericError, Bt),
 }
 
 #[derive(Default, Clone)]
@@ -903,11 +906,11 @@ where
             BridgeType::Grpc(params) => grpc::GrpcBridge
                 .build(id, params, half, spawn)
                 .await
-                .map_err(|e| SessionError::Bridge(Box::new(e.compat()), <_>::default())),
+                .map_err(|e| SessionError::Bridge(Box::new(e), <_>::default())),
             BridgeType::Unix(params) => grpc::UnixBridge
                 .build(id, params, half, spawn)
                 .await
-                .map_err(|e| SessionError::Bridge(Box::new(e.compat()), <_>::default())),
+                .map_err(|e| SessionError::Bridge(Box::new(e), <_>::default())),
             _ => Err(SessionError::UnknownBridgeType),
         }
     }
@@ -1039,8 +1042,7 @@ impl<P, T> Guard<P, T> for SafeGuard
 where
     P: ProstMessageMapping<Tag = T>,
     T: Tag,
-    <P::MapTo as TryInto<P>>::Error: 'static + Send + Sync,
-    GenericError: From<<P::MapTo as TryInto<P>>::Error>,
+    <P::MapTo as TryInto<P>>::Error: 'static + StdError + Send + Sync,
 {
     type Error = GenericError;
     fn encode(&self, payload: P) -> Vec<u8> {
@@ -1076,7 +1078,7 @@ where
     }
     fn decode(&self, data: &[u8]) -> Result<P, Self::Error> {
         if data.len() < 12 {
-            return Err(Box::new(err_msg("truncated data").compat()));
+            return Err(err_msg("truncated data"));
         }
         let mut nonce = [0u8; 12];
         nonce[..].copy_from_slice(&data[..12]);
@@ -1085,15 +1087,15 @@ where
             .aead
             .decrypt(GenericArray::from_slice(&nonce), data)
             .map_err(|e| {
-                trace!("decode error: {}", Backtrace::new());
-                Box::new(err_msg(format!("decode: {:?}", e)).compat())
+                trace!("decode error: {:?}", Bt::new());
+                err_msg(format!("decode: {:?}", e))
             })?;
         let payload: <P as ProstMessageMapping>::MapTo = Self::decode_message(buf)?;
         Ok(payload.try_into()?)
     }
     fn decode_with_tag(&self, data: &[u8], tag: &T) -> Result<P, Self::Error> {
         if data.len() < 12 {
-            return Err(Box::new(err_msg("truncated data").compat()));
+            return Err(err_msg("truncated data") as GenericError);
         }
         let mut nonce = [0u8; 12];
         nonce[..].copy_from_slice(&data[..12]);
@@ -1109,8 +1111,8 @@ where
                 },
             )
             .map_err(|e| {
-                trace!("decode_with_tag error: {}", Backtrace::new());
-                Box::new(err_msg(format!("decode: {:?}", e)).compat())
+                trace!("decode_with_tag error: {:?}", Bt::new());
+                err_msg(format!("decode: {:?}", e))
             })?;
         let payload: <P as ProstMessageMapping>::MapTo = Self::decode_message(buf)?;
         Ok(payload.try_into()?)

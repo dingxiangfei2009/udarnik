@@ -40,25 +40,23 @@ where
         let (feedback_tx, feedback_rx) = channel(4096);
         let poll_bridges_in = bridges_in_rx.map(Ok::<_, GenericError>).try_fold(
             (payload_tx, feedback_tx),
-            move |(mut payload_tx, mut feedback_tx), message| {
-                async move {
-                    match message {
-                        BridgeMessage::Payload {
-                            raw_shard,
-                            raw_shard_id,
-                        } => {
-                            payload_tx.send((raw_shard, raw_shard_id)).await?;
-                        }
-                        BridgeMessage::PayloadFeedback {
-                            feedback,
-                            stream: stream_,
-                        } if stream == stream_ => {
-                            feedback_tx.send(feedback).await?;
-                        }
-                        _ => error!("poll_bridges_in: unknown message"),
+            move |(mut payload_tx, mut feedback_tx), message| async move {
+                match message {
+                    BridgeMessage::Payload {
+                        raw_shard,
+                        raw_shard_id,
+                    } => {
+                        payload_tx.send((raw_shard, raw_shard_id)).await?;
                     }
-                    Ok((payload_tx, feedback_tx))
+                    BridgeMessage::PayloadFeedback {
+                        feedback,
+                        stream: stream_,
+                    } if stream == stream_ => {
+                        feedback_tx.send(feedback).await?;
+                    }
+                    _ => error!("poll_bridges_in: unknown message"),
                 }
+                Ok((payload_tx, feedback_tx))
             },
         );
         let poll_bridges_in = spawn.spawn(poll_bridges_in);
@@ -212,14 +210,12 @@ where
 
         let poll_send_pending = unfold(
             (Arc::clone(&send_queue), terminate.clone().fuse()),
-            move |(send_queue, mut terminate)| {
-                async move {
-                    loop {
-                        select! {
-                            send = send_queue.pop().fuse() =>
-                                break Some((send, (send_queue, terminate))),
-                            _ = terminate => break None,
-                        }
+            move |(send_queue, mut terminate)| async move {
+                loop {
+                    select! {
+                        send = send_queue.pop().fuse() =>
+                            break Some((send, (send_queue, terminate))),
+                        _ = terminate => break None,
                     }
                 }
             },
@@ -259,32 +255,30 @@ where
                     terminate.clone().fuse(),
                     self.role,
                 ),
-                |(receive_queue, codec, timeout_generator, mut progress, mut terminate, role)| {
-                    async move {
-                        let recv = select! {
-                            recv = receive_queue.poll(&codec).fuse() => recv,
-                            _ = terminate => {
-                                error!("{:?}: poll_recv: terminated", role);
-                                return None
-                            },
-                        };
-                        trace!("{:?}: poll_recv: incoming data", role);
-                        if let Err(_) = progress.send(()).await {
-                            info!("{:?}: poll_recv: progress is gone", role);
-                            None
-                        } else {
-                            Some((
-                                Ok(recv),
-                                (
-                                    receive_queue,
-                                    codec,
-                                    timeout_generator,
-                                    progress,
-                                    terminate,
-                                    role,
-                                ),
-                            ))
-                        }
+                |(receive_queue, codec, timeout_generator, mut progress, mut terminate, role)| async move {
+                    let recv = select! {
+                        recv = receive_queue.poll(&codec).fuse() => recv,
+                        _ = terminate => {
+                            error!("{:?}: poll_recv: terminated", role);
+                            return None
+                        },
+                    };
+                    trace!("{:?}: poll_recv: incoming data", role);
+                    if let Err(_) = progress.send(()).await {
+                        info!("{:?}: poll_recv: progress is gone", role);
+                        None
+                    } else {
+                        Some((
+                            Ok(recv),
+                            (
+                                receive_queue,
+                                codec,
+                                timeout_generator,
+                                progress,
+                                terminate,
+                                role,
+                            ),
+                        ))
                     }
                 },
             )
@@ -472,7 +466,7 @@ where
                             }
                             Err(SendError::BrokenPipe) => {
                                 return Err(SessionError::BrokenPipe(
-                                    Box::new(SendError::BrokenPipe.compat()),
+                                    Box::new(SendError::BrokenPipe),
                                     <_>::default(),
                                 ))
                             }
