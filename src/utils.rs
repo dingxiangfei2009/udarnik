@@ -1,12 +1,8 @@
 use core::fmt;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::{collections::VecDeque, sync::Mutex};
 
-use async_std::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use dyn_clone::{clone_box, DynClone};
 use futures::{
     future::{Either, FusedFuture},
@@ -35,7 +31,7 @@ impl<St: Stream> Peekable<St> {
     unsafe_unpinned!(peeked: Option<St::Item>);
 
     pub fn new(stream: St) -> Peekable<St> {
-        Peekable {
+        Self {
             stream: stream.fuse(),
             peeked: None,
         }

@@ -25,7 +25,7 @@ use futures::{
     future::{BoxFuture, Fuse},
     join,
     prelude::*,
-    select,
+    select, select_biased,
     stream::{iter, unfold, FuturesUnordered},
 };
 use generic_array::GenericArray;
@@ -34,11 +34,15 @@ use lru::LruCache;
 use prost::Message as ProstMessage;
 use rand::{rngs::StdRng, seq::IteratorRandom, CryptoRng, RngCore, SeedableRng};
 use sha3::Digest;
-use sss::lattice::{
-    Anke, AnkeIdentity, AnkePublic, AnkeSessionKeyPart, AnkeSessionKeyPartR, Boris, BorisIdentity,
-    BorisPublic, BorisSessionKeyPart, BorisSessionKeyPartR, Init, PrivateKey, PublicKey,
-    Reconciliator, SessionKeyPart, SessionKeyPartMix, SessionKeyPartMixParallelSampler,
-    SessionKeyPartParallelSampler, Signature,
+use sss::{
+    artin::GF65536NPreparedMultipointEvalVZG,
+    lattice::{
+        Anke, AnkeIdentity, AnkePublic, AnkeSessionKeyPart, AnkeSessionKeyPartR, Boris,
+        BorisIdentity, BorisPublic, BorisSessionKeyPart, BorisSessionKeyPartR, Init, PrivateKey,
+        PublicKey, Reconciliator, SessionKeyPart, SessionKeyPartMix,
+        SessionKeyPartMixParallelSampler, SessionKeyPartParallelSampler,
+    },
+    mceliece::{McElieceCiphertext, McElieceKEM65536PrivateKey, McElieceKEM65536PublicKey},
 };
 use thiserror::Error;
 
@@ -50,7 +54,7 @@ use crate::{
         RemoteRecvError, SendError, SendQueue, ShardState, TaskProgressNotifier,
     },
     utils::{ClonableSendableFuture, ClonableSink, Spawn, WakerQueue},
-    GenericError, Redact,
+    GenericError,
 };
 
 pub mod wire {
@@ -90,9 +94,19 @@ pub struct Identity(String);
 impl From<&'_ PublicKey> for Identity {
     fn from(PublicKey(key): &'_ PublicKey) -> Self {
         let mut digest = sha3::Sha3_512::new();
+        digest.input("rlwe:");
         for bytes in key.into_coeff_bytes() {
             digest.input(bytes);
         }
+        Self(format!("{:x}", digest.result()))
+    }
+}
+
+impl From<&'_ McElieceKEM65536PublicKey> for Identity {
+    fn from(key: &'_ McElieceKEM65536PublicKey) -> Self {
+        let mut digest = sha3::Sha3_512::new();
+        digest.input("mceliece_kem_65536:");
+        digest.input(serde_json::to_string(key).unwrap());
         Self(format!("{:x}", digest.result()))
     }
 }
@@ -188,53 +202,60 @@ pub struct UnixBridge {
 #[derive(Clone, Debug, From)]
 pub struct BridgeRetract(BridgeId);
 
-#[derive(Debug)]
 pub enum Message<G> {
     KeyExchange(KeyExchangeMessage),
-    Params(Redact<Pomerium<G, Params, ()>>),
+    Params(Pomerium<G, Params, ()>),
     Client(ClientMessage<G>),
     Session(SessionId),
     SessionLogOnChallenge(Vec<u8>),
     SessionLogOn(SessionLogOn),
 }
 
+impl<G> Debug for Message<G> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match self {
+            Message::KeyExchange(m) => f.debug_tuple("Message::KeyExchange").field(m).finish(),
+            Message::Params(_) => f.debug_tuple("Message::Params").finish(),
+            Message::Client(m) => f.debug_tuple("Message::Client").field(m).finish(),
+            Message::Session(sid) => f.debug_tuple("Message::Session").field(sid).finish(),
+            Message::SessionLogOnChallenge(challenge) => {
+                f.debug_tuple("Message::Session").field(challenge).finish()
+            }
+            Message::SessionLogOn(logon) => f.debug_tuple("Message::Session").field(logon).finish(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionLogOn {
-    pub init_identity: InitIdentity,
-    pub identity: Identity,
     pub session: SessionId,
     pub challenge: Vec<u8>,
-    pub signature: Signature,
 }
 
 impl SessionLogOn {
-    pub fn generate_body(
-        init_identity: &InitIdentity,
-        identity: &Identity,
-        session: &SessionId,
-        challenge: &[u8],
-    ) -> Vec<u8> {
+    pub fn generate_body(session: &SessionId, challenge: &[u8]) -> Vec<u8> {
         let mut body = challenge.to_vec();
         body.extend(session.as_bytes());
-        body.extend(init_identity.as_bytes());
-        body.extend(identity.as_bytes());
         body
     }
     pub fn recover_body(&self) -> Vec<u8> {
-        Self::generate_body(
-            &self.init_identity,
-            &self.identity,
-            &self.session,
-            &self.challenge,
-        )
+        Self::generate_body(&self.session, &self.challenge)
     }
 }
 
-#[derive(Debug)]
 pub struct ClientMessage<G> {
-    variant: Redact<Pomerium<G, ClientMessageVariant, (SessionId, u64)>>,
+    variant: Pomerium<G, ClientMessageVariant, (SessionId, u64)>,
     serial: u64,
     session: SessionId,
+}
+
+impl<G> Debug for ClientMessage<G> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        f.debug_struct("ClientMessage")
+            .field("serial", &self.serial)
+            .field("session", &self.session)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -254,11 +275,225 @@ pub struct Params {
 
 #[derive(Debug)]
 pub enum KeyExchangeMessage {
-    Offer(Identity, InitIdentity),
-    Accept(Identity, InitIdentity),
-    Reject(Identity, InitIdentity),
-    AnkePart(Redact<SessionKeyPart>),
-    BorisPart(Redact<SessionKeyPart>, Redact<Reconciliator>),
+    RLWE(RLWEKeyExchange),
+    McEliece(McElieceKeyExchange),
+}
+
+pub enum RLWEKeyExchange {
+    AnkePart {
+        part: SessionKeyPart,
+        anke_identity: String,
+        boris_identity: String,
+        init_identity: String,
+    },
+    BorisPart {
+        part: SessionKeyPart,
+        reconciliator: Reconciliator,
+    },
+}
+
+impl Debug for RLWEKeyExchange {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match self {
+            RLWEKeyExchange::AnkePart {
+                anke_identity,
+                boris_identity,
+                init_identity,
+                ..
+            } => f
+                .debug_struct("RLWEKeyExchange::AnkePart")
+                .field("anke_identity", anke_identity)
+                .field("boris_identity", boris_identity)
+                .field("init_identity", init_identity)
+                .finish(),
+            RLWEKeyExchange::BorisPart { .. } => {
+                f.debug_struct("RLWEKeyExchange::BorisPart").finish()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum KeyExchangeAnkeIdentity<R, H> {
+    RLWE(RLWEAnkeIdentity<R>),
+    McEliece(McElieceAnkeIdentity<H>),
+}
+
+#[derive(Debug)]
+pub struct KeyExchangeBorisIdentity<R, H> {
+    pub rlwe: RLWEBorisIdentity<R>,
+    pub mc: McElieceBorisIdentity<H>,
+}
+
+pub struct RLWEAnkeIdentity<R> {
+    init_identity: InitIdentity,
+    init: Init,
+    anke_identity: Identity,
+    boris_identity: Identity,
+    anke_pri: PrivateKey,
+    boris_pub: PublicKey,
+    anke_pub: PublicKey,
+    anke_data: Vec<u8>,
+    boris_data: Vec<u8>,
+    session_key_part_sampler: SessionKeyPartParallelSampler<R>,
+    anke_session_key_part_mix_sampler: SessionKeyPartMixParallelSampler<R, Anke>,
+}
+
+impl<R> RLWEAnkeIdentity<R>
+where
+    R: 'static + RngCore + CryptoRng + SeedableRng + Send,
+{
+    pub fn new(
+        init_identity: InitIdentity,
+        init: Init,
+        anke_identity: Identity,
+        boris_identity: Identity,
+        anke_pri: PrivateKey,
+        anke_pub: PublicKey,
+        boris_pub: PublicKey,
+        anke_data: Vec<u8>,
+        boris_data: Vec<u8>,
+    ) -> Self {
+        Self {
+            init_identity,
+            init,
+            anke_identity,
+            boris_identity,
+            anke_pri,
+            boris_pub,
+            anke_pub,
+            anke_data,
+            boris_data,
+            session_key_part_sampler: SessionKeyPart::parallel_sampler::<R>(2, 4096),
+            anke_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
+        }
+    }
+}
+
+impl<R> Debug for RLWEAnkeIdentity<R> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        f.debug_struct("RLWEAnkeIdentity")
+            .field("anke_identity", &self.anke_identity)
+            .field("boris_identity", &self.boris_identity)
+            .field("init_identity", &self.init_identity)
+            .finish()
+    }
+}
+
+pub struct RLWEBorisIdentity<R> {
+    init_db: BTreeMap<InitIdentity, Init>,
+    identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
+    allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
+    anke_data: Vec<u8>,
+    boris_data: Vec<u8>,
+    session_key_part_sampler: SessionKeyPartParallelSampler<R>,
+    boris_session_key_part_mix_sampler: SessionKeyPartMixParallelSampler<R, Boris>,
+}
+
+impl<R> RLWEBorisIdentity<R>
+where
+    R: 'static + RngCore + CryptoRng + SeedableRng + Send,
+{
+    pub fn new(
+        init_db: BTreeMap<InitIdentity, Init>,
+        identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
+        allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
+        anke_data: Vec<u8>,
+        boris_data: Vec<u8>,
+    ) -> Self {
+        Self {
+            init_db,
+            identity_db,
+            allowed_identities,
+            anke_data,
+            boris_data,
+            session_key_part_sampler: SessionKeyPart::parallel_sampler::<R>(2, 4096),
+            boris_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
+        }
+    }
+}
+
+impl<R> Debug for RLWEBorisIdentity<R> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        f.debug_struct("RLWEBorisIdentity")
+            .field("anke_data", &self.anke_data)
+            .field("boris_data", &self.boris_data)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum McElieceKeyExchange {
+    Anke {
+        anke_identity: Identity,
+        boris_identity: Identity,
+        c0: Vec<u8>,
+        c1: Vec<u8>,
+    },
+    Boris {
+        c0: Vec<u8>,
+        c1: Vec<u8>,
+    },
+}
+
+pub struct McElieceAnkeIdentity<H> {
+    anke_identity: Identity,
+    boris_identity: Identity,
+    anke_pub: McElieceKEM65536PublicKey,
+    anke_pri: McElieceKEM65536PrivateKey<GF65536NPreparedMultipointEvalVZG>,
+    boris_pub: McElieceKEM65536PublicKey,
+    _p: PhantomData<fn() -> H>,
+}
+
+impl<H> McElieceAnkeIdentity<H> {
+    pub fn new(
+        anke_pri: McElieceKEM65536PrivateKey<GF65536NPreparedMultipointEvalVZG>,
+        anke_pub: McElieceKEM65536PublicKey,
+        boris_pub: McElieceKEM65536PublicKey,
+    ) -> Self {
+        Self {
+            anke_identity: Identity::from(&anke_pub),
+            boris_identity: Identity::from(&boris_pub),
+            anke_pri,
+            boris_pub,
+            anke_pub,
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<H> Debug for McElieceAnkeIdentity<H> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        f.debug_struct("McElieceAnkeIdentity").finish()
+    }
+}
+
+pub struct McElieceBorisIdentity<H> {
+    allowed_identities: BTreeMap<Identity, McElieceKEM65536PublicKey>,
+    identities: BTreeMap<Identity, McElieceKEM65536PrivateKey<GF65536NPreparedMultipointEvalVZG>>,
+    _p: PhantomData<fn() -> H>,
+}
+
+impl<H> McElieceBorisIdentity<H> {
+    pub fn new(
+        allowed_identities: BTreeMap<Identity, McElieceKEM65536PublicKey>,
+        identities: BTreeMap<
+            Identity,
+            McElieceKEM65536PrivateKey<GF65536NPreparedMultipointEvalVZG>,
+        >,
+    ) -> Self {
+        Self {
+            allowed_identities,
+            identities,
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<H> Debug for McElieceBorisIdentity<H> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        f.debug_struct("McElieceAnkeIdentity").finish()
+    }
 }
 
 #[derive(Error, Debug)]
@@ -285,19 +520,6 @@ pub enum KeyExchangeError {
 pub enum KeyExchangeRole {
     Anke,
     Boris,
-}
-
-pub struct KeyExchange<R> {
-    pub retries: Option<u32>,
-    pub init_db: BTreeMap<InitIdentity, Init>,
-    pub identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
-    pub allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
-    pub identity_sequence: Vec<(InitIdentity, Identity)>,
-    pub session_key_part_sampler: SessionKeyPartParallelSampler<R>,
-    pub anke_session_key_part_mix_sampler: SessionKeyPartMixParallelSampler<R, Anke>,
-    pub boris_session_key_part_mix_sampler: SessionKeyPartMixParallelSampler<R, Boris>,
-    pub anke_data: Vec<u8>,
-    pub boris_data: Vec<u8>,
 }
 
 #[derive(Hash, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -354,9 +576,6 @@ pub struct Session<G> {
     role: KeyExchangeRole,
     pub session_id: SessionId,
     pub params: Params,
-    pub anke_identity: Identity,
-    pub boris_identity: Identity,
-    pub init_identity: InitIdentity,
 }
 
 pub struct SessionStream {
@@ -376,9 +595,6 @@ pub struct SessionBootstrap {
     params: Params,
     session_key: Vec<u8>,
     session_id: SessionId,
-    anke_identity: Identity,
-    boris_identity: Identity,
-    init_identity: InitIdentity,
 }
 
 pub struct SessionHandle<G> {
@@ -413,9 +629,6 @@ where
             role,
             params,
             session_key,
-            anke_identity,
-            boris_identity,
-            init_identity,
             session_id,
         } = session_bootstrap;
         let (input_tx, input) = channel(4096);
@@ -452,9 +665,6 @@ where
 
             session_id: session_id.clone(),
             params,
-            anke_identity,
-            boris_identity,
-            init_identity,
         });
         let poll = Pin::clone(&session)
             .process_stream(
@@ -514,11 +724,11 @@ where
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
-            variant: Redact(Pomerium::encode_with_tag(
+            variant: Pomerium::encode_with_tag(
                 &*self.outbound_guard,
                 ClientMessageVariant::BridgeNegotiate(BridgeNegotiationMessage::ProposeAsk),
                 &(self.session_id.clone(), serial),
-            )),
+            ),
         });
         self.send_master_message(message).await
     }
@@ -528,14 +738,14 @@ where
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
-            variant: Redact(Pomerium::encode_with_tag(
+            variant: Pomerium::encode_with_tag(
                 &*self.outbound_guard,
                 ClientMessageVariant::Stream(StreamRequest::Reset {
                     window: self.params.window,
                     stream,
                 }),
                 &(self.session_id.clone(), serial),
-            )),
+            ),
         });
         self.send_master_message(message).await
     }
@@ -576,13 +786,13 @@ where
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
-            variant: Redact(Pomerium::encode_with_tag(
+            variant: Pomerium::encode_with_tag(
                 &*self.outbound_guard,
                 ClientMessageVariant::BridgeNegotiate(BridgeNegotiationMessage::AskProposal(
                     proposals,
                 )),
                 &(self.session_id.clone(), serial),
-            )),
+            ),
         });
         self.send_master_message(message).await
     }
@@ -629,7 +839,7 @@ where
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
-            variant: Redact(Pomerium::encode_with_tag(
+            variant: Pomerium::encode_with_tag(
                 &*self.outbound_guard,
                 if failure {
                     ClientMessageVariant::Err
@@ -637,7 +847,7 @@ where
                     ClientMessageVariant::Ok
                 },
                 &tag,
-            )),
+            ),
         });
         self.send_master_message(message).await
     }
@@ -648,11 +858,11 @@ where
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
-            variant: Redact(Pomerium::encode_with_tag(
+            variant: Pomerium::encode_with_tag(
                 &*self.outbound_guard,
                 ClientMessageVariant::BridgeNegotiate(BridgeNegotiationMessage::Ask(proposals)),
                 &tag,
-            )),
+            ),
         });
         self.send_master_message(message).await
     }
@@ -681,11 +891,11 @@ where
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
-            variant: Redact(Pomerium::encode_with_tag(
+            variant: Pomerium::encode_with_tag(
                 &*self.outbound_guard,
                 ClientMessageVariant::BridgeNegotiate(BridgeNegotiationMessage::Health(health)),
                 &tag,
-            )),
+            ),
         });
         self.send_master_message(message).await
     }
@@ -720,8 +930,7 @@ where
                 let this = Pin::clone(&self);
                 async move {
                     info!("input start");
-                    this.as_ref().handle_input(input).await.unwrap(); // TODO: don't panic
-                    Ok(())
+                    this.as_ref().handle_input(input).await
                 }
             })
             .boxed()
@@ -800,7 +1009,7 @@ where
             })
             .boxed()
             .fuse();
-        select! {
+        select_biased! {
             result = error_reports => match result {
                 Ok(Err(e)) => {
                     error!("{:?}: error_reports: {:?}", self.role, e);
@@ -911,7 +1120,7 @@ where
                 .build(id, params, half, spawn)
                 .await
                 .map_err(|e| SessionError::Bridge(Box::new(e), <_>::default())),
-            _ => Err(SessionError::UnknownBridgeType),
+            // _ => Err(SessionError::UnknownBridgeType),
         }
     }
 }
@@ -956,7 +1165,7 @@ pub enum PayloadFeedback {
     },
 }
 
-pub(crate) struct SafeGuard {
+pub struct SafeGuard {
     aead: ChaCha20Poly1305,
 }
 
@@ -1018,7 +1227,7 @@ impl Tag for (SessionId, u64) {
     }
 }
 
-pub(crate) trait ProstMessageMapping: Sized {
+pub trait ProstMessageMapping: Sized {
     type MapTo: ProstMessage + Default + From<Self> + TryInto<Self>;
     type Tag: Tag;
 }

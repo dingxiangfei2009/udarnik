@@ -7,20 +7,26 @@ use std::{
 };
 
 use async_std::task::sleep;
+use blake2::Blake2b;
 use futures::{
     channel::{mpsc::channel, oneshot::channel as oneshot},
     prelude::*,
 };
 use http::Uri;
 use log::{error, info};
+use rand_chacha::ChaCha20Rng;
 use sss::lattice::{keygen, Init, PrivateKey, PublicKey, SigningKey};
 use udarnik::{
     client::{client, ClientBootstrap},
     keyman::{
         Error as KeyError, RawInit, RawPrivateKey, RawPublicKey, RawSigningKey, RawVerificationKey,
     },
+    reference_seeder_chacha,
     server::{server, ServerBootstrap},
-    state::{Identity, InitIdentity, Params},
+    state::{
+        Identity, InitIdentity, KeyExchangeAnkeIdentity, KeyExchangeBorisIdentity,
+        McElieceBorisIdentity, Params, RLWEAnkeIdentity, RLWEBorisIdentity, SafeGuard,
+    },
     utils::TokioSpawn,
 };
 
@@ -37,8 +43,6 @@ async fn start(handle: tokio::runtime::Handle) {
     let prikey = PrivateKey::try_from(prikey).unwrap();
     let pubkey: RawPublicKey = serde_json::from_str(&PUBLIC_KEY).unwrap();
     let pubkey: PublicKey = PublicKey::try_from(pubkey).unwrap();
-    let sign_key = SigningKey::from_private_key(&prikey);
-    let verify_key = sign_key.verification_key(&init);
     let (new_channel_tx, mut new_channel) = channel(32);
 
     let mut init_db = BTreeMap::default();
@@ -54,37 +58,26 @@ async fn start(handle: tokio::runtime::Handle) {
     identity_db
         .entry(InitIdentity::from(&init))
         .or_default()
-        .insert(Identity::from(&pubkey), prikey);
-
-    let mut sign_db: BTreeMap<_, BTreeMap<_, _>> = <_>::default();
-    sign_db
-        .entry(InitIdentity::from(&init))
-        .or_default()
-        .insert(Identity::from(&pubkey), sign_key);
-
-    let mut verify_db: BTreeMap<_, BTreeMap<_, _>> = <_>::default();
-    verify_db
-        .entry(InitIdentity::from(&init))
-        .or_default()
-        .insert(Identity::from(&pubkey), verify_key);
-
-    let identity_sequence = vec![(InitIdentity::from(&init), Identity::from(&pubkey))];
+        .insert(Identity::from(&pubkey), prikey.clone());
 
     let addr: SocketAddr = "[::]:8080".parse().unwrap();
     let spawn = TokioSpawn(handle.clone());
     let server = server(
         ServerBootstrap {
             addr: addr.clone(),
-            allowed_identities: allowed_identities.clone(),
-            anke_data: vec![],
-            boris_data: vec![],
-            identity_db: identity_db.clone(),
-            init_db: init_db.clone(),
-            identity_sequence: identity_sequence.clone(),
-            retries: Some(3),
-            verify_db: verify_db.clone(),
+            kex: KeyExchangeBorisIdentity {
+                rlwe: <RLWEBorisIdentity<ChaCha20Rng>>::new(
+                    init_db,
+                    identity_db,
+                    allowed_identities,
+                    vec![],
+                    vec![],
+                ),
+                mc: <McElieceBorisIdentity<Blake2b>>::new(<_>::default(), <_>::default()),
+            },
         },
         new_channel_tx,
+        reference_seeder_chacha,
         spawn.clone(),
         |duration| tokio::time::delay_for(duration),
     );
@@ -94,7 +87,7 @@ async fn start(handle: tokio::runtime::Handle) {
     let (mut input, input_rx) = channel(4096);
     let (output_tx, mut output) = channel(4096);
     let (terminate, terminate_rx) = oneshot();
-    let client = client(
+    let client = client::<SafeGuard, ChaCha20Rng, Blake2b, _, _, _, _>(
         ClientBootstrap {
             addr: format!("http://{}", addr).parse().unwrap(),
             params: Params {
@@ -102,15 +95,19 @@ async fn start(handle: tokio::runtime::Handle) {
                 entropy: 0,
                 window: 4096,
             },
-            allowed_identities,
-            anke_data: vec![],
-            boris_data: vec![],
-            identity_db,
-            identity_sequence,
-            init_db,
-            retries: Some(3),
-            sign_db,
+            kex: KeyExchangeAnkeIdentity::RLWE(RLWEAnkeIdentity::new(
+                InitIdentity::from(&init),
+                init,
+                Identity::from(&pubkey),
+                Identity::from(&pubkey),
+                prikey,
+                pubkey.clone(),
+                pubkey,
+                vec![],
+                vec![],
+            )),
         },
+        reference_seeder_chacha,
         input_rx,
         output_tx,
         terminate_rx,

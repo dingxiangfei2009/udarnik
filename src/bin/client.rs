@@ -15,6 +15,7 @@ use async_std::{
     io::{stdin, stdout, BufReader, BufWriter},
     task::sleep,
 };
+use blake2::Blake2b;
 use futures::{
     channel::{
         mpsc::{channel, SendError},
@@ -26,6 +27,7 @@ use futures::{
 };
 use http::Uri;
 use log::{error, info};
+use rand_chacha::ChaCha20Rng;
 use sss::lattice::{keygen, Init, PrivateKey, PublicKey, SigningKey};
 use structopt::StructOpt;
 use thiserror::Error;
@@ -34,8 +36,9 @@ use udarnik::{
     keyman::{
         Error as KeyError, RawInit, RawPrivateKey, RawPublicKey, RawSigningKey, RawVerificationKey,
     },
+    reference_seeder_chacha,
     server::{server, ServerBootstrap},
-    state::{Identity, InitIdentity, Params},
+    state::{Identity, InitIdentity, KeyExchangeAnkeIdentity, Params, RLWEAnkeIdentity, SafeGuard},
     utils::TokioSpawn,
 };
 
@@ -68,43 +71,12 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
     let prikey: RawPrivateKey = serde_json::from_reader(File::open(key)?)?;
     let prikey = PrivateKey::try_from(prikey)?;
     let pubkey = prikey.public_key(&init);
-    let sign_key = SigningKey::from_private_key(&prikey);
-    let verify_key = sign_key.verification_key(&init);
-
-    let mut init_db = BTreeMap::default();
-    init_db.insert(InitIdentity::from(&init), init.clone());
-
-    let mut allowed_identities: HashMap<_, HashMap<_, _>> = <_>::default();
-    allowed_identities
-        .entry(InitIdentity::from(&init))
-        .or_default()
-        .insert(Identity::from(&pubkey), pubkey.clone());
-
-    let mut identity_db: BTreeMap<_, BTreeMap<_, _>> = <_>::default();
-    identity_db
-        .entry(InitIdentity::from(&init))
-        .or_default()
-        .insert(Identity::from(&pubkey), prikey);
-
-    let mut sign_db: BTreeMap<_, BTreeMap<_, _>> = <_>::default();
-    sign_db
-        .entry(InitIdentity::from(&init))
-        .or_default()
-        .insert(Identity::from(&pubkey), sign_key);
-
-    let mut verify_db: BTreeMap<_, BTreeMap<_, _>> = <_>::default();
-    verify_db
-        .entry(InitIdentity::from(&init))
-        .or_default()
-        .insert(Identity::from(&pubkey), verify_key);
-
-    let identity_sequence = vec![(InitIdentity::from(&init), Identity::from(&pubkey))];
 
     let spawn = TokioSpawn(handle.clone());
     let (input, input_rx) = channel(4096);
     let (output_tx, output) = channel(4096);
     let (terminate, terminate_rx) = oneshot();
-    let client = client(
+    let client = client::<SafeGuard, ChaCha20Rng, Blake2b, _, _, _, _>(
         ClientBootstrap {
             addr: format!("http://{}", addr).parse().unwrap(),
             params: Params {
@@ -112,15 +84,19 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
                 entropy: 0,
                 window: 4096,
             },
-            allowed_identities,
-            anke_data: vec![],
-            boris_data: vec![],
-            identity_db,
-            identity_sequence,
-            init_db,
-            retries: Some(3),
-            sign_db,
+            kex: KeyExchangeAnkeIdentity::RLWE(RLWEAnkeIdentity::new(
+                InitIdentity::from(&init),
+                init,
+                Identity::from(&pubkey),
+                Identity::from(&pubkey),
+                prikey,
+                pubkey.clone(),
+                pubkey,
+                vec![],
+                vec![],
+            )),
         },
+        reference_seeder_chacha,
         input_rx,
         output_tx,
         terminate_rx,

@@ -1,11 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap},
-    convert::TryFrom,
-    fmt::Debug,
-    marker::PhantomData,
-    net::SocketAddr,
-    pin::Pin,
-    time::Duration,
+    collections::HashMap, convert::TryFrom, fmt::Debug, marker::PhantomData, net::SocketAddr,
+    pin::Pin, time::Duration,
 };
 
 use async_std::sync::{Arc, Mutex, RwLock};
@@ -17,18 +12,13 @@ use futures::{
 };
 use log::{error, info, trace, warn};
 use rand::{CryptoRng, RngCore, SeedableRng};
-use sss::lattice::{
-    Init, PrivateKey, PublicKey, SessionKeyPart, SessionKeyPartMix, VerificationKey,
-};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
-    protocol::signature_hasher,
-    reference_seeder_chacha,
     state::{
-        key_exchange_boris, wire, Guard, Identity, InitIdentity, KeyExchange, Message, Params,
-        SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle, SessionId,
+        key_exchange_boris, wire, Guard, KeyExchangeBorisIdentity, Message, Params, SafeGuard,
+        Session, SessionBootstrap, SessionError, SessionHandle, SessionId,
     },
     utils::{Spawn, TryFutureStream},
     GenericError,
@@ -50,24 +40,18 @@ impl<G> Clone for SessionState<G> {
     }
 }
 
-struct UdarnikServer<G, R, S, TimeGen, Timeout> {
+struct UdarnikServer<G, R, H, S, TimeGen, Timeout> {
     sessions: Arc<RwLock<HashMap<SessionId, SessionState<G>>>>,
-    verify_db: Arc<BTreeMap<InitIdentity, BTreeMap<Identity, VerificationKey>>>,
-    retries: Option<u32>,
-    init_db: Arc<BTreeMap<InitIdentity, Init>>,
-    identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
-    allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
-    identity_sequence: Vec<(InitIdentity, Identity)>,
-    anke_data: Vec<u8>,
-    boris_data: Vec<u8>,
+    kex: Arc<KeyExchangeBorisIdentity<R, H>>,
     seeder: S,
     new_sessions: Sender<SessionBootstrap>,
     timeout_generator: TimeGen,
     _p: PhantomData<fn() -> (R, Timeout)>,
 }
 
-impl<G, R, S, TimeGen, Timeout> UdarnikServer<G, R, S, TimeGen, Timeout>
+impl<G, R, H, S, TimeGen, Timeout> UdarnikServer<G, R, H, S, TimeGen, Timeout>
 where
+    H: 'static,
     R: 'static + Send + CryptoRng + RngCore + SeedableRng,
     TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
     Timeout: 'static + Send + Sync + Future<Output = ()>,
@@ -76,10 +60,7 @@ where
         &self,
         mut message_stream: impl Stream<Item = Result<Message<G>, SessionError>> + Send + Sync + Unpin,
         mut message_sink: impl Sink<Message<G>, Error = SessionError> + Send + Sync + Unpin,
-        h: impl Fn(Vec<u8>) -> Vec<u8>,
     ) -> impl Future<Output = Result<(), SessionError>> {
-        let init_db = Arc::clone(&self.init_db);
-        let verify_db = Arc::clone(&self.verify_db);
         let sessions = Arc::clone(&self.sessions);
         let mut rng = R::from_entropy();
         let mut challenge = vec![0u8; 256];
@@ -96,115 +77,83 @@ where
                         if logon.challenge != orig_challenge {
                             return Err(SessionError::SignOn("unexpected message".into()));
                         }
-                        if let (Some(key), Some(init)) = (
-                            verify_db
-                                .get(&logon.init_identity)
-                                .and_then(|t| t.get(&logon.identity)),
-                            init_db.get(&logon.init_identity),
-                        ) {
-                            if key.verify(&logon.recover_body(), logon.signature, init, h) {
-                                let SessionState {
-                                    mut master_in,
-                                    master_out,
-                                    ..
-                                } = {
-                                    let sessions = sessions.read().await;
-                                    if let Some(state) = sessions.get(&logon.session) {
-                                        if state.session.init_identity == logon.init_identity
-                                            && state.session.anke_identity == logon.identity
-                                        {
-                                            SessionState::clone(state)
-                                        } else {
-                                            return Err(SessionError::SignOn(
-                                                "unexpected message".into(),
-                                            ));
-                                        }
-                                    } else {
-                                        return Err(SessionError::SignOn(
-                                            "unexpected message".into(),
-                                        ));
-                                    }
-                                };
-                                let session = logon.session;
-                                trace!("server: session {} sign on", session);
-                                let (progress_tx, mut progress_rx) = channel(4096);
-                                let master_in = {
-                                    let mut progress = progress_tx.clone();
-                                    async move {
-                                        while let Some(msg) = message_stream.next().await {
-                                            master_in
-                                                .send(msg?)
-                                                .map_err(|e| {
-                                                    SessionError::BrokenPipe(
-                                                        Box::new(e),
-                                                        <_>::default(),
-                                                    )
-                                                })
-                                                .await?;
-                                            progress.send(()).await.map_err(|e| {
-                                                SessionError::BrokenPipe(
-                                                    Box::new(e),
-                                                    <_>::default(),
-                                                )
-                                            })?;
-                                        }
-                                        Ok::<_, SessionError>(())
-                                    }
-                                };
+                        let SessionState {
+                            mut master_in,
+                            master_out,
+                            ..
+                        } = {
+                            let sessions = sessions.read().await;
+                            if let Some(state) = sessions.get(&logon.session) {
+                                SessionState::clone(state)
+                            } else {
+                                return Err(SessionError::SignOn("unexpected message".into()));
+                            }
+                        };
+                        let session = logon.session;
+                        trace!("server: session {} sign on", session);
+                        let (progress_tx, mut progress_rx) = channel(4096);
+                        let master_in = {
+                            let mut progress = progress_tx.clone();
+                            async move {
+                                while let Some(msg) = message_stream.next().await {
+                                    master_in
+                                        .send(msg?)
+                                        .map_err(|e| {
+                                            SessionError::BrokenPipe(Box::new(e), <_>::default())
+                                        })
+                                        .await?;
+                                    progress.send(()).await.map_err(|e| {
+                                        SessionError::BrokenPipe(Box::new(e), <_>::default())
+                                    })?;
+                                }
+                                Ok::<_, SessionError>(())
+                            }
+                        };
 
-                                let master_out = {
-                                    let mut progress = progress_tx;
-                                    async move {
-                                        loop {
-                                            let msg = { master_out.lock().await.next().await };
-                                            if let Some(msg) = msg {
-                                                message_sink.send(msg).await?;
-                                                progress.send(()).await.map_err(|e| {
-                                                    SessionError::BrokenPipe(
-                                                        Box::new(e),
-                                                        <_>::default(),
-                                                    )
-                                                })?;
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                        Ok::<_, SessionError>(())
+                        let master_out = {
+                            let mut progress = progress_tx;
+                            async move {
+                                loop {
+                                    let msg = { master_out.lock().await.next().await };
+                                    if let Some(msg) = msg {
+                                        message_sink.send(msg).await?;
+                                        progress.send(()).await.map_err(|e| {
+                                            SessionError::BrokenPipe(Box::new(e), <_>::default())
+                                        })?;
+                                    } else {
+                                        break;
                                     }
-                                };
-                                let progress = async {
-                                    loop {
-                                        let mut timeout = Pin::from(Box::new(timeout_generator(
-                                            Duration::new(300, 0),
-                                        ))
-                                            as Box<dyn Future<Output = ()> + Send + Sync>)
-                                        .fuse();
-                                        select! {
-                                            _ = progress_rx.next() => (),
-                                            _ = timeout => break
-                                        }
-                                    }
-                                    info!("session {}: master link has no activity", session);
-                                };
-                                let mut master_in = Pin::from(Box::new(master_in)
-                                    as Box<
-                                        dyn Future<Output = Result<(), SessionError>> + Send + Sync,
-                                    >)
-                                .fuse();
-                                let mut master_out = Pin::from(Box::new(master_out)
-                                    as Box<
-                                        dyn Future<Output = Result<(), SessionError>> + Send + Sync,
-                                    >)
-                                .fuse();
-                                let mut progress = Pin::from(Box::new(progress)
-                                    as Box<dyn Future<Output = ()> + Send + Sync>)
-                                .fuse();
+                                }
+                                Ok::<_, SessionError>(())
+                            }
+                        };
+                        let progress = async {
+                            loop {
+                                let mut timeout =
+                                    Pin::from(Box::new(timeout_generator(Duration::new(300, 0)))
+                                        as Box<dyn Future<Output = ()> + Send + Sync>)
+                                    .fuse();
                                 select! {
-                                    r = master_in => r?,
-                                    r = master_out => r?,
-                                    _ = progress => (),
+                                    _ = progress_rx.next() => (),
+                                    _ = timeout => break
                                 }
                             }
+                            info!("session {}: master link has no activity", session);
+                        };
+                        let mut master_in = Pin::from(Box::new(master_in)
+                            as Box<dyn Future<Output = Result<(), SessionError>> + Send + Sync>)
+                        .fuse();
+                        let mut master_out = Pin::from(Box::new(master_out)
+                            as Box<dyn Future<Output = Result<(), SessionError>> + Send + Sync>)
+                        .fuse();
+                        let mut progress = Pin::from(
+                            Box::new(progress) as Box<dyn Future<Output = ()> + Send + Sync>
+                        )
+                        .fuse();
+                        select! {
+                            r = master_in => r?,
+                            r = master_out => r?,
+                            _ = progress => (),
                         }
                     }
                     _ => return Err(SessionError::SignOn("unexpected message".into())),
@@ -216,9 +165,10 @@ where
 }
 
 #[tonic::async_trait]
-impl<G, R, S, TimeGen, Timeout> wire::master_server::Master
-    for Pin<Arc<UdarnikServer<G, R, S, TimeGen, Timeout>>>
+impl<G, R, H, S, TimeGen, Timeout> wire::master_server::Master
+    for Pin<Arc<UdarnikServer<G, R, H, S, TimeGen, Timeout>>>
 where
+    H: 'static,
     G: 'static + Send + Sync + Guard<Params, ()> + for<'a> From<&'a [u8]> + Debug,
     G::Error: Debug,
     R: 'static + Send + Sync + SeedableRng + RngCore + CryptoRng,
@@ -244,34 +194,40 @@ where
                 as Box<
                     dyn Stream<Item = Result<Message<G>, Status>> + Send + Sync,
                 >);
-        let kex = KeyExchange {
-            retries: self.retries,
-            init_db: <_>::clone(&*self.init_db),
-            identity_db: self.identity_db.clone(),
-            allowed_identities: self.allowed_identities.clone(),
-            identity_sequence: self.identity_sequence.clone(),
-            session_key_part_sampler: SessionKeyPart::parallel_sampler::<R>(2, 4096),
-            anke_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
-            boris_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
-            anke_data: self.anke_data.to_vec(),
-            boris_data: self.boris_data.to_vec(),
-        };
+        // let kex = KeyExchange {
+        //     retries: self.retries,
+        //     init_db: <_>::clone(&*self.init_db),
+        //     identity_db: self.identity_db.clone(),
+        //     allowed_identities: self.allowed_identities.clone(),
+        //     identity_sequence: self.identity_sequence.clone(),
+        //     session_key_part_sampler: SessionKeyPart::parallel_sampler::<R>(2, 4096),
+        //     anke_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
+        //     boris_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
+        //     anke_data: self.anke_data.to_vec(),
+        //     boris_data: self.boris_data.to_vec(),
+        // };
         let seeder = self.seeder.clone();
         let (message_sink, message_stream) = channel(4096);
         let mut new_sessions = self.new_sessions.clone();
         let session_id = SessionId::from(uuid::Uuid::new_v4().to_string());
-        let kex_result = key_exchange_boris(kex, request, message_sink, seeder, session_id)
-            .map_err(|e| {
+        let kex_result = key_exchange_boris::<_, H, _, _, _, _, _, _>(
+            Arc::clone(&self.kex),
+            request,
+            message_sink,
+            seeder,
+            session_id,
+        )
+        .map_err(|e| {
+            info!("boris: error: {}", e);
+            Box::new(e) as GenericError
+        })
+        .and_then(move |r| async move {
+            info!("new session");
+            new_sessions.send(r).await.map_err(|e| {
                 info!("boris: error: {}", e);
                 Box::new(e) as GenericError
             })
-            .and_then(move |r| async move {
-                info!("new session");
-                new_sessions.send(r).await.map_err(|e| {
-                    info!("boris: error: {}", e);
-                    Box::new(e) as GenericError
-                })
-            });
+        });
         let stream = TryFutureStream::new(
             Box::new(Pin::from(Box::new(kex_result))),
             Box::new(message_stream.map(wire::Message::from).map(Ok)),
@@ -298,7 +254,6 @@ where
         let complete = self.handle_session(
             request,
             message_sink.sink_map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default())),
-            signature_hasher,
         );
         let stream = TryFutureStream::new(
             Box::new(Pin::from(Box::new(complete))),
@@ -311,57 +266,36 @@ where
     }
 }
 
-pub struct ServerBootstrap {
+pub struct ServerBootstrap<R, H> {
     pub addr: SocketAddr,
-    pub allowed_identities: HashMap<InitIdentity, HashMap<Identity, PublicKey>>,
-    pub anke_data: Vec<u8>,
-    pub boris_data: Vec<u8>,
-    pub identity_db: BTreeMap<InitIdentity, BTreeMap<Identity, PrivateKey>>,
-    pub identity_sequence: Vec<(InitIdentity, Identity)>,
-    pub init_db: BTreeMap<InitIdentity, Init>,
-    pub retries: Option<u32>,
-    pub verify_db: BTreeMap<InitIdentity, BTreeMap<Identity, VerificationKey>>,
+    pub kex: KeyExchangeBorisIdentity<R, H>,
 }
 
 pub type ServiceFuture<T> = Pin<Box<dyn Future<Output = T> + Send + Sync>>;
 
-pub async fn server<TimeGen, Timeout>(
-    bootstrap: ServerBootstrap,
+pub async fn server<R, H, S, TimeGen, Timeout>(
+    bootstrap: ServerBootstrap<R, H>,
     mut new_channel: Sender<(Sender<Vec<u8>>, Receiver<Vec<u8>>)>,
+    seeder: S,
     spawn: impl Spawn + Clone + Send + Sync + 'static,
     timeout_generator: TimeGen,
 ) -> Result<(), GenericError>
 where
+    R: 'static + Send + Sync + SeedableRng + RngCore + CryptoRng,
+    H: 'static,
+    S: 'static + Send + Sync + Clone + Fn(&[u8]) -> R::Seed,
     TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
     Timeout: 'static + Future<Output = ()> + Send + Sync,
 {
-    let ServerBootstrap {
-        addr,
-        allowed_identities,
-        anke_data,
-        boris_data,
-        identity_db,
-        identity_sequence,
-        init_db,
-        retries,
-        verify_db,
-    } = bootstrap;
+    let ServerBootstrap { addr, kex } = bootstrap;
     let (new_sessions_tx, mut new_sessions) = channel(32);
     let sessions = Arc::default();
-    let seeder = reference_seeder_chacha;
-    let server: UdarnikServer<SafeGuard, rand_chacha::ChaChaRng, _, _, Timeout> = UdarnikServer {
+    let server: UdarnikServer<SafeGuard, _, _, _, _, Timeout> = UdarnikServer {
         _p: PhantomData,
-        allowed_identities,
-        anke_data,
-        boris_data,
-        identity_db,
-        identity_sequence,
-        init_db: Arc::new(init_db),
+        kex: Arc::new(kex),
         new_sessions: new_sessions_tx,
-        retries,
         seeder,
         sessions: Arc::clone(&sessions),
-        verify_db: Arc::new(verify_db),
         timeout_generator: timeout_generator.clone(),
     };
     let server = Arc::pin(server);

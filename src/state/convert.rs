@@ -6,21 +6,16 @@ use std::{
 
 use backtrace::Backtrace as Bt;
 use cfg_if::cfg_if;
-use sss::{
-    adapter::Int,
-    lattice::{Poly, Reconciliator, SessionKeyPart, Signature},
-};
+use sss::lattice::{Reconciliator, SessionKeyPart};
 use thiserror::Error;
 
 use super::{
     wire, BridgeAsk, BridgeId, BridgeMessage, BridgeNegotiationMessage, BridgeRetract, BridgeType,
-    ClientMessage, ClientMessageVariant, GrpcBridge, KeyExchangeMessage, Message, Params,
-    PayloadFeedback, Pomerium, SessionLogOn, StreamRequest, UnixBridge,
+    ClientMessage, ClientMessageVariant, GrpcBridge, KeyExchangeMessage, McElieceKeyExchange,
+    Message, Params, PayloadFeedback, Pomerium, RLWEKeyExchange, SessionLogOn, StreamRequest,
+    UnixBridge,
 };
-use crate::{
-    protocol::{RawShard, RawShardId},
-    GenericError, Redact,
-};
+use crate::protocol::{RawShard, RawShardId};
 
 impl From<wire::BridgeId> for BridgeId {
     fn from(id: wire::BridgeId) -> Self {
@@ -53,7 +48,7 @@ impl<G> From<Message<G>> for wire::message::Message {
         use wire::message::Message as M;
         match message {
             Message::KeyExchange(kex) => M::KeyExchange(wire::KeyExchange::from(kex)),
-            Message::Params(Redact(params)) => M::Params(params.data),
+            Message::Params(params) => M::Params(params.data),
             Message::Client(msg) => M::Client(wire::ClientMessage::from(msg)),
             Message::Session(session) => M::Session(session.to_string()),
             Message::SessionLogOn(logon) => M::SessionLogOn(wire::SessionLogOn::from(logon)),
@@ -65,22 +60,8 @@ impl<G> From<Message<G>> for wire::message::Message {
 impl From<SessionLogOn> for wire::SessionLogOn {
     fn from(logon: SessionLogOn) -> Self {
         Self {
-            init_identity: logon.init_identity.to_string(),
-            identity: logon.identity.to_string(),
             session: logon.session.to_string(),
             challenge: logon.challenge,
-            signature: Some(wire::Signature::from(logon.signature)),
-        }
-    }
-}
-
-impl From<Signature> for wire::Signature {
-    fn from(signature: Signature) -> Self {
-        Self {
-            p: signature.z_1.into_coeff_bytes(),
-            q: signature.z_2.into_coeff_bytes(),
-            r: signature.c.into_coeff_bytes(),
-            k: signature.k.into_bytes(),
         }
     }
 }
@@ -97,25 +78,47 @@ impl From<KeyExchangeMessage> for wire::key_exchange::Variant {
     fn from(kex: KeyExchangeMessage) -> Self {
         use wire::key_exchange::Variant as V;
         match kex {
-            KeyExchangeMessage::Offer(ident, init_ident) => V::Offer(wire::Offer {
-                identity: ident.to_string(),
-                init_identity: init_ident.to_string(),
-            }),
-            KeyExchangeMessage::Accept(ident, init_ident) => V::Accept(wire::Accept {
-                identity: ident.to_string(),
-                init_identity: init_ident.to_string(),
-            }),
-            KeyExchangeMessage::Reject(ident, init_ident) => V::Reject(wire::Reject {
-                identity: ident.to_string(),
-                init_identity: init_ident.to_string(),
-            }),
-            KeyExchangeMessage::AnkePart(Redact(part)) => V::AnkePart(wire::AnkePart {
-                part: part.into_coeff_bytes(),
-            }),
-            KeyExchangeMessage::BorisPart(Redact(part), Redact(recon)) => {
-                V::BorisPart(wire::BorisPart {
+            KeyExchangeMessage::RLWE(RLWEKeyExchange::AnkePart {
+                part,
+                anke_identity,
+                boris_identity,
+                init_identity,
+            }) => V::Rlwe(wire::Rlwe {
+                variant: Some(wire::rlwe::Variant::AnkePart(wire::AnkePart {
                     part: part.into_coeff_bytes(),
-                    reconciliator: recon.into_bytes(),
+                    anke_identity: anke_identity.to_string(),
+                    boris_identity: boris_identity.to_string(),
+                    init_identity: init_identity.to_string(),
+                })),
+            }),
+            KeyExchangeMessage::RLWE(RLWEKeyExchange::BorisPart {
+                part,
+                reconciliator,
+            }) => V::Rlwe(wire::Rlwe {
+                variant: Some(wire::rlwe::Variant::BorisPart(wire::BorisPart {
+                    part: part.into_coeff_bytes(),
+                    reconciliator: reconciliator.into_bytes(),
+                })),
+            }),
+            KeyExchangeMessage::McEliece(McElieceKeyExchange::Anke {
+                anke_identity,
+                boris_identity,
+                c0,
+                c1,
+            }) => V::Mc(wire::McEliece {
+                variant: Some(wire::mc_eliece::Variant::AnkeKey(wire::McAnkeKey {
+                    anke_identity: anke_identity.to_string(),
+                    boris_identity: boris_identity.to_string(),
+                    c0,
+                    c1,
+                })),
+            }),
+            KeyExchangeMessage::McEliece(McElieceKeyExchange::Boris { c0, c1 }) => {
+                V::Mc(wire::McEliece {
+                    variant: Some(wire::mc_eliece::Variant::BorisKey(wire::McBorisKey {
+                        c0,
+                        c1,
+                    })),
                 })
             }
         }
@@ -127,7 +130,7 @@ impl<G> From<ClientMessage<G>> for wire::ClientMessage {
         Self {
             serial: msg.serial,
             session: msg.session.to_string(),
-            variant: msg.variant.0.data,
+            variant: msg.variant.data,
         }
     }
 }
@@ -251,7 +254,7 @@ impl<G> TryFrom<wire::message::Message> for Message<G> {
             M::KeyExchange(wire::KeyExchange { variant: Some(kex) }) => {
                 Self::KeyExchange(<_>::try_from(kex)?)
             }
-            M::Params(params) => Self::Params(Redact(Pomerium::from_raw(params))),
+            M::Params(params) => Self::Params(Pomerium::from_raw(params)),
             M::Client(msg) => Self::Client(ClientMessage::try_from(msg)?),
             M::Session(session) => Self::Session(session.into()),
             M::SessionLogOn(logon) => Self::SessionLogOn(logon.try_into()?),
@@ -265,35 +268,11 @@ impl TryFrom<wire::SessionLogOn> for SessionLogOn {
     type Error = WireError;
     fn try_from(logon: wire::SessionLogOn) -> Result<Self, Self::Error> {
         match logon {
-            wire::SessionLogOn {
-                init_identity,
-                identity,
-                session,
-                challenge,
-                signature: Some(signature),
-            } => Ok(Self {
-                init_identity: init_identity.into(),
-                identity: identity.into(),
+            wire::SessionLogOn { session, challenge } => Ok(Self {
                 session: session.into(),
                 challenge,
-                signature: signature.try_into()?,
             }),
-            _ => return Err(WireError::Malformed(<_>::default())),
         }
-    }
-}
-
-impl TryFrom<wire::Signature> for Signature {
-    type Error = WireError;
-    fn try_from(sig: wire::Signature) -> Result<Self, Self::Error> {
-        Ok(Self {
-            z_1: Poly::from_coeff_bytes(sig.p)
-                .ok_or_else(|| WireError::Malformed(<_>::default()))?,
-            z_2: Poly::from_coeff_bytes(sig.q)
-                .ok_or_else(|| WireError::Malformed(<_>::default()))?,
-            c: Poly::from_coeff_bytes(sig.r).ok_or_else(|| WireError::Malformed(<_>::default()))?,
-            k: Int::from_bytes(&sig.k),
-        })
     }
 }
 
@@ -302,32 +281,50 @@ impl TryFrom<wire::key_exchange::Variant> for KeyExchangeMessage {
     fn try_from(kex: wire::key_exchange::Variant) -> Result<Self, Self::Error> {
         use wire::key_exchange::Variant as V;
         Ok(match kex {
-            V::Offer(wire::Offer {
-                identity,
-                init_identity,
-            }) => KeyExchangeMessage::Offer(identity.into(), init_identity.into()),
-            V::Accept(wire::Accept {
-                identity,
-                init_identity,
-            }) => KeyExchangeMessage::Accept(identity.into(), init_identity.into()),
-            V::Reject(wire::Reject {
-                identity,
-                init_identity,
-            }) => KeyExchangeMessage::Reject(identity.into(), init_identity.into()),
-            V::AnkePart(wire::AnkePart { part }) => KeyExchangeMessage::AnkePart(Redact(
-                SessionKeyPart::from_coeff_bytes(part)
+            V::Rlwe(wire::Rlwe {
+                variant:
+                    Some(wire::rlwe::Variant::AnkePart(wire::AnkePart {
+                        part,
+                        anke_identity,
+                        boris_identity,
+                        init_identity,
+                    })),
+            }) => KeyExchangeMessage::RLWE(RLWEKeyExchange::AnkePart {
+                part: SessionKeyPart::from_coeff_bytes(part)
                     .ok_or_else(|| WireError::Malformed(<_>::default()))?,
-            )),
-            V::BorisPart(wire::BorisPart {
-                part,
-                reconciliator,
-            }) => KeyExchangeMessage::BorisPart(
-                Redact(
-                    SessionKeyPart::from_coeff_bytes(part)
-                        .ok_or_else(|| WireError::Malformed(<_>::default()))?,
-                ),
-                Redact(Reconciliator::from_bytes(reconciliator)),
-            ),
+                anke_identity,
+                boris_identity,
+                init_identity,
+            }),
+            V::Rlwe(wire::Rlwe {
+                variant:
+                    Some(wire::rlwe::Variant::BorisPart(wire::BorisPart {
+                        part,
+                        reconciliator,
+                    })),
+            }) => KeyExchangeMessage::RLWE(RLWEKeyExchange::BorisPart {
+                part: SessionKeyPart::from_coeff_bytes(part)
+                    .ok_or_else(|| WireError::Malformed(<_>::default()))?,
+                reconciliator: Reconciliator::from_bytes(reconciliator),
+            }),
+            V::Mc(wire::McEliece {
+                variant:
+                    Some(wire::mc_eliece::Variant::AnkeKey(wire::McAnkeKey {
+                        anke_identity,
+                        boris_identity,
+                        c0,
+                        c1,
+                    })),
+            }) => KeyExchangeMessage::McEliece(McElieceKeyExchange::Anke {
+                anke_identity: anke_identity.into(),
+                boris_identity: boris_identity.into(),
+                c0,
+                c1,
+            }),
+            V::Mc(wire::McEliece {
+                variant: Some(wire::mc_eliece::Variant::BorisKey(wire::McBorisKey { c0, c1 })),
+            }) => KeyExchangeMessage::McEliece(McElieceKeyExchange::Boris { c0, c1 }),
+            _ => return Err(WireError::Malformed(<_>::default())),
         })
     }
 }
@@ -338,7 +335,7 @@ impl<G> TryFrom<wire::ClientMessage> for ClientMessage<G> {
         Ok(ClientMessage {
             serial: msg.serial,
             session: msg.session.into(),
-            variant: Redact(Pomerium::from_raw(msg.variant)),
+            variant: Pomerium::from_raw(msg.variant),
         })
     }
 }

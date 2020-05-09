@@ -28,18 +28,8 @@ message Message {
 }
 
 message SessionLogOn {
-  string init_identity = 1;
-  string identity = 2;
   string session = 3;
   bytes challenge = 4;
-  Signature signature = 5;
-}
-
-message Signature {
-  repeated bytes p = 1;
-  repeated bytes q = 2;
-  repeated bytes r = 3;
-  bytes k = 4;
 }
 
 message ClientMessage {
@@ -50,31 +40,23 @@ message ClientMessage {
 
 message KeyExchange {
   oneof variant {
-    Offer offer = 1;
-    Accept accept = 2;
-    Reject reject = 3;
-    AnkePart anke_part = 4;
-    BorisPart boris_part = 5;
+    RLWE rlwe = 1;
+    McEliece mc = 2;
   }
 }
 
-message Offer {
-  string identity = 1;
-  string init_identity = 2;
-}
-
-message Accept {
-  string identity = 1;
-  string init_identity = 2;
-}
-
-message Reject {
-  string identity = 1;
-  string init_identity = 2;
+message RLWE {
+  oneof variant {
+    AnkePart anke_part = 1;
+    BorisPart boris_part = 2;
+  }
 }
 
 message AnkePart {
   repeated bytes part = 1;
+  string anke_identity = 2;
+  string boris_identity = 3;
+  string init_identity = 4;
 }
 
 message BorisPart {
@@ -84,9 +66,28 @@ message BorisPart {
 
 message BridgeMessage {
   oneof variant {
-    Payload payload = 2;
-    PayloadFeedback payload_feedback = 3;
+    Payload payload = 1;
+    PayloadFeedback payload_feedback = 2;
   }
+}
+
+message McEliece {
+  oneof variant {
+    McAnkeKey anke_key = 1;
+    McBorisKey boris_key = 2;
+  }
+}
+
+message McAnkeKey {
+  string anke_identity = 1;
+  string boris_identity = 2;
+  bytes c0 = 3;
+  bytes c1 = 4;
+}
+
+message McBorisKey {
+  bytes c0 = 1;
+  bytes c1 = 2;
 }
 
 message Payload {

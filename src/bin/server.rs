@@ -1,30 +1,27 @@
-#[macro_use]
-extern crate derive_more;
-
 use std::{
     collections::{BTreeMap, HashMap},
     convert::TryFrom,
     fs::File,
-    io::Write,
     net::SocketAddr,
     path::PathBuf,
 };
 
-use futures::{
-    channel::{mpsc::channel, oneshot::channel as oneshot},
-    prelude::*,
-};
+use blake2::Blake2b;
+use futures::{channel::mpsc::channel, prelude::*};
 use log::{error, info};
-use sss::lattice::{keygen, Init, PrivateKey, PublicKey, SigningKey};
+use rand_chacha::ChaCha20Rng;
+use sss::lattice::{Init, PrivateKey, SigningKey};
 use structopt::StructOpt;
 use thiserror::Error;
 use tokio::runtime::Handle;
 use udarnik::{
     keyman::{Error as KeyError, RawInit, RawPrivateKey},
+    reference_seeder_chacha,
     server::{server, ServerBootstrap},
-    state::{Identity, InitIdentity},
+    state::{
+        Identity, InitIdentity, KeyExchangeBorisIdentity, McElieceBorisIdentity, RLWEBorisIdentity,
+    },
     utils::TokioSpawn,
-    GenericError,
 };
 
 #[derive(Debug, StructOpt)]
@@ -85,22 +82,23 @@ async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
         .or_default()
         .insert(Identity::from(&pubkey), verify_key);
 
-    let identity_sequence = vec![(InitIdentity::from(&init), Identity::from(&pubkey))];
-
     let spawn = TokioSpawn(handle.clone());
     let server = server(
         ServerBootstrap {
             addr: addr.clone(),
-            allowed_identities: allowed_identities.clone(),
-            anke_data: vec![],
-            boris_data: vec![],
-            identity_db: identity_db.clone(),
-            init_db: init_db.clone(),
-            identity_sequence: identity_sequence.clone(),
-            retries: Some(3),
-            verify_db: verify_db.clone(),
+            kex: KeyExchangeBorisIdentity {
+                rlwe: <RLWEBorisIdentity<ChaCha20Rng>>::new(
+                    init_db,
+                    identity_db,
+                    allowed_identities,
+                    vec![],
+                    vec![],
+                ),
+                mc: <McElieceBorisIdentity<Blake2b>>::new(<_>::default(), <_>::default()),
+            },
         },
         new_channel_tx,
+        reference_seeder_chacha,
         spawn.clone(),
         |duration| tokio::time::delay_for(duration),
     );

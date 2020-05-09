@@ -36,7 +36,7 @@ where
                             Message::Client(ClientMessage {
                                 serial,
                                 session,
-                                variant: Redact(variant),
+                                variant,
                             }) => {
                                 trace!("{:?}: incoming client message", this.role);
                                 let tag = (session.clone(), serial);

@@ -46,7 +46,7 @@ impl<T> Debug for Redact<T> {
     }
 }
 
-fn reference_seeder_chacha(input: &[u8]) -> [u8; 32] {
+pub fn reference_seeder_chacha(input: &[u8]) -> [u8; 32] {
     use sha3::digest::Digest;
     let mut s = [0; 32];
     for chunks in sha3::Sha3_512::digest(input).chunks(32) {
