@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_std::sync::{Arc, Mutex, RwLock};
+use digest::Digest;
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
     future::{pending, select_all},
@@ -168,7 +169,7 @@ where
 impl<G, R, H, S, TimeGen, Timeout> wire::master_server::Master
     for Pin<Arc<UdarnikServer<G, R, H, S, TimeGen, Timeout>>>
 where
-    H: 'static,
+    H: 'static + Digest,
     G: 'static + Send + Sync + Guard<Params, ()> + for<'a> From<&'a [u8]> + Debug,
     G::Error: Debug,
     R: 'static + Send + Sync + SeedableRng + RngCore + CryptoRng,
@@ -194,18 +195,6 @@ where
                 as Box<
                     dyn Stream<Item = Result<Message<G>, Status>> + Send + Sync,
                 >);
-        // let kex = KeyExchange {
-        //     retries: self.retries,
-        //     init_db: <_>::clone(&*self.init_db),
-        //     identity_db: self.identity_db.clone(),
-        //     allowed_identities: self.allowed_identities.clone(),
-        //     identity_sequence: self.identity_sequence.clone(),
-        //     session_key_part_sampler: SessionKeyPart::parallel_sampler::<R>(2, 4096),
-        //     anke_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
-        //     boris_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
-        //     anke_data: self.anke_data.to_vec(),
-        //     boris_data: self.boris_data.to_vec(),
-        // };
         let seeder = self.seeder.clone();
         let (message_sink, message_stream) = channel(4096);
         let mut new_sessions = self.new_sessions.clone();
@@ -266,6 +255,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct ServerBootstrap<R, H> {
     pub addr: SocketAddr,
     pub kex: KeyExchangeBorisIdentity<R, H>,
@@ -282,7 +272,7 @@ pub async fn server<R, H, S, TimeGen, Timeout>(
 ) -> Result<(), GenericError>
 where
     R: 'static + Send + Sync + SeedableRng + RngCore + CryptoRng,
-    H: 'static,
+    H: 'static + Digest,
     S: 'static + Send + Sync + Clone + Fn(&[u8]) -> R::Seed,
     TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
     Timeout: 'static + Future<Output = ()> + Send + Sync,

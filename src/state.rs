@@ -19,6 +19,7 @@ use std::{
 use aead::{Aead, NewAead, Payload};
 use async_std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use backtrace::Backtrace as Bt;
+use blake2::Blake2b;
 use chacha20poly1305::ChaCha20Poly1305;
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
@@ -29,6 +30,7 @@ use futures::{
     stream::{iter, unfold, FuturesUnordered},
 };
 use generic_array::GenericArray;
+use hmac::{Hmac, Mac};
 use log::{debug, error, info, trace, warn};
 use lru::LruCache;
 use prost::Message as ProstMessage;
@@ -44,6 +46,7 @@ use sss::{
     },
     mceliece::{McElieceCiphertext, McElieceKEM65536PrivateKey, McElieceKEM65536PublicKey},
 };
+use typenum::Unsigned;
 use thiserror::Error;
 
 use crate::{
@@ -88,7 +91,7 @@ impl From<&'_ Init> for InitIdentity {
     }
 }
 
-#[derive(From, Hash, PartialEq, PartialOrd, Eq, Ord, Clone, Debug, Deref)]
+#[derive(From, Hash, PartialEq, PartialOrd, Eq, Ord, Clone, Debug, Deref, Display)]
 pub struct Identity(String);
 
 impl From<&'_ PublicKey> for Identity {
@@ -331,8 +334,8 @@ pub struct RLWEAnkeIdentity<R> {
     anke_identity: Identity,
     boris_identity: Identity,
     anke_pri: PrivateKey,
-    boris_pub: PublicKey,
     anke_pub: PublicKey,
+    boris_pub: PublicKey,
     anke_data: Vec<u8>,
     boris_data: Vec<u8>,
     session_key_part_sampler: SessionKeyPartParallelSampler<R>,
@@ -1167,6 +1170,7 @@ pub enum PayloadFeedback {
 
 pub struct SafeGuard {
     aead: ChaCha20Poly1305,
+    mackey: Vec<u8>,
 }
 
 impl Debug for SafeGuard {
@@ -1186,9 +1190,14 @@ impl SafeGuard {
         key
     }
     fn new(key: &[u8]) -> Self {
-        let key = SafeGuard::derive_key(key);
+        let enckey = SafeGuard::derive_key(key);
+        let mut mackey = key.to_vec();
+        mackey.extend(&[0, 0]);
+        mackey.extend(&enckey);
+        mackey.extend(", hmac, blake2b".as_bytes());
         Self {
-            aead: ChaCha20Poly1305::new(*GenericArray::from_slice(&key)),
+            aead: ChaCha20Poly1305::new(*GenericArray::from_slice(&enckey)),
+            mackey,
         }
     }
     fn encode_message<P: ProstMessage>(payload: P) -> Vec<u8> {
@@ -1247,6 +1256,8 @@ impl ProstMessageMapping for BridgeMessage {
     type Tag = ();
 }
 
+type HmacBlake2b = Hmac<Blake2b>;
+
 impl<P, T> Guard<P, T> for SafeGuard
 where
     P: ProstMessageMapping<Tag = T>,
@@ -1263,7 +1274,11 @@ where
             .aead
             .encrypt(GenericArray::from_slice(&nonce), &payload[..])
             .expect("correct key sizes and bounds");
-        buf.splice(..0, nonce.to_vec());
+        let mut mac = HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
+        mac.input(&nonce);
+        mac.input(&(buf.len() as u64).to_le_bytes());
+        mac.input(&buf);
+        buf.splice(..0, mac.result().code().into_iter().chain(nonce.to_vec()));
         buf
     }
     fn encode_with_tag(&self, payload: P, tag: &T) -> Vec<u8> {
@@ -1282,16 +1297,28 @@ where
                 },
             )
             .expect("correct key sizes and bounds");
-        buf.splice(..0, nonce.to_vec());
+        let mut mac = HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
+        mac.input(&nonce);
+        mac.input(&(tag.len() as u64).to_le_bytes());
+        mac.input(&tag);
+        mac.input(&(buf.len() as u64).to_le_bytes());
+        mac.input(&buf);
+        buf.splice(..0, mac.result().code().into_iter().chain(nonce.to_vec()));
         buf
     }
     fn decode(&self, data: &[u8]) -> Result<P, Self::Error> {
-        if data.len() < 12 {
+        let mac_length = <HmacBlake2b as Mac>::OutputSize::to_usize();
+        if data.len() < 12 + mac_length {
             return Err(err_msg("truncated data"));
         }
-        let mut nonce = [0u8; 12];
-        nonce[..].copy_from_slice(&data[..12]);
-        let (_, data) = data.split_at(12);
+        let mac_code = &data[..mac_length];
+        let nonce = &data[mac_length..mac_length + 12];
+        let data = &data[mac_length + 12..];
+        let mut mac = HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
+        mac.input(&nonce);
+        mac.input(&(data.len() as u64).to_le_bytes());
+        mac.input(data);
+        mac.verify(mac_code)?;
         let buf = self
             .aead
             .decrypt(GenericArray::from_slice(&nonce), data)
@@ -1303,13 +1330,21 @@ where
         Ok(payload.try_into()?)
     }
     fn decode_with_tag(&self, data: &[u8], tag: &T) -> Result<P, Self::Error> {
-        if data.len() < 12 {
+        let mac_length = <HmacBlake2b as Mac>::OutputSize::to_usize();
+        if data.len() < 12 + mac_length {
             return Err(err_msg("truncated data") as GenericError);
         }
-        let mut nonce = [0u8; 12];
-        nonce[..].copy_from_slice(&data[..12]);
-        let (_, data) = data.split_at(12);
+        let mac_code = &data[..mac_length];
+        let nonce = &data[mac_length..mac_length + 12];
+        let data = &data[mac_length + 12..];
         let tag = tag.into_bytes();
+        let mut mac = HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
+        mac.input(&nonce);
+        mac.input(&(tag.len() as u64).to_le_bytes());
+        mac.input(&tag);
+        mac.input(&(data.len() as u64).to_le_bytes());
+        mac.input(data);
+        mac.verify(mac_code)?;
         let buf = self
             .aead
             .decrypt(

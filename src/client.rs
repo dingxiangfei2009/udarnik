@@ -18,7 +18,6 @@ use thiserror::Error;
 use tonic::{Request, Status};
 
 use crate::{
-    protocol::signature_hasher,
     state::{
         key_exchange_anke, wire, ClientMessageVariant, Guard, KeyExchangeAnkeIdentity,
         KeyExchangeError, Message, Params, SafeGuard, Session, SessionError, SessionHandle,

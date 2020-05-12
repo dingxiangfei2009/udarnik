@@ -195,6 +195,7 @@ pub async fn key_exchange_boris<R, H, G, S, MsgStream, MsgSink, MsgStreamErr, Id
 ) -> Result<SessionBootstrap, KeyExchangeError>
 where
     R: RngCore + CryptoRng + SeedableRng,
+    H: Digest,
     G: 'static + Debug + Guard<Params, ()> + for<'a> From<&'a [u8]>,
     G::Error: Debug,
     MsgStream: Stream<Item = Result<Message<G>, MsgStreamErr>> + Unpin,
@@ -225,8 +226,10 @@ where
             )
             .await
         }
-        Ok(Message::KeyExchange(KeyExchangeMessage::McEliece(_))) => todo!(),
-        _ => todo!(),
+        Ok(Message::KeyExchange(KeyExchangeMessage::McEliece(_))) => {
+            key_exchange_mceliece_boris(&ident.mc, message_stream, message_sink, session_id).await
+        }
+        _ => Err(KeyExchangeError::UnknownMessage(<_>::default())),
     }
 }
 
