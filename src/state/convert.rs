@@ -433,8 +433,8 @@ impl From<BridgeType> for wire::BridgeType {
                             use std::os::unix::ffi::OsStrExt;
                             path = addr.as_os_str().as_bytes().to_vec();
                         } else {
-                            use std::os::unix::ffi::OsStrExt;
-                            path = addr.as_os_str().as_bytes().to_vec();
+                            todo!("don't know handle this");
+                            path = vec![];
                         }
                     };
                     V::Unix(wire::BridgeUnix {
@@ -452,7 +452,7 @@ impl From<BridgeType> for wire::BridgeType {
 impl From<GrpcBridge> for wire::BridgeGrpc {
     fn from(GrpcBridge { id, addr, up, down }: GrpcBridge) -> Self {
         Self {
-            endpoint: addr.to_string(),
+            endpoint: addr.iter().map(ToString::to_string).collect(),
             id: Some(<_>::from(id)),
             up: up.to_vec(),
             down: down.to_vec(),
@@ -581,7 +581,10 @@ impl TryFrom<wire::BridgeType> for BridgeType {
                     up_key.copy_from_slice(&up);
                     down_key.copy_from_slice(&down);
                     BridgeType::Grpc(GrpcBridge {
-                        addr: endpoint.parse()?,
+                        addr: endpoint
+                            .iter()
+                            .map(|addr| addr.parse())
+                            .collect::<Result<Vec<_>, _>>()?,
                         id: id.into(),
                         up: up_key,
                         down: down_key,

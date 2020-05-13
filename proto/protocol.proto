@@ -200,7 +200,7 @@ message BridgeUnix {
 
 message BridgeGrpc {
   BridgeId id = 1;
-  string endpoint = 2;
+  repeated string endpoint = 2;
   bytes up = 3;
   bytes down = 4;
 }

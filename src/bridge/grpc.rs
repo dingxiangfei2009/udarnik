@@ -1,6 +1,7 @@
 use std::{
     convert::TryFrom,
     io::Result as IoResult,
+    net::SocketAddr,
     path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
@@ -20,6 +21,7 @@ use backtrace::Backtrace as Bt;
 use chacha20poly1305::ChaCha20Poly1305;
 use futures::{
     channel::mpsc::{channel as std_channel, Sender as StdSender},
+    future::BoxFuture,
     prelude::*,
     select,
 };
@@ -270,6 +272,8 @@ where
     let addr = format!("[::1]:{}", addr.port())
         .parse()
         .expect("correct socket address format");
+    let addr = vec![addr];
+
     let (server, mut progress) = BridgeServer::new(spawn.clone());
     let up_key = server.up.key;
     let down_key = server.down.key;
@@ -504,7 +508,13 @@ pub enum Error {
     Crypto(aead::Error, Bt),
     #[error("io: {0}")]
     Io(std::io::Error),
+    #[error("other: {0:?}")]
+    Other(GenericError),
 }
+
+#[derive(Error, Debug)]
+#[error("{0:?}")]
+pub struct GrpcBridgeError(pub Vec<Error>);
 
 async fn grpc_bridge_client<G, S>(
     mut message_sink: StdSender<wire::RawBridgeMessage>,
@@ -516,7 +526,7 @@ async fn grpc_bridge_client<G, S>(
     up: String,
     down: String,
     key: [u8; 32],
-    spawn: S,
+    spawn: &S,
 ) -> Result<Bridge<G>, Error>
 where
     G: 'static + Guard<BridgeMessage, ()>,
@@ -624,46 +634,60 @@ where
         S::Error: 'static,
     {
         let GrpcParams { addr, up, down, .. } = params;
-        let uri = Uri::builder()
-            .scheme("http")
-            .authority(&addr.to_string() as &str)
-            .path_and_query("/")
-            .build()
-            .map_err(Error::Uri)?;
-        let mut client = wire::bridge_client::BridgeClient::connect(uri)
-            .await
-            .map_err(Error::Transport)?;
-        let (message_sink, bridge_in) = std_channel(4096);
-        let bridge_out = client
-            .channel(Request::new(bridge_in.map(wire::RawBridgeMessage::from)))
-            .await
-            .map_err(|e| Error::Net(e, <_>::default()))?
-            .into_inner()
-            .map_err(|e| Error::Net(e, <_>::default()));
-        match half {
-            BridgeHalf::Up => {
-                grpc_bridge_client(
-                    message_sink,
-                    bridge_out,
-                    id.up.clone(),
-                    id.down.clone(),
-                    *up,
-                    spawn,
-                )
-                .await
+        let mut errors = vec![];
+        let try_bridge = |addr: SocketAddr| -> BoxFuture<Result<Bridge<G>, Error>> {
+            let spawn = &spawn;
+            async move {
+                let uri = Uri::builder()
+                    .scheme("http")
+                    .authority(&addr.to_string() as &str)
+                    .path_and_query("/")
+                    .build()
+                    .map_err(Error::Uri)?;
+                let mut client = wire::bridge_client::BridgeClient::connect(uri)
+                    .await
+                    .map_err(Error::Transport)?;
+                let (message_sink, bridge_in) = std_channel(4096);
+                let bridge_out = client
+                    .channel(Request::new(bridge_in.map(wire::RawBridgeMessage::from)))
+                    .await
+                    .map_err(|e| Error::Net(e, <_>::default()))?
+                    .into_inner()
+                    .map_err(|e| Error::Net(e, <_>::default()));
+                match half {
+                    BridgeHalf::Up => {
+                        grpc_bridge_client(
+                            message_sink,
+                            bridge_out,
+                            id.up.clone(),
+                            id.down.clone(),
+                            *up,
+                            spawn,
+                        )
+                        .await
+                    }
+                    BridgeHalf::Down => {
+                        grpc_bridge_client(
+                            message_sink,
+                            bridge_out,
+                            id.down.clone(),
+                            id.up.clone(),
+                            *down,
+                            spawn,
+                        )
+                        .await
+                    }
+                }
             }
-            BridgeHalf::Down => {
-                grpc_bridge_client(
-                    message_sink,
-                    bridge_out,
-                    id.down.clone(),
-                    id.up.clone(),
-                    *down,
-                    spawn,
-                )
-                .await
+            .boxed()
+        };
+        for addr in addr {
+            match try_bridge(addr.clone()).await {
+                Ok(bridge) => return Ok(bridge),
+                Err(e) => errors.push(e),
             }
         }
+        Err(Error::Other(Box::new(GrpcBridgeError(errors))))
     }
 }
 
@@ -726,7 +750,7 @@ where
                     id.up.clone(),
                     id.down.clone(),
                     *up,
-                    spawn,
+                    &spawn,
                 )
                 .await
             }
@@ -737,7 +761,7 @@ where
                     id.down.clone(),
                     id.up.clone(),
                     *down,
-                    spawn,
+                    &spawn,
                 )
                 .await
             }

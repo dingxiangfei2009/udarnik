@@ -46,8 +46,8 @@ use sss::{
     },
     mceliece::{McElieceCiphertext, McElieceKEM65536PrivateKey, McElieceKEM65536PublicKey},
 };
-use typenum::Unsigned;
 use thiserror::Error;
+use typenum::Unsigned;
 
 use crate::{
     bridge::{grpc, BridgeHalf, ConstructibleBridge},
@@ -188,7 +188,7 @@ pub enum BridgeType {
 
 #[derive(Clone, Debug, From)]
 pub struct GrpcBridge {
-    pub addr: SocketAddr,
+    pub addr: Vec<SocketAddr>,
     pub id: BridgeId,
     pub up: [u8; 32],
     pub down: [u8; 32],
@@ -1274,7 +1274,8 @@ where
             .aead
             .encrypt(GenericArray::from_slice(&nonce), &payload[..])
             .expect("correct key sizes and bounds");
-        let mut mac = HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
+        let mut mac =
+            HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
         mac.input(&nonce);
         mac.input(&(buf.len() as u64).to_le_bytes());
         mac.input(&buf);
@@ -1297,7 +1298,8 @@ where
                 },
             )
             .expect("correct key sizes and bounds");
-        let mut mac = HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
+        let mut mac =
+            HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
         mac.input(&nonce);
         mac.input(&(tag.len() as u64).to_le_bytes());
         mac.input(&tag);
@@ -1314,7 +1316,8 @@ where
         let mac_code = &data[..mac_length];
         let nonce = &data[mac_length..mac_length + 12];
         let data = &data[mac_length + 12..];
-        let mut mac = HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
+        let mut mac =
+            HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
         mac.input(&nonce);
         mac.input(&(data.len() as u64).to_le_bytes());
         mac.input(data);
@@ -1338,7 +1341,8 @@ where
         let nonce = &data[mac_length..mac_length + 12];
         let data = &data[mac_length + 12..];
         let tag = tag.into_bytes();
-        let mut mac = HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
+        let mut mac =
+            HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
         mac.input(&nonce);
         mac.input(&(tag.len() as u64).to_le_bytes());
         mac.input(&tag);
