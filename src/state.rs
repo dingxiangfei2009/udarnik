@@ -783,9 +783,9 @@ where
     where
         S: Spawn + Clone + Send + Sync + 'static,
     {
+        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         // TODO: proposal
         let proposals = self.as_ref().construct_bridge_proposals(spawn).await;
-        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
