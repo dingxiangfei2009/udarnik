@@ -20,13 +20,17 @@ use async_trait::async_trait;
 use backtrace::Backtrace as Bt;
 use chacha20poly1305::ChaCha20Poly1305;
 use futures::{
-    channel::mpsc::{channel as std_channel, Sender as StdSender},
+    channel::{
+        mpsc::{channel as std_channel, Sender as StdSender},
+        oneshot,
+    },
     future::BoxFuture,
     prelude::*,
     select,
 };
 use generic_array::GenericArray;
 use http::Uri;
+use log::info;
 use log::{error, trace};
 use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
@@ -251,16 +255,15 @@ where
     }
 }
 
-pub async fn bridge<S>(
-    spawn: S,
-) -> Result<
-    (
-        BridgeId,
-        GrpcParams,
-        Box<dyn Future<Output = ()> + Send + Sync + Unpin>,
-    ),
-    GenericError,
->
+pub struct GrpcBridgeConstruction {
+    pub id: BridgeId,
+    pub params: GrpcParams,
+    pub kill_switch: oneshot::Sender<()>,
+    pub driver: Box<dyn Future<Output = ()> + Send + Sync + Unpin>,
+}
+
+/// Construct a bridge server
+pub async fn bridge<S>(spawn: S) -> Result<GrpcBridgeConstruction, GenericError>
 where
     S: Spawn + Clone + Send + Sync + 'static,
     S::Error: 'static,
@@ -325,18 +328,26 @@ where
     };
     let progress = Box::pin(progress) as Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
     let mut progress = progress.fuse();
+    let (kill_switch, kill_signal) = oneshot::channel();
     let service = async move {
         select! {
             _ = progress => (),
             _ = service => (),
             _ = accept => (),
+            kill_signal = kill_signal.fuse() => {
+                match kill_signal {
+                    Ok(_) => info!("bridge server: killed"),
+                    Err(_) => info!("bridge server: killed since kill switch dropped"),
+                }
+            }
         }
     };
-    Ok((
+    Ok(GrpcBridgeConstruction {
         id,
         params,
-        Box::new(Box::pin(service) as Pin<Box<dyn Future<Output = ()> + Send + Sync>>),
-    ))
+        kill_switch,
+        driver: Box::new(Box::pin(service) as Pin<Box<dyn Future<Output = ()> + Send + Sync>>),
+    })
 }
 
 #[cfg(target_family = "unix")]

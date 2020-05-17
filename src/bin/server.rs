@@ -1,3 +1,6 @@
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static _GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use std::{
     collections::{BTreeMap, HashMap},
     convert::TryFrom,

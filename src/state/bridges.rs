@@ -48,6 +48,9 @@ where
             } else {
                 let (bridge, _, _) = future::select_all(polls).await;
                 trace!("{:?}: bridge: {:?} terminated", self.role, bridge);
+                if let Some(kill_switch) = self.bridge_kill_switches.lock().await.remove(&bridge) {
+                    let _ = kill_switch.send(());
+                }
                 self.bridge_polls.write().await.remove(&bridge);
                 self.send_counter.counters.write().await.remove(&bridge);
                 self.send_success_counter

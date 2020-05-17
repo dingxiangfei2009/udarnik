@@ -22,7 +22,10 @@ use backtrace::Backtrace as Bt;
 use blake2::Blake2b;
 use chacha20poly1305::ChaCha20Poly1305;
 use futures::{
-    channel::mpsc::{channel, Receiver, Sender},
+    channel::{
+        mpsc::{channel, Receiver, Sender},
+        oneshot::Sender as OneshotSender,
+    },
     future::{BoxFuture, Fuse},
     join,
     prelude::*,
@@ -567,10 +570,13 @@ pub struct Session<G> {
     // internal states
     error_reports: Sender<(u8, u64, HashSet<u8>)>,
     master_sink: Box<dyn Send + Sync + ClonableSink<Message<G>, GenericError>>,
+    bridge_kill_switches: Mutex<HashMap<BridgeId, OneshotSender<()>>>,
     bridge_builder: BridgeBuilder<G>,
     bridge_drivers: Pin<
         Arc<RwLock<FuturesUnordered<Fuse<Box<dyn Future<Output = ()> + Send + Sync + Unpin>>>>>,
     >,
+
+    new_tasks: Sender<Box<dyn 'static + Send + Sync + Unpin + Future<Output = ()>>>,
     stream_polls: Arc<RwLock<StreamPolls>>,
     stream_polls_waker_queue: WakerQueue,
     bridge_polls_waker_queue: WakerQueue,
@@ -641,6 +647,7 @@ where
         let (bridges_out_tx, bridges_out_rx) = channel(4096);
         let (bridges_in_tx, bridges_in_rx) = channel(4096);
         let bridge_drivers = FuturesUnordered::new();
+        let (new_tasks, new_tasks_rx) = channel(4096);
         let session = Arc::pin(Self {
             role,
             local_serial: <_>::default(),
@@ -662,9 +669,12 @@ where
             master_sink,
             bridge_builder: BridgeBuilder::new(),
             bridge_drivers: Arc::pin(RwLock::new(bridge_drivers)),
+            bridge_kill_switches: <_>::default(),
             stream_polls: <_>::default(),
             bridge_polls: <_>::default(),
             hall_of_fame: Arc::new(RwLock::new(LruCache::new(256))),
+
+            new_tasks,
 
             session_id: session_id.clone(),
             params,
@@ -679,6 +689,7 @@ where
                 bridges_out_rx,
                 bridges_in_tx,
                 bridges_in_rx,
+                new_tasks_rx,
                 timeout_generator.clone(),
                 spawn,
             )
@@ -711,46 +722,41 @@ where
         }
     }
 
-    async fn send_master_message(
-        self: Pin<&Self>,
-        message: Message<G>,
-    ) -> Result<(), SessionError> {
+    async fn send_raw_master_message(&self, message: Message<G>) -> Result<(), SessionError> {
         ClonableSink::clone_pin_box(&*self.master_sink)
             .send(message)
             .await
             .map_err(|e| SessionError::BrokenPipe(e, <_>::default()))
     }
 
-    async fn invite_bridge_proposal(self: Pin<&Self>) -> Result<(), SessionError> {
-        trace!("{:?}: invite bridge proposals", self.role);
+    async fn send_master_message(&self, message: ClientMessageVariant) -> Result<(), SessionError> {
         let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         let message = Message::Client(ClientMessage {
             serial,
             session: self.session_id.clone(),
             variant: Pomerium::encode_with_tag(
                 &*self.outbound_guard,
-                ClientMessageVariant::BridgeNegotiate(BridgeNegotiationMessage::ProposeAsk),
+                message,
                 &(self.session_id.clone(), serial),
             ),
         });
-        self.send_master_message(message).await
+        self.send_raw_master_message(message).await
+    }
+
+    async fn invite_bridge_proposal(self: Pin<&Self>) -> Result<(), SessionError> {
+        trace!("{:?}: invite bridge proposals", self.role);
+        self.send_master_message(ClientMessageVariant::BridgeNegotiate(
+            BridgeNegotiationMessage::ProposeAsk,
+        ))
+        .await
     }
 
     async fn reset_remote_stream(self: Pin<&Self>, stream: u8) -> Result<(), SessionError> {
-        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
-        let message = Message::Client(ClientMessage {
-            serial,
-            session: self.session_id.clone(),
-            variant: Pomerium::encode_with_tag(
-                &*self.outbound_guard,
-                ClientMessageVariant::Stream(StreamRequest::Reset {
-                    window: self.params.window,
-                    stream,
-                }),
-                &(self.session_id.clone(), serial),
-            ),
-        });
-        self.send_master_message(message).await
+        self.send_master_message(ClientMessageVariant::Stream(StreamRequest::Reset {
+            window: self.params.window,
+            stream,
+        }))
+        .await
     }
 
     async fn construct_bridge_proposals<S>(self: Pin<&Self>, spawn: S) -> Vec<BridgeAsk>
@@ -761,14 +767,23 @@ where
         let mut asks = vec![];
         for _ in 0..3 {
             trace!("{:?}: building bridge", self.role);
-            let (id, params, poll) = match grpc::bridge(spawn.clone()).await {
+            let grpc::GrpcBridgeConstruction {
+                id,
+                params,
+                driver,
+                kill_switch,
+            } = match grpc::bridge(spawn.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!("{:?}: bridge engineer: {}", self.role, e);
                     continue;
                 }
             };
-            self.bridge_drivers.read().await.push(poll.fuse());
+            self.bridge_kill_switches
+                .lock()
+                .await
+                .insert(id.clone(), kill_switch);
+            self.bridge_drivers.read().await.push(driver.fuse());
             trace!("{:?}: bridge constructed", self.role);
             asks.push(BridgeAsk {
                 r#type: BridgeType::Grpc(params),
@@ -779,32 +794,27 @@ where
         asks
     }
 
-    async fn answer_ask_proposal<S>(self: Pin<&Self>, spawn: S) -> Result<(), SessionError>
+    async fn answer_ask_proposal<S>(self: Pin<Arc<Self>>, spawn: S) -> Result<(), SessionError>
     where
         S: Spawn + Clone + Send + Sync + 'static,
     {
-        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
         // TODO: proposal
+        if let KeyExchangeRole::Anke = self.role {
+            warn!("{:?}: I cannot build a bridge %)", self.role);
+            return Ok(());
+        }
         let proposals = self.as_ref().construct_bridge_proposals(spawn).await;
-        let message = Message::Client(ClientMessage {
-            serial,
-            session: self.session_id.clone(),
-            variant: Pomerium::encode_with_tag(
-                &*self.outbound_guard,
-                ClientMessageVariant::BridgeNegotiate(BridgeNegotiationMessage::AskProposal(
-                    proposals,
-                )),
-                &(self.session_id.clone(), serial),
-            ),
-        });
-        self.send_master_message(message).await
+        self.send_master_message(ClientMessageVariant::BridgeNegotiate(
+            BridgeNegotiationMessage::AskProposal(proposals),
+        ))
+        .await
     }
 
     fn update_local_serial(&self, serial: u64) -> u64 {
         let serial = serial + 1;
         loop {
             let local_serial = self.local_serial.load(Ordering::Relaxed);
-            if Wrapping(serial) - Wrapping(serial) < Wrapping(1 << 63) {
+            if Wrapping(local_serial) - Wrapping(serial) < Wrapping(1 << 63) {
                 break local_serial;
             } else if self
                 .local_serial
@@ -852,22 +862,14 @@ where
                 &tag,
             ),
         });
-        self.send_master_message(message).await
+        self.send_raw_master_message(message).await
     }
 
     async fn ask_bridge(self: Pin<&Self>, proposals: Vec<BridgeAsk>) -> Result<(), SessionError> {
-        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
-        let tag = (self.session_id.clone(), serial);
-        let message = Message::Client(ClientMessage {
-            serial,
-            session: self.session_id.clone(),
-            variant: Pomerium::encode_with_tag(
-                &*self.outbound_guard,
-                ClientMessageVariant::BridgeNegotiate(BridgeNegotiationMessage::Ask(proposals)),
-                &tag,
-            ),
-        });
-        self.send_master_message(message).await
+        self.send_master_message(ClientMessageVariant::BridgeNegotiate(
+            BridgeNegotiationMessage::Ask(proposals),
+        ))
+        .await
     }
 
     fn assert_valid_serial(&self, serial: u64) -> Result<u64, u64> {
@@ -881,8 +883,6 @@ where
     }
 
     async fn answer_bridge_health_query(self: Pin<&Self>) -> Result<(), SessionError> {
-        let serial = self.remote_serial.fetch_add(1, Ordering::Relaxed);
-        let tag = (self.session_id.clone(), serial);
         let health = self
             .receive_counter
             .counters
@@ -891,16 +891,10 @@ where
             .iter()
             .map(|(id, recvs)| (id.clone(), recvs.load(Ordering::Relaxed)))
             .collect();
-        let message = Message::Client(ClientMessage {
-            serial,
-            session: self.session_id.clone(),
-            variant: Pomerium::encode_with_tag(
-                &*self.outbound_guard,
-                ClientMessageVariant::BridgeNegotiate(BridgeNegotiationMessage::Health(health)),
-                &tag,
-            ),
-        });
-        self.send_master_message(message).await
+        self.send_master_message(ClientMessageVariant::BridgeNegotiate(
+            BridgeNegotiationMessage::Health(health),
+        ))
+        .await
     }
 
     async fn process_stream<T: 'static + Send + Future<Output = ()>>(
@@ -913,6 +907,7 @@ where
         bridges_out_rx: Receiver<BridgeMessage>,
         bridges_in_tx: Sender<(BridgeId, BridgeMessage)>,
         bridges_in_rx: Receiver<(BridgeId, BridgeMessage)>,
+        mut new_tasks: Receiver<Box<dyn 'static + Send + Sync + Unpin + Future<Output = ()>>>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
         spawn: impl Spawn + Clone + Send + Sync + 'static,
     ) -> Result<(), SessionError> {
@@ -1012,6 +1007,33 @@ where
             })
             .boxed()
             .fuse();
+
+        let mut poll_tasks = spawn
+            .spawn(async move {
+                let mut tasks = FuturesUnordered::new();
+                loop {
+                    select! {
+                        r = tasks.next() => {
+                            if let None = r {
+                                if let Some(task) = new_tasks.next().await {
+                                    tasks.push(task);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        task = new_tasks.next() => {
+                            if let Some(task) = task {
+                                tasks.push(task);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .boxed()
+            .fuse();
         select_biased! {
             result = error_reports => match result {
                 Ok(Err(e)) => {
@@ -1058,7 +1080,8 @@ where
                     Ok(())
                 }
                 _ => Ok(()),
-            }
+            },
+            _ = poll_tasks => Ok(()),
         }
     }
 }

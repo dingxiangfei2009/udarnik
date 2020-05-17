@@ -44,11 +44,24 @@ where
                 }
             };
 
+            match variant {
+                ClientMessageVariant::Ok | ClientMessageVariant::Err => {
+                    trace!("{:?}: peer answers", self.role);
+                    self.update_remote_serial(serial);
+                    progress
+                        .send(())
+                        .await
+                        .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?;
+                    continue;
+                }
+                _ => {}
+            }
+
             // Message can be valid but old.
             if let Err(local_serial) = self.assert_valid_serial(serial) {
                 info!(
-                    "{:?}: outdated serial, should be at least {}",
-                    self.role, local_serial
+                    "{:?}: outdated serial {}, should be at least {}, message: {:?}",
+                    self.role, serial, local_serial, variant
                 );
                 self.as_ref().notify_serial(local_serial, true).await?;
                 continue;
@@ -56,52 +69,13 @@ where
 
             match variant {
                 ClientMessageVariant::BridgeNegotiate(negotiation) => {
-                    trace!("{:?}: incoming bridge negotiation message", self.role);
-                    match negotiation {
-                        BridgeNegotiationMessage::ProposeAsk => {
-                            info!("{:?}: peer wants new bridges", self.role);
-                            self.as_ref().answer_ask_proposal(spawn.clone()).await?
-                        }
-                        BridgeNegotiationMessage::Ask(proposals) => {
-                            info!("{:?}: peer wants new bridge rendevous", self.role);
-                            Pin::clone(&self)
-                                .apply_proposal(proposals, bridges_in_tx.clone(), spawn.clone())
-                                .await;
-                        }
-                        BridgeNegotiationMessage::Retract(bridges_) => {
-                            info!("{:?}: peer wants to tear down bridges", self.role);
-                            {
-                                let mut bridge_polls = self.bridge_polls.write().await;
-                                for BridgeRetract(id) in &bridges_ {
-                                    bridge_polls.remove(id);
-                                }
-                            }
-                            for BridgeRetract(id) in bridges_ {
-                                self.bridge_builder.kill(&id).await;
-                            }
-                        }
-                        BridgeNegotiationMessage::AskProposal(proposals) => {
-                            info!("{:?}: peer sends some bridge proposals", self.role);
-                            let asks = Pin::clone(&self)
-                                .apply_proposal(proposals, bridges_in_tx.clone(), spawn.clone())
-                                .await;
-                            self.as_ref().ask_bridge(asks).await?
-                        }
-                        BridgeNegotiationMessage::QueryHealth => {
-                            info!("{:?}: peer queries bridge health", self.role);
-                            self.as_ref().answer_bridge_health_query().await?
-                        }
-                        BridgeNegotiationMessage::Health(health) => {
-                            info!("{:?}: peer answers bridge health", self.role);
-                            let mut counters = self.send_success_counter.counters.write().await;
-                            for (id, count) in health {
-                                counters
-                                    .entry(id)
-                                    .or_default()
-                                    .fetch_add(count, Ordering::Relaxed);
-                            }
-                        }
-                    }
+                    Pin::clone(&self)
+                        .handle_bridge_negotiation(
+                            negotiation,
+                            bridges_in_tx.clone(),
+                            spawn.clone(),
+                        )
+                        .await?
                 }
                 ClientMessageVariant::Stream(request) => match request {
                     StreamRequest::Reset { stream, window } => {
@@ -124,14 +98,7 @@ where
                         self.stream_polls_waker_queue.try_notify_all();
                     }
                 },
-                ClientMessageVariant::Ok | ClientMessageVariant::Err => {
-                    trace!("{:?}: peer answers", self.role);
-                    self.update_remote_serial(serial);
-                    progress
-                        .send(())
-                        .await
-                        .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?;
-                }
+                _ => {}
             }
             self.as_ref()
                 .notify_serial(self.update_local_serial(serial), false)
@@ -140,6 +107,74 @@ where
                 .send(())
                 .await
                 .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?;
+        }
+        Ok(())
+    }
+
+    async fn handle_bridge_negotiation(
+        self: Pin<Arc<Self>>,
+        negotiation: BridgeNegotiationMessage,
+        bridges_in_tx: Sender<(BridgeId, BridgeMessage)>,
+        spawn: impl Spawn + Clone + Send + Sync + 'static,
+    ) -> Result<(), SessionError> {
+        trace!("{:?}: incoming bridge negotiation message", self.role);
+        match negotiation {
+            BridgeNegotiationMessage::ProposeAsk => {
+                info!("{:?}: peer wants new bridges", self.role);
+                self.new_tasks
+                    .clone()
+                    .send(Box::new(Box::pin(async move {
+                        if let Err(e) = self.answer_ask_proposal(spawn).await {
+                            error!("answer_ask_proposal: {:?}", e);
+                        }
+                    })) as Box<_>)
+                    .await
+                    .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?;
+            }
+            BridgeNegotiationMessage::Ask(proposals) => {
+                info!("{:?}: peer wants new bridge rendevous", self.role);
+                Pin::clone(&self)
+                    .apply_proposal(proposals, bridges_in_tx, spawn)
+                    .await;
+            }
+            BridgeNegotiationMessage::Retract(bridges_) => {
+                info!("{:?}: peer wants to tear down bridges", self.role);
+                {
+                    let mut bridge_polls = self.bridge_polls.write().await;
+                    for BridgeRetract(id) in &bridges_ {
+                        bridge_polls.remove(id);
+                    }
+                }
+                let mut bridge_kill_switches = self.bridge_kill_switches.lock().await;
+                for BridgeRetract(id) in bridges_ {
+                    if let Some(kill_switch) = bridge_kill_switches.remove(&id) {
+                        if let Err(e) = kill_switch.send(()) {
+                            warn!("killing bridge {:?}: {:?}", id, e);
+                        }
+                    }
+                }
+            }
+            BridgeNegotiationMessage::AskProposal(proposals) => {
+                info!("{:?}: peer sends some bridge proposals", self.role);
+                let asks = Pin::clone(&self)
+                    .apply_proposal(proposals, bridges_in_tx, spawn)
+                    .await;
+                self.as_ref().ask_bridge(asks).await?
+            }
+            BridgeNegotiationMessage::QueryHealth => {
+                info!("{:?}: peer queries bridge health", self.role);
+                self.as_ref().answer_bridge_health_query().await?
+            }
+            BridgeNegotiationMessage::Health(health) => {
+                info!("{:?}: peer answers bridge health", self.role);
+                let mut counters = self.send_success_counter.counters.write().await;
+                for (id, count) in health {
+                    counters
+                        .entry(id)
+                        .or_default()
+                        .fetch_add(count, Ordering::Relaxed);
+                }
+            }
         }
         Ok(())
     }
