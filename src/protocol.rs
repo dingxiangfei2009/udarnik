@@ -398,7 +398,7 @@ impl Verifiable for RawShard {
     fn verify(self, proof: Self::Proof) -> Result<Self::Output, Self::Error> {
         let RawShard { raw_data } = self;
 
-        let aead = ChaCha20Poly1305::new(GenericArray::clone_from_slice(&proof.key));
+        let aead = ChaCha20Poly1305::new(&GenericArray::clone_from_slice(&proof.key));
         let aad = proof.to_aad();
         let data = aead
             .decrypt(
@@ -458,15 +458,15 @@ impl ShardState {
         word_pos += id as u128;
         rng.set_word_pos(word_pos);
         let mut sha3 = Sha3_512::new();
-        sha3.input(&rng.next_u64().to_le_bytes());
-        sha3.input(b",");
-        sha3.input(&id.to_le_bytes());
-        sha3.input(b";");
-        sha3.input(&self.key);
-        sha3.input(b", stream key ");
-        sha3.input(&self.stream_key);
+        sha3.update(&rng.next_u64().to_le_bytes());
+        sha3.update(b",");
+        sha3.update(&id.to_le_bytes());
+        sha3.update(b";");
+        sha3.update(&self.key);
+        sha3.update(b", stream key ");
+        sha3.update(&self.stream_key);
         let mut result = [0; 32];
-        for chunk in sha3.result().chunks(32) {
+        for chunk in sha3.finalize().chunks(32) {
             for (r, c) in result.iter_mut().zip(chunk) {
                 *r ^= c
             }
@@ -512,7 +512,7 @@ impl Shard {
         state: &ShardState,
     ) -> (RawShard, RawShardId) {
         let proof = self.generate_shard_id(serial, state);
-        let aead = ChaCha20Poly1305::new(GenericArray::clone_from_slice(&proof.key));
+        let aead = ChaCha20Poly1305::new(&GenericArray::clone_from_slice(&proof.key));
         let aad = proof.to_aad();
 
         let mut data = vec![];

@@ -367,7 +367,7 @@ where
             .chain(&self.session_key)
             .chain(b", stream=")
             .chain(&[stream])
-            .result()
+            .finalize()
             .chunks(32)
         {
             for (s, c) in chunk.iter().zip(shard_state.stream_key.iter_mut()) {

@@ -162,7 +162,7 @@ where
                 AnkeSessionKeyPartR(&anke_random),
             );
             let shared_key = anke_part_mix.reconciliate(&reconciliator);
-            let mut v = BitVec::<LittleEndian, u8>::new();
+            let mut v = BitVec::<Lsb0, u8>::new();
             v.extend(shared_key.iter().copied());
             v.into_vec()
         }
@@ -379,7 +379,7 @@ where
     );
     let reconciliator = boris_part_mix.reconciliator();
     let shared_key = boris_part_mix.reconciliate(&reconciliator);
-    let mut v = BitVec::<LittleEndian, u8>::new();
+    let mut v = BitVec::<Lsb0, u8>::new();
     v.extend(shared_key.iter().copied());
     let shared_key = v.into_vec();
 

@@ -132,7 +132,7 @@ impl<S: Spawn> BridgeServer<S> {
         } else {
             return Err(Status::aborted("broken pipe"));
         };
-        let aead = Arc::pin(ChaCha20Poly1305::new(*GenericArray::from_slice(&key)));
+        let aead = Arc::pin(ChaCha20Poly1305::new(GenericArray::from_slice(&key)));
         let aead_ = Pin::clone(&aead);
         let nonce_ = Pin::clone(&nonce);
         let progress = self.progress.clone();
@@ -262,7 +262,7 @@ pub struct GrpcBridgeConstruction {
     pub driver: Box<dyn Future<Output = ()> + Send + Sync + Unpin>,
 }
 
-/// Construct a bridge server
+/// Construct a TCP GRPC bridge server
 pub async fn bridge<S>(spawn: S) -> Result<GrpcBridgeConstruction, GenericError>
 where
     S: Spawn + Clone + Send + Sync + 'static,
@@ -559,7 +559,7 @@ where
             error!("broken pipe: {}", e);
             Error::Pipe(<_>::default())
         })?;
-    let aead = Arc::pin(ChaCha20Poly1305::new(*GenericArray::from_slice(&key)));
+    let aead = Arc::pin(ChaCha20Poly1305::new(GenericArray::from_slice(&key)));
     let nonce = Arc::pin(nonce);
     let (tx, message_sink_transform) = std_channel(4096);
     let poll = spawn

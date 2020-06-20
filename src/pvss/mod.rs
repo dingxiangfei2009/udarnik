@@ -1,6 +1,6 @@
 use curve25519_dalek::{constants, edwards::EdwardsPoint, scalar::Scalar, traits::Identity};
 use rand::{CryptoRng, Error as RngError, RngCore};
-use sha3::digest::{FixedOutput, Input};
+use sha3::digest::Digest;
 use sha3::Sha3_256;
 use thiserror::Error;
 
@@ -41,12 +41,6 @@ pub enum Error {
     #[error("invalid dealer proof: {0}")]
     InvalidDealerProof(dleq::Error),
 }
-
-// impl From<RngError> for Error {
-//     fn from(err: RngError) -> Self {
-//         Error::Rng(err)
-//     }
-// }
 
 pub struct Polynomial(Vec<Scalar>);
 
@@ -163,16 +157,16 @@ impl Challenge {
         let Commits(ref commits) = commits;
         let mut sha3 = Sha3_256::default();
         for commit in commits {
-            sha3.input(commit.to_montgomery().as_bytes());
+            sha3.update(commit.to_montgomery().as_bytes());
         }
         for SignedSeed(ref signed_seed) in dealer_signed_seeds {
-            sha3.input(signed_seed.to_montgomery().as_bytes());
+            sha3.update(signed_seed.to_montgomery().as_bytes());
         }
         for shard in shards {
-            sha3.input(shard.value.to_montgomery().as_bytes());
+            sha3.update(shard.value.to_montgomery().as_bytes());
         }
         let mut challenge = [0u8; 32];
-        challenge.copy_from_slice(sha3.fixed_result().as_slice());
+        challenge.copy_from_slice(sha3.finalize().as_slice());
         Self(Scalar::from_bytes_mod_order(challenge))
     }
 }
@@ -356,18 +350,18 @@ impl CustodianProof {
         let custodian_key = custodian_base * private_key;
 
         let mut sha3 = Sha3_256::default();
-        sha3.input(shard_seed.0.to_montgomery().as_bytes());
-        sha3.input(custodian_seed.0.to_montgomery().as_bytes());
-        sha3.input(
+        sha3.update(shard_seed.0.to_montgomery().as_bytes());
+        sha3.update(custodian_seed.0.to_montgomery().as_bytes());
+        sha3.update(
             constants::ED25519_BASEPOINT_POINT
                 .to_montgomery()
                 .as_bytes(),
         );
-        sha3.input(recovered.to_montgomery().as_bytes());
-        sha3.input(custodian_key.to_montgomery().as_bytes());
-        sha3.input(encrypted.to_montgomery().as_bytes());
+        sha3.update(recovered.to_montgomery().as_bytes());
+        sha3.update(custodian_key.to_montgomery().as_bytes());
+        sha3.update(encrypted.to_montgomery().as_bytes());
         let mut challenge = [0u8; 32];
-        challenge.copy_from_slice(sha3.fixed_result().as_slice());
+        challenge.copy_from_slice(sha3.finalize().as_slice());
         let challenge = Scalar::from_bytes_mod_order(challenge);
         let response = seed.0 - challenge * private_key;
         let encrypted = encrypted.clone();

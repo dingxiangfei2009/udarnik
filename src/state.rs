@@ -21,6 +21,7 @@ use async_std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use backtrace::Backtrace as Bt;
 use blake2::Blake2b;
 use chacha20poly1305::ChaCha20Poly1305;
+use crypto_mac::NewMac;
 use futures::{
     channel::{
         mpsc::{channel, Receiver, Sender},
@@ -88,9 +89,9 @@ impl From<&'_ Init> for InitIdentity {
     fn from(Init(init): &'_ Init) -> Self {
         let mut digest = sha3::Sha3_512::new();
         for bytes in init.into_coeff_bytes() {
-            digest.input(bytes);
+            digest.update(bytes);
         }
-        Self(format!("{:x}", digest.result()))
+        Self(format!("{:x}", digest.finalize()))
     }
 }
 
@@ -100,20 +101,20 @@ pub struct Identity(String);
 impl From<&'_ PublicKey> for Identity {
     fn from(PublicKey(key): &'_ PublicKey) -> Self {
         let mut digest = sha3::Sha3_512::new();
-        digest.input("rlwe:");
+        digest.update("rlwe:");
         for bytes in key.into_coeff_bytes() {
-            digest.input(bytes);
+            digest.update(bytes);
         }
-        Self(format!("{:x}", digest.result()))
+        Self(format!("{:x}", digest.finalize()))
     }
 }
 
 impl From<&'_ McElieceKEM65536PublicKey> for Identity {
     fn from(key: &'_ McElieceKEM65536PublicKey) -> Self {
         let mut digest = sha3::Sha3_512::new();
-        digest.input("mceliece_kem_65536:");
-        digest.input(serde_json::to_string(key).unwrap());
-        Self(format!("{:x}", digest.result()))
+        digest.update("mceliece_kem_65536:");
+        digest.update(serde_json::to_string(key).unwrap());
+        Self(format!("{:x}", digest.finalize()))
     }
 }
 
@@ -1219,7 +1220,7 @@ impl SafeGuard {
         mackey.extend(&enckey);
         mackey.extend(", hmac, blake2b".as_bytes());
         Self {
-            aead: ChaCha20Poly1305::new(*GenericArray::from_slice(&enckey)),
+            aead: ChaCha20Poly1305::new(GenericArray::from_slice(&enckey)),
             mackey,
         }
     }
@@ -1299,10 +1300,16 @@ where
             .expect("correct key sizes and bounds");
         let mut mac =
             HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
-        mac.input(&nonce);
-        mac.input(&(buf.len() as u64).to_le_bytes());
-        mac.input(&buf);
-        buf.splice(..0, mac.result().code().into_iter().chain(nonce.to_vec()));
+        mac.update(&nonce);
+        mac.update(&(buf.len() as u64).to_le_bytes());
+        mac.update(&buf);
+        buf.splice(
+            ..0,
+            mac.finalize()
+                .into_bytes()
+                .into_iter()
+                .chain(nonce.to_vec()),
+        );
         buf
     }
     fn encode_with_tag(&self, payload: P, tag: &T) -> Vec<u8> {
@@ -1323,12 +1330,18 @@ where
             .expect("correct key sizes and bounds");
         let mut mac =
             HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
-        mac.input(&nonce);
-        mac.input(&(tag.len() as u64).to_le_bytes());
-        mac.input(&tag);
-        mac.input(&(buf.len() as u64).to_le_bytes());
-        mac.input(&buf);
-        buf.splice(..0, mac.result().code().into_iter().chain(nonce.to_vec()));
+        mac.update(&nonce);
+        mac.update(&(tag.len() as u64).to_le_bytes());
+        mac.update(&tag);
+        mac.update(&(buf.len() as u64).to_le_bytes());
+        mac.update(&buf);
+        buf.splice(
+            ..0,
+            mac.finalize()
+                .into_bytes()
+                .into_iter()
+                .chain(nonce.to_vec()),
+        );
         buf
     }
     fn decode(&self, data: &[u8]) -> Result<P, Self::Error> {
@@ -1341,9 +1354,9 @@ where
         let data = &data[mac_length + 12..];
         let mut mac =
             HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
-        mac.input(&nonce);
-        mac.input(&(data.len() as u64).to_le_bytes());
-        mac.input(data);
+        mac.update(&nonce);
+        mac.update(&(data.len() as u64).to_le_bytes());
+        mac.update(data);
         mac.verify(mac_code)?;
         let buf = self
             .aead
@@ -1366,11 +1379,11 @@ where
         let tag = tag.into_bytes();
         let mut mac =
             HmacBlake2b::new_varkey(&self.mackey).expect("should except variable length key");
-        mac.input(&nonce);
-        mac.input(&(tag.len() as u64).to_le_bytes());
-        mac.input(&tag);
-        mac.input(&(data.len() as u64).to_le_bytes());
-        mac.input(data);
+        mac.update(&nonce);
+        mac.update(&(tag.len() as u64).to_le_bytes());
+        mac.update(&tag);
+        mac.update(&(data.len() as u64).to_le_bytes());
+        mac.update(data);
         mac.verify(mac_code)?;
         let buf = self
             .aead
