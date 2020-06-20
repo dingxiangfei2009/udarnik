@@ -73,9 +73,8 @@ version = "0.2.0"
 features = ["macros", "io-driver", "time", "rt-threaded"]
 
 [dependencies.sss]
-# git = "https://github.com/dingxiangfei2009/sss"
-# rev = "8b6039b16edd2d8bec4ea68047f66bbbc4d8f54a"
-path = "../sss"
+git = "https://github.com/dingxiangfei2009/sss"
+rev = "af3cb38bcbc92094618cef68bf740dea242db11f"
 
 [build-dependencies]
 prost-build = "0.6"

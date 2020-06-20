@@ -30,6 +30,11 @@ where
             };
             if polls.is_empty() {
                 drop(polls);
+                if let KeyExchangeRole::Boris = self.role {
+                    // I am server. I don't ask clients to build bridges for me.
+                    timeout_generator(Duration::new(1, 0)).await;
+                    continue;
+                }
                 trace!("{:?}: poll_bridges: no bridges, inviting", self.role);
                 let now = Instant::now();
                 let duration_since = now.duration_since(last_invite);

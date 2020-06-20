@@ -149,18 +149,6 @@ where
         .and_then(|m| async { Message::<G>::try_from(m).map_err(|e| Box::new(e) as GenericError) })
         .map_err(BoxError)
         .boxed();
-    // let kex = KeyExchange {
-    //     retries,
-    //     init_db: init_db.clone(),
-    //     identity_db,
-    //     allowed_identities,
-    //     identity_sequence,
-    //     session_key_part_sampler: SessionKeyPart::parallel_sampler::<R>(2, 4096),
-    //     anke_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
-    //     boris_session_key_part_mix_sampler: SessionKeyPartMix::parallel_sampler::<R>(2, 4096),
-    //     anke_data,
-    //     boris_data,
-    // };
     let session_bootstrap = key_exchange_anke::<_, H, _, _, _, _, _>(
         &kex,
         message_stream,
