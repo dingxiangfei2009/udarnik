@@ -432,8 +432,10 @@ impl From<BridgeType> for wire::BridgeType {
                         if #[cfg(target_family = "unix")] {
                             use std::os::unix::ffi::OsStrExt;
                             path = addr.as_os_str().as_bytes().to_vec();
+                        } else if #[cfg(target_family = "windows")] {
+                            use std::os::windows::ffi::OsStrExt;
+                            path = addr.as_os_str().as_bytes().to_vec();
                         } else {
-                            todo!("don't know handle this");
                             path = vec![];
                         }
                     };

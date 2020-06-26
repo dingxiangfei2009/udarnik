@@ -37,19 +37,7 @@ where
                             bridge_id
                         }
                     }) {
-                        if let Some(counter) =
-                            self.receive_counter.counters.read().await.get(&bridge_id)
-                        {
-                            counter.fetch_add(1, Ordering::Relaxed);
-                            return Ok(());
-                        }
-                        self.receive_counter
-                            .counters
-                            .write()
-                            .await
-                            .entry(bridge_id)
-                            .or_default()
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.bridge_state.inc_recv_counter(bridge_id).await;
                     }
                     progress
                         .send(())

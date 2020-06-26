@@ -1,7 +1,7 @@
 use core::fmt;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use std::{collections::VecDeque, sync::Mutex};
+use std::{collections::VecDeque, error::Error, sync::Mutex};
 
 use dyn_clone::{clone_box, DynClone};
 use futures::{
@@ -324,7 +324,9 @@ impl<T, E> Stream for TryFutureStream<T, E> {
 impl<T, E> Unpin for TryFutureStream<T, E> {}
 
 pub trait Spawn {
-    type Error: core::fmt::Debug + Send + Sync;
+    type Error: Error + Send + Sync;
+
+    /// Spawn task concurrently
     fn spawn<F, T>(
         &self,
         f: F,

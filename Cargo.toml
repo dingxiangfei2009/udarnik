@@ -65,7 +65,7 @@ features = ["tls"]
 version = "0.5"
 
 [dependencies.async-std]
-version = "1.0"
+version = "1.6"
 features = ["attributes", "unstable"]
 
 [dependencies.tokio]

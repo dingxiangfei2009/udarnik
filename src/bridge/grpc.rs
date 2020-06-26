@@ -26,7 +26,7 @@ use futures::{
     },
     future::BoxFuture,
     prelude::*,
-    select,
+    select_biased,
 };
 use generic_array::GenericArray;
 use http::Uri;
@@ -199,7 +199,7 @@ impl<S: Spawn> BridgeServer<S> {
             )
             .fuse();
         let mut down = Box::new(Box::pin(down));
-        select! {
+        select_biased! {
             r = up => match r {
                 Ok(Err(e)) => Err(e),
                 Err(e) => {
@@ -320,7 +320,7 @@ where
     };
     let progress = async move {
         loop {
-            select! {
+            select_biased! {
                 _ = progress.next().fuse() => trace!("bridge service: progress"),
                 _ = sleep(Duration::new(300, 0)).fuse() => break,
             }
@@ -330,7 +330,7 @@ where
     let mut progress = progress.fuse();
     let (kill_switch, kill_signal) = oneshot::channel();
     let service = async move {
-        select! {
+        select_biased! {
             _ = progress => (),
             _ = service => (),
             _ = accept => (),
@@ -412,7 +412,7 @@ where
     };
     let progress = async move {
         loop {
-            select! {
+            select_biased! {
                 _ = progress.next().fuse() => (),
                 _ = sleep(Duration::new(300, 0)).fuse() => break,
             }
@@ -422,7 +422,7 @@ where
     let mut progress = progress.fuse();
     let service = async move {
         let _tempdir = tempdir;
-        select! {
+        select_biased! {
             _ = progress => (),
             _ = service => (),
             _ = accept => (),

@@ -9,7 +9,7 @@ use futures::{
     channel::mpsc::{channel, Receiver, Sender},
     future::{pending, select_all},
     prelude::*,
-    select,
+    select_biased,
 };
 use log::{error, info, trace, warn};
 use rand::{CryptoRng, RngCore, SeedableRng};
@@ -76,7 +76,7 @@ where
                 match m? {
                     Message::SessionLogOn(logon) => {
                         if logon.challenge != orig_challenge {
-                            return Err(SessionError::SignOn("unexpected message".into()));
+                            return Err(SessionError::SignOn("incorrect challenge".into()));
                         }
                         let SessionState {
                             mut master_in,
@@ -87,7 +87,7 @@ where
                             if let Some(state) = sessions.get(&logon.session) {
                                 SessionState::clone(state)
                             } else {
-                                return Err(SessionError::SignOn("unexpected message".into()));
+                                return Err(SessionError::SignOn("no such session".into()));
                             }
                         };
                         let session = logon.session;
@@ -134,7 +134,7 @@ where
                                     Pin::from(Box::new(timeout_generator(Duration::new(300, 0)))
                                         as Box<dyn Future<Output = ()> + Send + Sync>)
                                     .fuse();
-                                select! {
+                                select_biased! {
                                     _ = progress_rx.next() => (),
                                     _ = timeout => break
                                 }
@@ -151,13 +151,13 @@ where
                             Box::new(progress) as Box<dyn Future<Output = ()> + Send + Sync>
                         )
                         .fuse();
-                        select! {
+                        select_biased! {
                             r = master_in => r?,
                             r = master_out => r?,
                             _ = progress => (),
                         }
                     }
-                    _ => return Err(SessionError::SignOn("unexpected message".into())),
+                    _ => return Err(SessionError::SignOn("unexpected message type".into())),
                 }
             }
             Ok(())
@@ -336,7 +336,7 @@ where
             let poll_progress_or_timeout = async move {
                 loop {
                     let mut timeout = timeout_generator(Duration::new(300, 0)).boxed().fuse();
-                    select! {
+                    select_biased! {
                         _ = progress.next().fuse() => (),
                         _ = timeout => break,
                         _ = poll => break,
@@ -363,7 +363,7 @@ where
                 select_all(polls.clone()).boxed()
             }
             .fuse();
-            select! {
+            select_biased! {
                 new_poll = poll_session.next() => {
                     if let Some(new_poll) = new_poll {
                         polls.push(new_poll.shared())
@@ -383,7 +383,7 @@ where
         .serve(addr)
         .boxed()
         .fuse();
-    select! {
+    select_biased! {
         r = service => r?,
         _ = poll_sessions => (),
         _ = new_sessions => (),

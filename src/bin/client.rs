@@ -26,7 +26,6 @@ use futures::{
     select,
     stream::repeat,
 };
-use http::Uri;
 use log::{error, info};
 use rand_chacha::ChaCha20Rng;
 use serde_json::from_reader;
@@ -35,7 +34,7 @@ use sss::{
     field::F2,
     galois::{GF65536NTower, GF65536N},
     goppa::{BinaryPacked, GoppaDecoder, GoppaEncoder},
-    lattice::{keygen, Init, PrivateKey, PublicKey, SigningKey},
+    lattice::{Init, PrivateKey, PublicKey},
     mceliece::{McElieceKEM65536PrivateKey, McElieceKEM65536PublicKey},
 };
 use structopt::StructOpt;
@@ -44,7 +43,6 @@ use udarnik::{
     client::{client, ClientBootstrap},
     keyman::{Error as KeyError, RawInit, RawPrivateKey, RawPublicKey},
     reference_seeder_chacha,
-    server::{server, ServerBootstrap},
     state::{
         Identity, InitIdentity, KeyExchangeAnkeIdentity, McElieceAnkeIdentity, Params,
         RLWEAnkeIdentity, SafeGuard,
@@ -212,7 +210,7 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
     };
 
     let spawn = TokioSpawn(handle.clone());
-    let (input, input_rx) = channel(4096);
+    let (mut input, input_rx) = channel(4096);
     let (output_tx, output) = channel(4096);
     let (terminate, terminate_rx) = oneshot();
     let client = client::<SafeGuard, ChaCha20Rng, Blake2b, _, _, _, _>(
@@ -233,15 +231,18 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
         |duration| tokio::time::delay_for(duration),
     );
     let client = handle.spawn(client);
-    // let stdin = stdin();
-    // let stdin = BufReader::new(stdin.lock().await);
     let stdin = handle.spawn(
-        repeat(vec![1; 1500])
-            .map(Ok)
-            .forward(input.clone().sink_map_err(Error::Pipe)),
+        async move {
+            loop {
+                input.send(vec![1; 1500]).await.unwrap();
+                tokio::time::delay_for(Duration::new(5, 0)).await;
+            }
+        }
+        // repeat(vec![1; 1500])
+        //     .map(Ok)
+        //     .forward(input.clone().sink_map_err(Error::Pipe)),
     );
-    let stdout = stdout();
-    let stdout = BufWriter::new(stdout.lock().await);
+    let stdout = BufWriter::new(stdout());
     let stdout = handle.spawn(
         output
             .map(Ok)
@@ -252,7 +253,7 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
             .map_ok(|_| ()),
     );
     select! {
-        r = stdin.fuse() => r.unwrap().unwrap(),
+        r = stdin.fuse() => (),
         r = client.fuse() => r.unwrap().unwrap(),
         r = stdout.fuse() => r.unwrap().unwrap(),
     }

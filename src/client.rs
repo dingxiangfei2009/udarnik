@@ -9,7 +9,7 @@ use futures::{
     },
     pin_mut,
     prelude::*,
-    select,
+    select_biased,
 };
 use http::Uri;
 use log::{error, info, trace};
@@ -182,8 +182,8 @@ where
         pin_mut!(master_in);
         let timeout_generator = timeout_generator_;
         loop {
-            select! {
-                _ = timeout_generator(Duration::new(300, 0)).fuse() =>
+            select_biased! {
+                _ = timeout_generator(Duration::new(60, 0)).fuse() =>
                     info!("client: reconnect to master to receive directives"),
                 r = master_in.as_mut().peek().fuse() =>
                     if let None = r {
@@ -239,7 +239,7 @@ where
             .fuse();
             let mut progress = async {
                 loop {
-                    select! {
+                    select_biased! {
                         () = progress_rx.select_next_some().fuse() => (),
                         () = timeout_generator(Duration::new(300, 0)).fuse() => {
                             error!("client: master pipe: close connection due to inactivity");
@@ -250,7 +250,7 @@ where
             }
             .boxed()
             .fuse();
-            select! {
+            select_biased! {
                 r = poll_send => if let Err(e) = r {
                     error!("client: {}", e)
                 },
@@ -269,7 +269,7 @@ where
         .fuse();
     let progress = async move {
         loop {
-            select! {
+            select_biased! {
                 () = progress.select_next_some().fuse() => (),
                 () = timeout_generator(Duration::new(300, 0)).fuse() => {
                     error!("client: stopping due to inactivity");
@@ -309,7 +309,7 @@ where
         .map_err(|e| ClientError::Spawn(format!("{:?}", e)))
         .boxed()
         .fuse();
-    select! {
+    select_biased! {
         r = master_adapter => r??,
         r = progress => r?,
         r = terminate => r.map_err(|_| ClientError::Pipe(<_>::default()))?,

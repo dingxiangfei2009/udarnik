@@ -12,8 +12,6 @@ where
     pub(super) async fn handle_master_messages<T>(
         self: Pin<Arc<Self>>,
         mut master_messages: Receiver<Message<G>>,
-        bridges_in_tx: Sender<(BridgeId, BridgeMessage)>,
-        bridges_out_tx: Sender<BridgeMessage>,
         mut progress: Sender<()>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
         spawn: impl Spawn + Clone + Send + Sync + 'static,
@@ -70,32 +68,15 @@ where
             match variant {
                 ClientMessageVariant::BridgeNegotiate(negotiation) => {
                     Pin::clone(&self)
-                        .handle_bridge_negotiation(
-                            negotiation,
-                            bridges_in_tx.clone(),
-                            spawn.clone(),
-                        )
+                        .handle_bridge_negotiation(negotiation, spawn.clone())
                         .await?
                 }
                 ClientMessageVariant::Stream(request) => match request {
                     StreamRequest::Reset { stream, window } => {
                         info!("{:?}: peer resets stream {}", self.role, stream,);
-                        let (session_stream, poll) = self.new_stream(
-                            stream,
-                            window,
-                            bridges_out_tx.clone(),
-                            progress.clone(),
-                            timeout_generator.clone(),
-                            spawn.clone(),
-                        );
-                        {
-                            self.stream_polls
-                                .write()
-                                .await
-                                .insert(stream, (session_stream, Box::pin(poll.shared())));
-                        }
+                        self.new_stream(stream, window, timeout_generator.clone(), spawn.clone())
+                            .await?;
                         info!("{:?}: stream {}: reset", self.role, stream);
-                        self.stream_polls_waker_queue.try_notify_all();
                     }
                 },
                 _ => {}
@@ -114,7 +95,6 @@ where
     async fn handle_bridge_negotiation(
         self: Pin<Arc<Self>>,
         negotiation: BridgeNegotiationMessage,
-        bridges_in_tx: Sender<(BridgeId, BridgeMessage)>,
         spawn: impl Spawn + Clone + Send + Sync + 'static,
     ) -> Result<(), SessionError> {
         trace!("{:?}: incoming bridge negotiation message", self.role);
@@ -133,32 +113,17 @@ where
             }
             BridgeNegotiationMessage::Ask(proposals) => {
                 info!("{:?}: peer wants new bridge rendevous", self.role);
-                Pin::clone(&self)
-                    .apply_proposal(proposals, bridges_in_tx, spawn)
-                    .await;
+                Pin::clone(&self).apply_proposal(proposals, spawn).await?;
             }
             BridgeNegotiationMessage::Retract(bridges_) => {
                 info!("{:?}: peer wants to tear down bridges", self.role);
-                {
-                    let mut bridge_polls = self.bridge_polls.write().await;
-                    for BridgeRetract(id) in &bridges_ {
-                        bridge_polls.remove(id);
-                    }
-                }
-                let mut bridge_kill_switches = self.bridge_kill_switches.lock().await;
                 for BridgeRetract(id) in bridges_ {
-                    if let Some(kill_switch) = bridge_kill_switches.remove(&id) {
-                        if let Err(e) = kill_switch.send(()) {
-                            warn!("killing bridge {:?}: {:?}", id, e);
-                        }
-                    }
+                    self.bridge_state.remove_bridge(&id).await
                 }
             }
             BridgeNegotiationMessage::AskProposal(proposals) => {
                 info!("{:?}: peer sends some bridge proposals", self.role);
-                let asks = Pin::clone(&self)
-                    .apply_proposal(proposals, bridges_in_tx, spawn)
-                    .await;
+                let asks = Pin::clone(&self).apply_proposal(proposals, spawn).await?;
                 self.as_ref().ask_bridge(asks).await?
             }
             BridgeNegotiationMessage::QueryHealth => {
@@ -167,13 +132,7 @@ where
             }
             BridgeNegotiationMessage::Health(health) => {
                 info!("{:?}: peer answers bridge health", self.role);
-                let mut counters = self.send_success_counter.counters.write().await;
-                for (id, count) in health {
-                    counters
-                        .entry(id)
-                        .or_default()
-                        .fetch_add(count, Ordering::Relaxed);
-                }
+                self.bridge_state.update_bridge_health(health).await;
             }
         }
         Ok(())
