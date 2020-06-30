@@ -14,7 +14,7 @@ where
         bridges_inward: Receiver<(BridgeId, BridgeMessage)>,
     ) {
         bridges_inward
-            .for_each_concurrent(4096, {
+            .for_each_concurrent(32, {
                 move |(bridge_id, inbound)| async move {
                     let report = match &inbound {
                         BridgeMessage::PayloadFeedback { .. } => None,

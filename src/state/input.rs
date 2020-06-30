@@ -13,7 +13,7 @@ where
         let stream_state = Pin::clone(&self.stream_state);
         input
             .map(Ok)
-            .try_for_each_concurrent(4096, {
+            .try_for_each_concurrent(2, {
                 move |input| {
                     let ss = Pin::clone(&stream_state);
                     async move { ss.send(input).await }

@@ -24,8 +24,9 @@ use udarnik::{
     reference_seeder_chacha,
     server::{server, ServerBootstrap},
     state::{
-        Identity, InitIdentity, KeyExchangeAnkeIdentity, KeyExchangeBorisIdentity,
-        McElieceBorisIdentity, Params, RLWEAnkeIdentity, RLWEBorisIdentity, SafeGuard,
+        BridgeConstructorParams, Identity, InitIdentity, KeyExchangeAnkeIdentity,
+        KeyExchangeBorisIdentity, McElieceBorisIdentity, Params, RLWEAnkeIdentity,
+        RLWEBorisIdentity, SafeGuard, TimeoutParams,
     },
     utils::TokioSpawn,
 };
@@ -75,6 +76,17 @@ async fn start(handle: tokio::runtime::Handle) {
                 ),
                 mc: <McElieceBorisIdentity<Blake2b>>::new(<_>::default(), <_>::default()),
             },
+            timeout_params: TimeoutParams {
+                stream_timeout: Duration::new(3600, 0),
+                stream_reset_timeout: Duration::new(60, 0),
+                send_cooldown: Duration::new(0, 150_000_000),
+                recv_timeout: Duration::new(5, 0),
+                invite_cooldown: Duration::new(30, 0),
+            },
+            bridge_constructor_params: BridgeConstructorParams {
+                ip_listener_address: "127.0.0.1".parse().unwrap(),
+                ip_listener_mask: 32,
+            },
         },
         new_channel_tx,
         reference_seeder_chacha,
@@ -106,6 +118,17 @@ async fn start(handle: tokio::runtime::Handle) {
                 vec![],
                 vec![],
             )),
+            timeout_params: TimeoutParams {
+                stream_timeout: Duration::new(3600, 0),
+                stream_reset_timeout: Duration::new(60, 0),
+                send_cooldown: Duration::new(0, 150_000_000),
+                recv_timeout: Duration::new(5, 0),
+                invite_cooldown: Duration::new(30, 0),
+            },
+            bridge_constructor_params: BridgeConstructorParams {
+                ip_listener_address: "127.0.0.1".parse().unwrap(),
+                ip_listener_mask: 32,
+            },
         },
         reference_seeder_chacha,
         input_rx,

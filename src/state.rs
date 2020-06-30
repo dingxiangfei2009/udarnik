@@ -10,7 +10,7 @@ use core::{
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error as StdError,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
 };
 
@@ -26,9 +26,9 @@ use futures::{
         oneshot::Sender as OneshotSender,
     },
     future::{AbortHandle, Abortable, BoxFuture, Fuse},
-    join,
+    join, pin_mut,
     prelude::*,
-    select_biased,
+    select, select_biased,
     stream::{iter, FuturesUnordered},
 };
 use generic_array::GenericArray;
@@ -37,6 +37,7 @@ use log::{debug, error, info, trace, warn};
 use lru::LruCache;
 use prost::Message as ProstMessage;
 use rand::{rngs::StdRng, seq::IteratorRandom, CryptoRng, RngCore, SeedableRng};
+use serde::{Deserialize, Serialize};
 use sha3::Digest;
 use sss::{
     artin::GF65536NPreparedMultipointEvalVZG,
@@ -206,6 +207,12 @@ pub struct UnixBridge {
 
 #[derive(Clone, Debug, From)]
 pub struct BridgeRetract(BridgeId);
+
+#[derive(Clone, Debug)]
+pub struct BridgeConstructorParams {
+    pub ip_listener_address: IpAddr,
+    pub ip_listener_mask: usize,
+}
 
 pub enum Message<G> {
     KeyExchange(KeyExchangeMessage),
@@ -559,15 +566,9 @@ pub struct Session<G> {
 
     bridge_state: Pin<Arc<BridgeState>>,
     stream_state: Pin<Arc<StreamState>>,
+    bridge_constructor_params: BridgeConstructorParams,
     pub session_id: SessionId,
     pub params: Params,
-}
-
-fn _session_is_sync<G>()
-where
-    G: Sync,
-    Session<G>: Sync,
-{
 }
 
 pub struct SessionStream {
@@ -581,18 +582,41 @@ pub struct SessionStream {
 type StreamPoll = Box<dyn Sync + ClonableSendableFuture<()> + Unpin>;
 
 struct StreamState {
-    streams: RwLock<HashMap<u8, SessionStream>>,
+    streams: RwLock<HashMap<u8, Arc<SessionStream>>>,
     new_stream_poll: Sender<StreamPoll>,
     stream_avail_mutex: Mutex<()>,
     stream_avail_cv: Condvar,
-    stream_timeout: Duration,
 
     session_progress: Sender<()>,
     bridge_outward: Sender<BridgeMessage>,
-    send_cooldown: Duration,
     codec: Arc<RSCodec>,
     error_reports: Sender<(u8, u64, HashSet<u8>)>,
     output: Sender<Vec<u8>>,
+
+    stream_timeout: Duration,
+    send_cooldown: Duration,
+    recv_timeout: Duration,
+}
+
+struct StreamTimeouts {
+    stream_timeout: Duration,
+    send_cooldown: Duration,
+    stream_reset_timeout: Duration,
+    recv_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Serialize, Deserialize)]
+pub struct TimeoutParams {
+    /// Timeout for streams with no progress
+    pub stream_timeout: Duration,
+    /// Cool down time for every extra shard sent after the threshold pack
+    pub send_cooldown: Duration,
+    /// Timeout for reseting stream if there is not one
+    pub stream_reset_timeout: Duration,
+    /// Timeout for head-of-line packet in the receive queue
+    pub recv_timeout: Duration,
+    /// Cool down time for inviting new bridge proposals if there is no bridge
+    pub invite_cooldown: Duration,
 }
 
 #[derive(Debug)]

@@ -11,6 +11,8 @@ where
 {
     pub fn new<T, S>(
         session_bootstrap: SessionBootstrap,
+        timeout_params: TimeoutParams,
+        bridge_constructor_params: BridgeConstructorParams,
         master_messages: Receiver<Message<G>>,
         master_sink: Box<dyn Send + Sync + ClonableSink<Message<G>, GenericError>>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
@@ -26,6 +28,13 @@ where
             session_key,
             session_id,
         } = session_bootstrap;
+        let TimeoutParams {
+            stream_timeout,
+            send_cooldown,
+            stream_reset_timeout,
+            recv_timeout,
+            invite_cooldown,
+        } = timeout_params;
         let (input_tx, input) = channel(4096);
         let (output, output_rx) = channel(4096);
         let (error_reports, error_reports_rx) = channel(4096);
@@ -36,7 +45,6 @@ where
         let bridge_drivers = FuturesUnordered::new();
         let (new_tasks, new_tasks_rx) = channel(4096);
         let (stream_reset_trigger, stream_reset_rx) = channel(4096);
-        let invite_cooldown = Duration::new(10, 0);
         let (bridge_state, bridge_state_poll) = BridgeState::new(
             invite_cooldown,
             bridges_in_tx,
@@ -46,11 +54,15 @@ where
         );
         let codec = Arc::new(RSCodec::new(params.correction).map_err(SessionError::Codec)?);
         let (stream_state, stream_state_poll) = StreamState::new(
-            Duration::new(60, 0),
+            StreamTimeouts {
+                stream_timeout,
+                send_cooldown,
+                stream_reset_timeout,
+                recv_timeout,
+            },
             stream_reset_trigger,
             progress.clone(),
             bridge_outward_tx,
-            Duration::new(10, 0),
             Arc::clone(&codec),
             error_reports.clone(),
             output.clone(),
@@ -75,24 +87,28 @@ where
 
             session_id: session_id.clone(),
             params,
+            bridge_constructor_params,
         });
-        let poll = Pin::clone(&session).process_session(
-            input,
-            error_reports_rx,
-            master_messages,
-            bridges_in_rx,
-            progress,
-            new_tasks_rx,
-            bridge_invitation_rx,
-            stream_reset_rx,
-            timeout_generator.clone(),
-            spawn,
-        );
+        let poll = Pin::clone(&session)
+            .process_session(
+                input,
+                error_reports_rx,
+                master_messages,
+                bridges_in_rx,
+                progress,
+                new_tasks_rx,
+                bridge_invitation_rx,
+                stream_reset_rx,
+                timeout_generator.clone(),
+                spawn,
+            )
+            .fuse();
         let poll = async move {
+            pin_mut!(bridge_state_poll, stream_state_poll, poll);
             select_biased! {
-                _ = bridge_state_poll.boxed().fuse() => (),
-                _ = stream_state_poll.boxed().fuse() => (),
-                _ = poll.boxed().fuse() => (),
+                _ = bridge_state_poll.fuse() => (),
+                _ = stream_state_poll.fuse() => (),
+                _ = poll => (),
             }
             Ok(())
         }
@@ -187,7 +203,7 @@ where
                 params,
                 driver,
                 kill_switch,
-            } = match grpc::bridge(spawn.clone()).await {
+            } = match grpc::bridge(spawn.clone(), &self.bridge_constructor_params).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!("{:?}: bridge engineer: {}", self.role, e);
@@ -334,19 +350,17 @@ where
     where
         T: 'static + Send + Future<Output = ()>,
     {
-        let mut error_reports = spawn
-            .spawn({
-                let this = Pin::clone(&self);
-                let progress = progress.clone();
-                async move {
-                    this.as_ref()
-                        .handle_error_reports(error_reports, progress)
-                        .await
-                }
-            })
-            .boxed()
-            .fuse();
-        let mut input = spawn
+        let error_reports = {
+            let this = Pin::clone(&self);
+            let progress = progress.clone();
+            async move {
+                this.as_ref()
+                    .handle_error_reports(error_reports, progress)
+                    .await
+            }
+            .fuse()
+        };
+        let input = spawn
             .spawn({
                 let this = Pin::clone(&self);
                 async move {
@@ -354,45 +368,39 @@ where
                     this.as_ref().handle_input(input).await
                 }
             })
-            .boxed()
             .fuse();
-        let mut invite_bridges = spawn
-            .spawn({
-                let this = Pin::clone(&self);
-                async move {
-                    while let Some(_) = bridge_invitation_trigger.next().await {
-                        if let Err(e) = this.as_ref().invite_bridge_proposal().await {
-                            error!("invite_bridges: master message failed, {:?}", e)
-                        }
+        let invite_bridges = {
+            let this = Pin::clone(&self);
+            async move {
+                while let Some(_) = bridge_invitation_trigger.next().await {
+                    if let Err(e) = this.as_ref().invite_bridge_proposal().await {
+                        error!("invite_bridges: master message failed, {:?}", e)
                     }
                 }
-            })
-            .boxed()
-            .fuse();
-        let mut reset_streams = spawn
-            .spawn({
-                let this = Pin::clone(&self);
-                let timeout = timeout_generator.clone();
-                let spawn = spawn.clone();
-                async move {
-                    while let Some(stream) = stream_reset_trigger.next().await {
-                        this.as_ref()
-                            .reset_stream(stream, timeout.clone(), spawn.clone())
-                            .await?;
-                    }
-                    Ok::<_, SessionError>(())
+            }
+            .fuse()
+        };
+        let reset_streams = {
+            let this = Pin::clone(&self);
+            let timeout = timeout_generator.clone();
+            let spawn = spawn.clone();
+            async move {
+                while let Some(stream) = stream_reset_trigger.next().await {
+                    this.as_ref()
+                        .reset_stream(stream, timeout.clone(), spawn.clone())
+                        .await?;
                 }
-            })
-            .boxed()
-            .fuse();
-        let mut poll_bridges_in = spawn
+                Ok::<_, SessionError>(())
+            }
+            .fuse()
+        };
+        let poll_bridges_in = spawn
             .spawn({
                 let this = Pin::clone(&self);
                 async move { this.as_ref().handle_bridges_in(bridge_inward).await }
             })
-            .boxed()
             .fuse();
-        let mut poll_master_messages = spawn
+        let poll_master_messages = spawn
             .spawn({
                 let this = Pin::clone(&self);
                 this.handle_master_messages(
@@ -402,17 +410,13 @@ where
                     spawn.clone(),
                 )
             })
-            .boxed()
             .fuse();
-        let mut poll_bridge_drivers = spawn
-            .spawn({
-                let this = Pin::clone(&self);
-                async move { this.as_ref().handle_bridge_drivers(timeout_generator).await }
-            })
-            .boxed()
-            .fuse();
+        let poll_bridge_drivers = {
+            let this = Pin::clone(&self);
+            async move { this.as_ref().handle_bridge_drivers(timeout_generator).await }.fuse()
+        };
 
-        let mut poll_tasks = spawn
+        let poll_tasks = spawn
             .spawn(async move {
                 let mut tasks = FuturesUnordered::new();
                 loop {
@@ -436,14 +440,23 @@ where
                     }
                 }
             })
-            .boxed()
+            .unwrap_or_else(|_| ())
             .fuse();
-        select_biased! {
+        pin_mut!(
+            poll_master_messages,
+            poll_bridges_in,
+            poll_bridge_drivers,
+            error_reports,
+            invite_bridges,
+            reset_streams,
+            input,
+            poll_tasks,
+        );
+        select! {
+            _ = poll_master_messages => Ok(()),
+            _ = poll_bridges_in => Ok(()),
+            _ = poll_bridge_drivers => Ok(()),
             result = error_reports => match result {
-                Ok(Err(e)) => {
-                    error!("{:?}: error_reports: {:?}", self.role, e);
-                    Ok(())
-                },
                 Err(e) => {
                     error!("{:?}: error_reports: {:?}", self.role, e);
                     Ok(())
@@ -457,9 +470,6 @@ where
                 }
                 Ok(())
             },
-            _ = poll_bridges_in => Ok(()),
-            _ = poll_master_messages => Ok(()),
-            _ = poll_bridge_drivers => Ok(()),
             result = input => match result {
                 Ok(Err(e)) => {
                     error!("{:?}: input: {:?}", self.role, e);

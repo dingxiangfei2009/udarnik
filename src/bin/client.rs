@@ -1,21 +1,10 @@
 #![type_length_limit = "4000000"]
-#[macro_use]
-extern crate derive_more;
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    convert::TryFrom,
-    fs::File,
-    net::SocketAddr,
-    path::PathBuf,
-    str::FromStr,
-    time::Duration,
+    convert::TryFrom, fs::File, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration,
 };
 
-use async_std::{
-    io::{stdin, stdout, BufReader, BufWriter},
-    task::sleep,
-};
+use async_std::io::{stdout, BufWriter};
 use blake2::Blake2b;
 use futures::{
     channel::{
@@ -44,8 +33,8 @@ use udarnik::{
     keyman::{Error as KeyError, RawInit, RawPrivateKey, RawPublicKey},
     reference_seeder_chacha,
     state::{
-        Identity, InitIdentity, KeyExchangeAnkeIdentity, McElieceAnkeIdentity, Params,
-        RLWEAnkeIdentity, SafeGuard,
+        BridgeConstructorParams, Identity, InitIdentity, KeyExchangeAnkeIdentity,
+        McElieceAnkeIdentity, Params, RLWEAnkeIdentity, SafeGuard, TimeoutParams,
     },
     utils::TokioSpawn,
 };
@@ -210,9 +199,9 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
     };
 
     let spawn = TokioSpawn(handle.clone());
-    let (mut input, input_rx) = channel(4096);
+    let (input, input_rx) = channel(4096);
     let (output_tx, output) = channel(4096);
-    let (terminate, terminate_rx) = oneshot();
+    let (_terminate, terminate_rx) = oneshot();
     let client = client::<SafeGuard, ChaCha20Rng, Blake2b, _, _, _, _>(
         ClientBootstrap {
             addr: format!("http://{}", addr).parse().unwrap(),
@@ -222,6 +211,17 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
                 window: 4096,
             },
             kex,
+            timeout_params: TimeoutParams {
+                stream_timeout: Duration::new(3600, 0),
+                stream_reset_timeout: Duration::new(60, 0),
+                send_cooldown: Duration::new(0, 150_000_000),
+                recv_timeout: Duration::new(5, 0),
+                invite_cooldown: Duration::new(30, 0),
+            },
+            bridge_constructor_params: BridgeConstructorParams {
+                ip_listener_address: "127.0.0.1".parse().unwrap(),
+                ip_listener_mask: 32,
+            },
         },
         reference_seeder_chacha,
         input_rx,
@@ -232,15 +232,9 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
     );
     let client = handle.spawn(client);
     let stdin = handle.spawn(
-        async move {
-            loop {
-                input.send(vec![1; 1500]).await.unwrap();
-                tokio::time::delay_for(Duration::new(5, 0)).await;
-            }
-        }
-        // repeat(vec![1; 1500])
-        //     .map(Ok)
-        //     .forward(input.clone().sink_map_err(Error::Pipe)),
+        repeat(vec![1; 1500])
+            .map(Ok)
+            .forward(input.clone().sink_map_err(Error::Pipe)),
     );
     let stdout = BufWriter::new(stdout());
     let stdout = handle.spawn(

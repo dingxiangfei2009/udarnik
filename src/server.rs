@@ -8,6 +8,7 @@ use digest::Digest;
 use futures::{
     channel::mpsc::{channel, Receiver, Sender},
     future::{pending, select_all},
+    pin_mut,
     prelude::*,
     select_biased,
 };
@@ -18,8 +19,9 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     state::{
-        key_exchange_boris, wire, Guard, KeyExchangeBorisIdentity, Message, Params, SafeGuard,
-        Session, SessionBootstrap, SessionError, SessionHandle, SessionId,
+        key_exchange_boris, wire, BridgeConstructorParams, Guard, KeyExchangeBorisIdentity,
+        Message, Params, SafeGuard, Session, SessionBootstrap, SessionError, SessionHandle,
+        SessionId, TimeoutParams,
     },
     utils::{Spawn, TryFutureStream},
     GenericError,
@@ -109,7 +111,8 @@ where
                                 }
                                 Ok::<_, SessionError>(())
                             }
-                        };
+                        }
+                        .fuse();
 
                         let master_out = {
                             let mut progress = progress_tx;
@@ -127,30 +130,20 @@ where
                                 }
                                 Ok::<_, SessionError>(())
                             }
-                        };
+                        }
+                        .fuse();
+
                         let progress = async {
                             loop {
-                                let mut timeout =
-                                    Pin::from(Box::new(timeout_generator(Duration::new(300, 0)))
-                                        as Box<dyn Future<Output = ()> + Send + Sync>)
-                                    .fuse();
                                 select_biased! {
                                     _ = progress_rx.next() => (),
-                                    _ = timeout => break
+                                    _ = timeout_generator(Duration::new(300, 0)).fuse() => break
                                 }
                             }
                             info!("session {}: master link has no activity", session);
-                        };
-                        let mut master_in = Pin::from(Box::new(master_in)
-                            as Box<dyn Future<Output = Result<(), SessionError>> + Send + Sync>)
+                        }
                         .fuse();
-                        let mut master_out = Pin::from(Box::new(master_out)
-                            as Box<dyn Future<Output = Result<(), SessionError>> + Send + Sync>)
-                        .fuse();
-                        let mut progress = Pin::from(
-                            Box::new(progress) as Box<dyn Future<Output = ()> + Send + Sync>
-                        )
-                        .fuse();
+                        pin_mut!(master_in, master_out, progress);
                         select_biased! {
                             r = master_in => r?,
                             r = master_out => r?,
@@ -259,6 +252,8 @@ where
 pub struct ServerBootstrap<R, H> {
     pub addr: SocketAddr,
     pub kex: KeyExchangeBorisIdentity<R, H>,
+    pub timeout_params: TimeoutParams,
+    pub bridge_constructor_params: BridgeConstructorParams,
 }
 
 pub type ServiceFuture<T> = Pin<Box<dyn Future<Output = T> + Send + Sync>>;
@@ -277,7 +272,12 @@ where
     TimeGen: 'static + Clone + Send + Sync + Fn(Duration) -> Timeout,
     Timeout: 'static + Future<Output = ()> + Send + Sync,
 {
-    let ServerBootstrap { addr, kex } = bootstrap;
+    let ServerBootstrap {
+        addr,
+        kex,
+        timeout_params,
+        bridge_constructor_params,
+    } = bootstrap;
     let (new_sessions_tx, mut new_sessions) = channel(32);
     let sessions = Arc::default();
     let server: UdarnikServer<SafeGuard, _, _, _, _, Timeout> = UdarnikServer {
@@ -290,7 +290,7 @@ where
     };
     let server = Arc::pin(server);
     let (mut poll_session_tx, mut poll_session) = channel(32);
-    let mut new_sessions = async {
+    let new_sessions = async {
         while let Some(session_bootstrap) = new_sessions.next().await {
             let (master_in, master_messages) = channel(4096);
             let (master_sink, master_out) = channel(4096);
@@ -304,6 +304,8 @@ where
                 mut progress,
             } = match Session::<SafeGuard>::new(
                 session_bootstrap,
+                timeout_params,
+                bridge_constructor_params.clone(),
                 master_messages,
                 master_sink,
                 timeout_generator.clone(),
@@ -333,11 +335,20 @@ where
             let mut poll = poll.fuse();
             let sessions = Arc::clone(&sessions);
             let timeout_generator = timeout_generator.clone();
-            let poll_progress_or_timeout = async move {
+            let timeout = async move {
                 loop {
-                    let mut timeout = timeout_generator(Duration::new(300, 0)).boxed().fuse();
                     select_biased! {
-                        _ = progress.next().fuse() => (),
+                        () = progress.select_next_some().fuse() => (),
+                        // TODO: configurable timeout
+                        _ = timeout_generator(Duration::new(30000000, 0)).fuse() => break,
+                    }
+                }
+            }
+            .fuse();
+            let poll_progress_or_timeout = async move {
+                pin_mut!(timeout);
+                loop {
+                    select_biased! {
                         _ = timeout => break,
                         _ = poll => break,
                     }
@@ -351,9 +362,8 @@ where
             }
         }
     }
-    .boxed()
     .fuse();
-    let mut poll_sessions = async move {
+    let poll_sessions = async move {
         let mut polls = vec![];
         loop {
             trace!("server: poll_sessions");
@@ -367,6 +377,8 @@ where
                 new_poll = poll_session.next() => {
                     if let Some(new_poll) = new_poll {
                         polls.push(new_poll.shared())
+                    } else {
+                        break;
                     }
                 },
                 (_, idx, _) = poll_all => {
@@ -375,14 +387,10 @@ where
             }
         }
     }
-    .boxed()
     .fuse();
     let service = wire::master_server::MasterServer::new(server);
-    let mut service = Server::builder()
-        .add_service(service)
-        .serve(addr)
-        .boxed()
-        .fuse();
+    let service = Server::builder().add_service(service).serve(addr).fuse();
+    pin_mut!(service, poll_sessions, new_sessions);
     select_biased! {
         r = service => r?,
         _ = poll_sessions => (),

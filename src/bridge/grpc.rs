@@ -1,7 +1,7 @@
 use std::{
     convert::TryFrom,
     io::Result as IoResult,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
@@ -18,6 +18,7 @@ use async_std::{
 };
 use async_trait::async_trait;
 use backtrace::Backtrace as Bt;
+use bitvec::{order::Msb0, slice::BitSlice};
 use chacha20poly1305::ChaCha20Poly1305;
 use futures::{
     channel::{
@@ -25,8 +26,9 @@ use futures::{
         oneshot,
     },
     future::BoxFuture,
+    pin_mut,
     prelude::*,
-    select_biased,
+    select, select_biased,
 };
 use generic_array::GenericArray;
 use http::Uri;
@@ -42,8 +44,8 @@ use super::{BridgeHalf, ConstructibleBridge};
 
 use crate::{
     state::{
-        wire, Bridge, BridgeId, BridgeMessage, GrpcBridge as GrpcParams, Guard, Pomerium,
-        UnixBridge as UnixParams,
+        wire, Bridge, BridgeConstructorParams, BridgeId, BridgeMessage, GrpcBridge as GrpcParams,
+        Guard, Pomerium, UnixBridge as UnixParams,
     },
     utils::{Spawn, TryFutureStream},
     GenericError,
@@ -199,7 +201,7 @@ impl<S: Spawn> BridgeServer<S> {
             )
             .fuse();
         let mut down = Box::new(Box::pin(down));
-        select_biased! {
+        select! {
             r = up => match r {
                 Ok(Err(e)) => Err(e),
                 Err(e) => {
@@ -262,19 +264,53 @@ pub struct GrpcBridgeConstruction {
     pub driver: Box<dyn Future<Output = ()> + Send + Sync + Unpin>,
 }
 
+fn random_addr_from_cidr(net: &IpAddr, range: usize) -> Result<IpAddr, GenericError> {
+    #[derive(Error, Debug)]
+    enum RandomCidrError {
+        #[error("invalid cidr spec")]
+        InvalidCidr,
+    }
+    match net {
+        IpAddr::V4(net) if range <= 32 => {
+            let mut addr = net.octets();
+            let mut rand = addr;
+            let slice: &mut BitSlice<Msb0, _> = BitSlice::from_slice_mut(&mut addr);
+            OsRng.fill_bytes(&mut rand);
+            let rand_slice: &BitSlice<Msb0, _> = BitSlice::from_slice(&rand);
+            slice[range..].copy_from_slice(&rand_slice[range..]);
+            Ok(addr.into())
+        }
+        IpAddr::V6(net) if range <= 128 => {
+            let mut addr = net.octets();
+            let mut rand = addr;
+            let slice: &mut BitSlice<Msb0, _> = BitSlice::from_slice_mut(&mut addr);
+            OsRng.fill_bytes(&mut rand);
+            let rand_slice: &BitSlice<Msb0, _> = BitSlice::from_slice(&rand);
+            slice[range..].copy_from_slice(&rand_slice[range..]);
+            Ok(addr.into())
+        }
+        _ => Err(Box::new(RandomCidrError::InvalidCidr)),
+    }
+}
+
 /// Construct a TCP GRPC bridge server
-pub async fn bridge<S>(spawn: S) -> Result<GrpcBridgeConstruction, GenericError>
+pub async fn bridge<S>(
+    spawn: S,
+    params: &BridgeConstructorParams,
+) -> Result<GrpcBridgeConstruction, GenericError>
 where
     S: Spawn + Clone + Send + Sync + 'static,
     S::Error: 'static,
 {
     trace!("bridge: engineering");
-    let stream = TcpListener::bind("[::]:0").await?;
+    let BridgeConstructorParams {
+        ip_listener_mask,
+        ip_listener_address,
+        ..
+    } = params;
+    let addr = random_addr_from_cidr(ip_listener_address, *ip_listener_mask)?;
+    let stream = TcpListener::bind(SocketAddr::new(addr, 0)).await?;
     let addr = stream.local_addr()?;
-    // TODO: proper address translation
-    let addr = format!("[::1]:{}", addr.port())
-        .parse()
-        .expect("correct socket address format");
     let addr = vec![addr];
 
     let (server, mut progress) = BridgeServer::new(spawn.clone());
@@ -321,7 +357,7 @@ where
     let progress = async move {
         loop {
             select_biased! {
-                _ = progress.next().fuse() => trace!("bridge service: progress"),
+                r = progress.next().fuse() => if let None = r { break },
                 _ = sleep(Duration::new(300, 0)).fuse() => break,
             }
         }
@@ -387,9 +423,8 @@ where
                 }
             })
             .await
-    };
-    let accept = Box::pin(accept) as Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
-    let mut accept = accept.fuse();
+    }
+    .fuse();
     let service = Server::builder()
         .add_service(service)
         .serve_with_incoming(incoming.map_ok(UnixStreamCompat))
@@ -400,9 +435,8 @@ where
         });
     let service = spawn
         .spawn(service)
-        .unwrap_or_else(|e| error!("bridge: service: {:?}", e));
-    let service = Box::pin(service) as Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
-    let mut service = service.fuse();
+        .unwrap_or_else(|e| error!("bridge: service: {:?}", e))
+        .fuse();
     let id = BridgeId { up, down };
     let params = UnixParams {
         addr: socket,
@@ -417,11 +451,11 @@ where
                 _ = sleep(Duration::new(300, 0)).fuse() => break,
             }
         }
-    };
-    let progress = Box::pin(progress) as Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
-    let mut progress = progress.fuse();
+    }
+    .fuse();
     let service = async move {
         let _tempdir = tempdir;
+        pin_mut!(progress, service, accept);
         select_biased! {
             _ = progress => (),
             _ = service => (),
@@ -776,6 +810,27 @@ where
                 )
                 .await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_cidr() {
+        let addr = "192.168.11.1".parse().unwrap();
+        let range = 23;
+        let random = random_addr_from_cidr(&addr, range).unwrap();
+        if let IpAddr::V4(addr) = random {
+            println!("{}", addr);
+            let addr = addr.octets();
+            let actual: &BitSlice<Msb0, _> = BitSlice::from_slice(&addr);
+            let expected: &BitSlice<Msb0, _> = BitSlice::from_slice(&[192u8, 168, 10, 0]);
+            assert_eq!(actual[..range], expected[..range]);
+        } else {
+            panic!()
         }
     }
 }

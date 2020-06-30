@@ -68,7 +68,7 @@ where
                             > = Box::new(source);
                             let mut poll = poll.fuse();
                             let poll = async move {
-                                select_biased! {
+                                select! {
                                     r = poll_outbound => {
                                         if let Err(e) = r {
                                             error!("bridge: poll_outbound: {:?}", e)

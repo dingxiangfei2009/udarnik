@@ -17,10 +17,12 @@ use async_std::sync::{
 };
 use backtrace::Backtrace as Bt;
 use chacha20poly1305::ChaCha20Poly1305;
-use futures::{channel::mpsc::channel, future::BoxFuture, prelude::*, select_biased};
+use futures::{
+    channel::mpsc::channel, future::BoxFuture, pin_mut, prelude::*, select_biased,
+};
 use generic_array::GenericArray;
 use lazy_static::lazy_static;
-use log::{debug, info, trace, warn};
+use log::{debug, trace, warn};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 use rayon::prelude::*;
@@ -37,6 +39,10 @@ use crate::{
     utils::ClonableSink,
     GenericError,
 };
+
+mod recv_queue;
+mod send_queue;
+pub use self::{recv_queue::ReceiveQueue, send_queue::SendQueue};
 
 lazy_static! {
     static ref RS_255_223: ReedSolomon<GF2561D> =
@@ -541,159 +547,6 @@ impl Shard {
     }
 }
 
-#[derive(Default)]
-struct ReceiveQueueState {
-    queue: VecDeque<AsyncMutex<Quorum>>,
-    start: Wrapping<u64>,
-}
-
-#[derive(Default)]
-pub struct ReceiveQueue {
-    state: AsyncRwLock<ReceiveQueueState>,
-    window: Option<u32>,
-
-    avail_mutex: AsyncMutex<()>,
-    avail_cv: Condvar,
-}
-
-#[derive(Error, Debug)]
-pub enum ReceiveError {
-    #[error("quorum: {0}")]
-    Quorum(#[from] QuorumError),
-    #[error("queue is full, size={0}")]
-    Full(usize),
-    #[error("shard recovery: {0}")]
-    Shard(#[from] ShardError),
-    #[error("out of bounds, size={0}")]
-    OutOfBound(u64, usize),
-}
-
-impl ReceiveQueue {
-    pub fn new() -> Self {
-        Self {
-            state: <_>::default(),
-            window: <_>::default(),
-            avail_mutex: <_>::default(),
-            avail_cv: <_>::default(),
-        }
-    }
-
-    pub async fn admit(
-        &self,
-        raw_shard: RawShard,
-        raw_shard_id: RawShardId,
-        shard_state: &ShardState,
-    ) -> Result<(u8, u8), ReceiveError> {
-        let serial = raw_shard_id.serial;
-        let shard_id = (raw_shard_id, shard_state)
-            .verify_proof(())
-            .map_err(ReceiveError::Shard)?;
-        let shard = raw_shard
-            .clone()
-            .verify_proof(shard_id.into_inner())
-            .map_err(ReceiveError::Shard)?;
-
-        let window = self.window.unwrap_or(256) as usize;
-        let state = self.state.read().await;
-        let Wrapping(idx) = Wrapping(serial) - state.start;
-        let idx = idx as usize;
-        if idx < 4 * window {
-            let (result, queue_len) = if idx < state.queue.len() {
-                let q_len = state.queue.len();
-                let result = state.queue[idx]
-                    .lock()
-                    .await
-                    .insert(serial, shard)
-                    .map_err(ReceiveError::Quorum)?;
-                if idx == 0 {
-                    self.signal_one(state).await;
-                }
-                (result, q_len)
-            } else {
-                drop(state);
-                let mut state = self.state.write().await;
-                let len = state.queue.len();
-                state
-                    .queue
-                    .resize_with(std::cmp::max(len, idx + 1), <_>::default);
-                let q_len = state.queue.len();
-                let result = state.queue[idx]
-                    .lock()
-                    .await
-                    .insert(serial, shard)
-                    .map_err(ReceiveError::Quorum)?;
-                if idx == 0 {
-                    self.signal_one(state).await;
-                }
-                (result, q_len)
-            };
-            if idx > window {
-                Err(ReceiveError::Full(queue_len))
-            } else {
-                Ok(result)
-            }
-        } else {
-            Err(ReceiveError::OutOfBound(state.start.0, state.queue.len()))
-        }
-    }
-
-    pub async fn pop_front(&self) -> Option<Quorum> {
-        let mut state = self.state.write().await;
-        if let Some(q) = state.queue.pop_front() {
-            state.start += Wrapping(1);
-            self.signal_all(state).await;
-            Some(q.into_inner())
-        } else {
-            None
-        }
-    }
-
-    async fn wait_for_update<T>(&self, write_guard: T) {
-        let guard = self.avail_mutex.lock().await;
-        drop(write_guard);
-        self.avail_cv.wait(guard).await;
-    }
-
-    async fn signal_one<T>(&self, write_guard: T) {
-        let _guard = self.avail_mutex.lock().await;
-        drop(write_guard);
-        self.avail_cv.notify_one();
-    }
-
-    async fn signal_all<T>(&self, write_guard: T) {
-        let _guard = self.avail_mutex.lock().await;
-        drop(write_guard);
-        self.avail_cv.notify_all();
-    }
-
-    pub async fn poll(&self, codec: &RSCodec) -> (u64, Vec<u8>, HashSet<u8>) {
-        loop {
-            info!("recv_q: polling");
-            let mut state = self.state.write().await;
-            if let Some(front) = state.queue.front() {
-                let result = front.lock().await.poll(&codec);
-                drop(front);
-                if let Ok(result) = result {
-                    state.start += Wrapping(1);
-                    state.queue.pop_front();
-                    self.signal_one(state).await;
-                    return result;
-                } else {
-                    self.wait_for_update(state).await;
-                }
-            } else {
-                self.wait_for_update(state).await;
-            }
-        }
-    }
-
-    pub async fn reset(&self) {
-        let mut state = self.state.write().await;
-        state.start = Wrapping(0);
-        state.queue.clear();
-    }
-}
-
 #[derive(Error, Debug)]
 pub enum SendError {
     #[error("codec: {0}")]
@@ -706,6 +559,18 @@ pub enum SendError {
     BrokenPipe,
     #[error("exhausted")]
     Exhausted,
+}
+
+#[derive(Error, Debug)]
+pub enum ReceiveError {
+    #[error("quorum: {0}")]
+    Quorum(#[from] QuorumError),
+    #[error("queue is full, size={0}")]
+    Full(usize),
+    #[error("shard recovery: {0}")]
+    Shard(#[from] ShardError),
+    #[error("out of bounds, size={0}")]
+    OutOfBound(u64, usize),
 }
 
 #[derive(Error, Debug)]
@@ -723,145 +588,6 @@ pub type TaskProgressNotifier =
 
 pub type TaskProgressNotifierSink =
     Box<dyn ClonableSink<(u64, TaskProgressNotifier), GenericError> + Unpin + Send + Sync>;
-
-pub struct SendQueue {
-    q_send: MPMCSender<(RawShard, RawShardId)>,
-    q_recv: MPMCReceiver<(RawShard, RawShardId)>,
-    stream: u8,
-    serial: AtomicU64,
-    task_notifiers: TaskProgressNotifierSink,
-    block_sending: AsyncMutex<Option<BoxFuture<'static, ()>>>,
-}
-
-impl SendQueue {
-    pub fn new(stream: u8, window: usize, task_notifiers: TaskProgressNotifierSink) -> Self {
-        let (q_send, q_recv) = mpmc_channel(window);
-        Self {
-            stream,
-            task_notifiers,
-            serial: AtomicU64::default(),
-            q_send,
-            q_recv,
-            block_sending: <_>::default(),
-        }
-    }
-
-    pub async fn block_sending(&self, condition: impl 'static + Future<Output = ()> + Send) {
-        *self.block_sending.lock().await = Some(condition.boxed())
-    }
-
-    pub async fn enqueue(&self, data: (RawShard, RawShardId)) {
-        let block_sending = { self.block_sending.lock().await.take() };
-        if let Some(block_sending) = block_sending {
-            debug!("send queue: back pressure");
-            block_sending.await
-        }
-        self.q_send.send(data).await;
-    }
-
-    pub async fn pop(&self) -> (RawShard, RawShardId) {
-        self.q_recv.recv().await.expect("senders should never drop")
-    }
-
-    pub async fn send<Timeout>(
-        &self,
-        data: impl AsRef<[u8]>,
-        shard_state: &ShardState,
-        codec: &RSCodec,
-        timeout_generator: impl Fn(Duration) -> Timeout,
-        timeout: Duration,
-    ) -> Result<(), SendError>
-    where
-        Timeout: Future,
-    {
-        let shards = Shard::from_codes(codec.encode(data.as_ref()).map_err(SendError::Codec)?);
-        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
-        let mut shards: Vec<_> = shards
-            .iter()
-            .map(|shard| shard.encode_shard(self.stream, serial, &shard_state))
-            .collect();
-
-        let (tx, rx) = channel(256);
-        let tx = Arc::new(Box::new(tx.sink_map_err(|e| Box::new(e) as GenericError))
-            as Box<
-                dyn Send + Sync + ClonableSink<Result<(u8, u8), RemoteRecvError>, GenericError>,
-            >);
-        {
-            ClonableSink::clone_pin_box(&*self.task_notifiers)
-                .send((serial, Arc::downgrade(&tx) as _))
-                .await
-                .map_err(|_| SendError::BrokenPipe)?;
-        }
-        let mut status = rx.fuse();
-
-        let threshold = codec.threshold();
-        for (shard, shard_id) in shards.drain(..threshold) {
-            self.enqueue((shard, shard_id)).await;
-        }
-
-        // hear from the peer about how the reception goes
-        let mut quorum = HashSet::new();
-        for _ in 0..threshold {
-            select_biased! {
-                status = status.next() => {
-                    match status {
-                        None => {
-                            warn!("feedback: remote lost");
-                            return Err(SendError::RemoteLost(<_>::default()))
-                        }
-                        Some(status) => match status {
-                            Ok((id, quorum_size)) => {
-                                quorum.insert(id);
-                            }
-                            Err(RemoteRecvError::Complete) => {
-                                trace!("feedback: complete");
-                                return Ok(())
-                            }
-                            Err(e) => {
-                                warn!("feedback: {}", e);
-                                return Err(SendError::Remote(e))
-                            }
-                        }
-                    }
-                },
-                _ = timeout_generator(timeout).fuse() => (),
-            }
-        }
-
-        // and we need to try harder now
-        warn!("send: try harder");
-        for (shard, shard_id) in shards {
-            self.enqueue((shard, shard_id)).await;
-            select_biased! {
-                status = status.next() => {
-                    match status {
-                        None => {
-                            warn!("feedback: remote lost");
-                            return Err(SendError::RemoteLost(<_>::default()))
-                        }
-                        Some(status) => match status {
-                            Ok((id, quorum_size)) => {
-                                trace!("feedback: ok");
-                                quorum.insert(id);
-                            }
-                            Err(RemoteRecvError::Complete) => {
-                                trace!("feedback: complete");
-                                return Ok(())
-                            }
-                            Err(e) => {
-                                info!("feedback: {}", e);
-                                return Err(SendError::Remote(e))
-                            }
-                        }
-                    }
-                },
-                _ = timeout_generator(Duration::new(0, 5_000_000)).fuse() => (),
-            }
-        }
-        // okay, maybe we have to drop it
-        Err(SendError::Exhausted)
-    }
-}
 
 pub fn signature_hasher(input: Vec<u8>) -> Vec<u8> {
     sha3::Sha3_512::digest(&input).to_vec()

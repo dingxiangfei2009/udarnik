@@ -8,6 +8,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     str::FromStr,
+    time::Duration,
 };
 
 use blake2::Blake2b;
@@ -30,7 +31,8 @@ use udarnik::{
     reference_seeder_chacha,
     server::{server, ServerBootstrap},
     state::{
-        Identity, InitIdentity, KeyExchangeBorisIdentity, McElieceBorisIdentity, RLWEBorisIdentity,
+        BridgeConstructorParams, Identity, InitIdentity, KeyExchangeBorisIdentity,
+        McElieceBorisIdentity, RLWEBorisIdentity, TimeoutParams,
     },
     utils::TokioSpawn,
 };
@@ -247,6 +249,17 @@ async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
                 ),
                 mc: <McElieceBorisIdentity<Blake2b>>::new(mc_allowed_identities, mc_identity_db),
             },
+            timeout_params: TimeoutParams {
+                stream_timeout: Duration::new(3600, 0),
+                stream_reset_timeout: Duration::new(60, 0),
+                send_cooldown: Duration::new(0, 150_000_000),
+                recv_timeout: Duration::new(5, 0),
+                invite_cooldown: Duration::new(30, 0),
+            },
+            bridge_constructor_params: BridgeConstructorParams {
+                ip_listener_address: "127.0.0.1".parse().unwrap(),
+                ip_listener_mask: 32,
+            },
         },
         new_channel_tx,
         reference_seeder_chacha,
@@ -258,14 +271,14 @@ async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
         async move {
             while let Some((input, output)) = new_channel.next().await {
                 info!("server: new channel, short-circuiting");
-                handle.spawn(async {
+                handle.spawn(
                     output
                         .map(Ok)
-                        .inspect_ok(|m| info!("got {:?}", m))
+                        .inspect_ok(|_| info!("server frontend: got message"))
                         .forward(input)
-                        .await
                         .unwrap_or_else(|e| error!("server: channel: {}", e))
-                });
+                        .map(|_| info!("session terminated")),
+                );
             }
         }
     });
