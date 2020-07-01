@@ -8,9 +8,9 @@ pub struct RecvProcess<Timeout> {
     // bridge outward send entry point
     pub bridge_outward: Sender<BridgeMessage>,
     // progress indicator
-    pub progress: Sender<()>,
+    pub progress: Arc<AtomicBool>,
     // session progress indicator
-    pub session_progress: Sender<()>,
+    pub session_progress: Arc<AtomicBool>,
     // final output
     pub output: Sender<Vec<u8>>,
     pub timeout: Timeout,
@@ -47,24 +47,20 @@ where
                 Ok((serial, data, errors)) => {
                     // hall of shame
                     info!("stream {}: poll_recv: good packet {}", self.stream, serial); // TODO: REMOVE
-                    let (err, out, bridge_out, progress, sprogress) = join!(
+                    let (err, out, bridge_out) = join!(
                         self.error_reports.send((self.stream, serial, errors)),
                         self.output.send(data),
                         self.bridge_outward.send(BridgeMessage::PayloadFeedback {
                             stream: self.stream,
                             feedback: PayloadFeedback::Complete { serial },
                         }),
-                        self.progress.send(()),
-                        self.session_progress.send(()),
                     );
                     err.map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))?;
                     out.map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))?;
                     bridge_out
                         .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))?;
-                    progress
-                        .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))?;
-                    sprogress
-                        .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))?;
+                    self.progress.store(true, Ordering::Relaxed);
+                    self.session_progress.store(true, Ordering::Relaxed);
                 }
                 Err(e) => {
                     // TODO: fine grained error reporting

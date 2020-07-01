@@ -38,7 +38,7 @@ where
         let (input_tx, input) = channel(4096);
         let (output, output_rx) = channel(4096);
         let (error_reports, error_reports_rx) = channel(4096);
-        let (progress, progress_rx) = channel(4096);
+        let progress = <_>::default();
         let (bridge_outward_tx, bridge_outward) = channel(4096);
         let (bridge_invitation_trigger, bridge_invitation_rx) = channel(4096);
         let (bridges_in_tx, bridges_in_rx) = channel(4096);
@@ -61,7 +61,7 @@ where
                 recv_timeout,
             },
             stream_reset_trigger,
-            progress.clone(),
+            Arc::clone(&progress),
             bridge_outward_tx,
             Arc::clone(&codec),
             error_reports.clone(),
@@ -95,7 +95,7 @@ where
                 error_reports_rx,
                 master_messages,
                 bridges_in_rx,
-                progress,
+                Arc::clone(&progress),
                 new_tasks_rx,
                 bridge_invitation_rx,
                 stream_reset_rx,
@@ -118,7 +118,7 @@ where
             poll,
             input: input_tx,
             output: output_rx,
-            progress: progress_rx,
+            progress,
         })
     }
 
@@ -340,7 +340,7 @@ where
         error_reports: Receiver<(u8, u64, HashSet<u8>)>,
         master_messages: Receiver<Message<G>>,
         bridge_inward: Receiver<(BridgeId, BridgeMessage)>,
-        progress: Sender<()>,
+        progress: Arc<AtomicBool>,
         mut new_tasks: Receiver<Box<dyn 'static + Send + Sync + Unpin + Future<Output = ()>>>,
         mut bridge_invitation_trigger: Receiver<()>,
         mut stream_reset_trigger: Receiver<u8>,
@@ -352,7 +352,7 @@ where
     {
         let error_reports = {
             let this = Pin::clone(&self);
-            let progress = progress.clone();
+            let progress = Arc::clone(&progress);
             async move {
                 this.as_ref()
                     .handle_error_reports(error_reports, progress)
@@ -405,7 +405,7 @@ where
                 let this = Pin::clone(&self);
                 this.handle_master_messages(
                     master_messages,
-                    progress.clone(),
+                    Arc::clone(&progress),
                     timeout_generator.clone(),
                     spawn.clone(),
                 )
@@ -456,13 +456,7 @@ where
             _ = poll_master_messages => Ok(()),
             _ = poll_bridges_in => Ok(()),
             _ = poll_bridge_drivers => Ok(()),
-            result = error_reports => match result {
-                Err(e) => {
-                    error!("{:?}: error_reports: {:?}", self.role, e);
-                    Ok(())
-                },
-                _ => Ok(()),
-            },
+            _ = error_reports => Ok(()),
             _ = invite_bridges => Ok(()),
             r = reset_streams => {
                 if let Err(e) = r {

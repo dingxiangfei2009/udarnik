@@ -3,9 +3,9 @@ use super::*;
 pub struct FeedbackProcess<Timeout> {
     pub task_notifiers: TaskProgressNotifierStore,
     // stream progress indicator
-    pub progress: Sender<()>,
+    pub progress: Arc<AtomicBool>,
     // session progress indicator
-    pub session_progress: Sender<()>,
+    pub session_progress: Arc<AtomicBool>,
     // send queue in order to enable blocking
     pub send_queue: Arc<SendQueue>,
     pub send_cooldown: Duration,
@@ -48,14 +48,8 @@ where
                         debug!("notifer pipe: {}", e);
                     }
                 }
-                if let Err(e) = self.progress.clone().send(()).await {
-                    debug!("progress pipe: {}", e);
-                    return Err(SessionError::BrokenPipe(Box::new(e), Bt::new()));
-                }
-                if let Err(e) = self.session_progress.clone().send(()).await {
-                    debug!("session_progress pipe: {}", e);
-                    return Err(SessionError::BrokenPipe(Box::new(e), Bt::new()));
-                }
+                self.progress.store(true, Ordering::Relaxed);
+                self.session_progress.store(true, Ordering::Relaxed);
             }
             PayloadFeedback::Duplicate { serial, id, quorum } => {
                 trace!("feedback: duplicate");
@@ -118,14 +112,8 @@ where
                         debug!("notifier pipe: {}", e);
                     }
                 }
-                if let Err(e) = self.progress.clone().send(()).await {
-                    debug!("progress pipe: {}", e);
-                    return Err(SessionError::BrokenPipe(Box::new(e), Bt::new()));
-                }
-                if let Err(e) = self.session_progress.clone().send(()).await {
-                    debug!("session_progress pipe: {}", e);
-                    return Err(SessionError::BrokenPipe(Box::new(e), Bt::new()));
-                }
+                self.progress.store(true, Ordering::Relaxed);
+                self.session_progress.store(true, Ordering::Relaxed);
             }
         }
         Ok(())

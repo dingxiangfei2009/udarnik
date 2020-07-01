@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap, convert::TryFrom, fmt::Debug, marker::PhantomData, net::SocketAddr,
     pin::Pin, time::Duration,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use async_std::sync::{Arc, Mutex, RwLock};
@@ -94,9 +95,9 @@ where
                         };
                         let session = logon.session;
                         trace!("server: session {} sign on", session);
-                        let (progress_tx, mut progress_rx) = channel(4096);
+                        let progress = AtomicBool::default();
                         let master_in = {
-                            let mut progress = progress_tx.clone();
+                            let progress = &progress;
                             async move {
                                 while let Some(msg) = message_stream.next().await {
                                     master_in
@@ -105,9 +106,7 @@ where
                                             SessionError::BrokenPipe(Box::new(e), <_>::default())
                                         })
                                         .await?;
-                                    progress.send(()).await.map_err(|e| {
-                                        SessionError::BrokenPipe(Box::new(e), <_>::default())
-                                    })?;
+                                    progress.store(true, Ordering::Relaxed);
                                 }
                                 Ok::<_, SessionError>(())
                             }
@@ -115,15 +114,13 @@ where
                         .fuse();
 
                         let master_out = {
-                            let mut progress = progress_tx;
+                            let progress = &progress;
                             async move {
                                 loop {
                                     let msg = { master_out.lock().await.next().await };
                                     if let Some(msg) = msg {
                                         message_sink.send(msg).await?;
-                                        progress.send(()).await.map_err(|e| {
-                                            SessionError::BrokenPipe(Box::new(e), <_>::default())
-                                        })?;
+                                        progress.store(true, Ordering::Relaxed);
                                     } else {
                                         break;
                                     }
@@ -135,9 +132,11 @@ where
 
                         let progress = async {
                             loop {
-                                select_biased! {
-                                    _ = progress_rx.next() => (),
-                                    _ = timeout_generator(Duration::new(300, 0)).fuse() => break
+                                timeout_generator(Duration::new(300, 0)).await;
+                                if progress.load(Ordering::Relaxed) {
+                                    progress.store(false, Ordering::Relaxed);
+                                } else {
+                                    break;
                                 }
                             }
                             info!("session {}: master link has no activity", session);
@@ -301,7 +300,7 @@ where
                 poll,
                 input,
                 output,
-                mut progress,
+                progress,
             } = match Session::<SafeGuard>::new(
                 session_bootstrap,
                 timeout_params,
@@ -337,10 +336,11 @@ where
             let timeout_generator = timeout_generator.clone();
             let timeout = async move {
                 loop {
-                    select_biased! {
-                        () = progress.select_next_some().fuse() => (),
-                        // TODO: configurable timeout
-                        _ = timeout_generator(Duration::new(30000000, 0)).fuse() => break,
+                    timeout_generator(Duration::new(30000000, 0)).await;
+                    if progress.load(Ordering::Relaxed) {
+                        progress.store(false, Ordering::Relaxed);
+                    } else {
+                        break;
                     }
                 }
             }

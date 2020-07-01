@@ -4,7 +4,7 @@ use core::{
     marker::PhantomData,
     num::Wrapping,
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 use std::{
@@ -587,7 +587,7 @@ struct StreamState {
     stream_avail_mutex: Mutex<()>,
     stream_avail_cv: Condvar,
 
-    session_progress: Sender<()>,
+    session_progress: Arc<AtomicBool>,
     bridge_outward: Sender<BridgeMessage>,
     codec: Arc<RSCodec>,
     error_reports: Sender<(u8, u64, HashSet<u8>)>,
@@ -636,7 +636,7 @@ pub struct SessionHandle<G> {
     pub poll: BoxFuture<'static, Result<(), SessionError>>,
     pub input: Sender<Vec<u8>>,
     pub output: Receiver<Vec<u8>>,
-    pub progress: Receiver<()>,
+    pub progress: Arc<AtomicBool>,
 }
 
 type BridgeSink = Box<dyn Send + Sync + ClonableSink<BridgeMessage, GenericError> + Unpin>;

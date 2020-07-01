@@ -12,7 +12,7 @@ where
     pub(super) async fn handle_master_messages<T>(
         self: Pin<Arc<Self>>,
         mut master_messages: Receiver<Message<G>>,
-        mut progress: Sender<()>,
+        progress: Arc<AtomicBool>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
         spawn: impl Spawn + Clone + Send + Sync + 'static,
     ) -> Result<(), SessionError>
@@ -46,10 +46,7 @@ where
                 ClientMessageVariant::Ok | ClientMessageVariant::Err => {
                     trace!("{:?}: peer answers", self.role);
                     self.update_remote_serial(serial);
-                    progress
-                        .send(())
-                        .await
-                        .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?;
+                    progress.store(true, Ordering::Relaxed);
                     continue;
                 }
                 _ => {}
@@ -84,10 +81,7 @@ where
             self.as_ref()
                 .notify_serial(self.update_local_serial(serial), false)
                 .await?;
-            progress
-                .send(())
-                .await
-                .map_err(|e| SessionError::BrokenPipe(Box::new(e), <_>::default()))?;
+            progress.store(true, Ordering::Relaxed);
         }
         Ok(())
     }

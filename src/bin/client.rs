@@ -12,7 +12,7 @@ use futures::{
         oneshot::channel as oneshot,
     },
     prelude::*,
-    select,
+    select_biased,
     stream::repeat,
 };
 use log::{error, info};
@@ -214,7 +214,7 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
             timeout_params: TimeoutParams {
                 stream_timeout: Duration::new(3600, 0),
                 stream_reset_timeout: Duration::new(60, 0),
-                send_cooldown: Duration::new(0, 150_000_000),
+                send_cooldown: Duration::new(0, 5_000_000),
                 recv_timeout: Duration::new(5, 0),
                 invite_cooldown: Duration::new(30, 0),
             },
@@ -246,7 +246,7 @@ async fn entry(cfg: Config, handle: tokio::runtime::Handle) -> Result<(), Error>
             })
             .map_ok(|_| ()),
     );
-    select! {
+    select_biased! {
         r = stdin.fuse() => (),
         r = client.fuse() => r.unwrap().unwrap(),
         r = stdout.fuse() => r.unwrap().unwrap(),

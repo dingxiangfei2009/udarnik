@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::{
     convert::TryFrom,
     io::Result as IoResult,
@@ -76,26 +77,26 @@ pub struct BridgeServer<S> {
     down_id: String,
     up: BridgeChannel,
     down: BridgeChannel,
-    progress: Sender<()>,
+    progress: Arc<AtomicBool>,
     spawn: S,
 }
 
 impl<S: Spawn> BridgeServer<S> {
-    fn new(spawn: S) -> (Self, Receiver<()>) {
+    fn new(spawn: S) -> (Self, Arc<AtomicBool>) {
         let up = uuid::Uuid::new_v4().to_string();
         let down = uuid::Uuid::new_v4().to_string();
         let mut up_key = [0; 32];
         let mut down_key = [0; 32];
         OsRng.fill_bytes(&mut up_key);
         OsRng.fill_bytes(&mut down_key);
-        let (progress_tx, progress) = channel(256);
+        let progress = <_>::default();
         (
             BridgeServer {
                 up_id: up.to_string(),
                 down_id: down.to_string(),
                 up: BridgeChannel::new(up_key),
                 down: BridgeChannel::new(down_key),
-                progress: progress_tx,
+                progress: Arc::clone(&progress),
                 spawn,
             },
             progress,
@@ -137,14 +138,14 @@ impl<S: Spawn> BridgeServer<S> {
         let aead = Arc::pin(ChaCha20Poly1305::new(GenericArray::from_slice(&key)));
         let aead_ = Pin::clone(&aead);
         let nonce_ = Pin::clone(&nonce);
-        let progress = self.progress.clone();
+        let progress = Arc::clone(&self.progress);
         let up = self
             .spawn
             .spawn(request.try_for_each_concurrent(32, move |m| {
                 let aead = Pin::clone(&aead_);
                 let nonce = Pin::clone(&nonce_);
                 let send = send.clone();
-                let progress = progress.clone();
+                let progress = Arc::clone(&progress);
                 async move {
                     match m {
                         wire::RawBridgeMessage {
@@ -154,13 +155,13 @@ impl<S: Spawn> BridgeServer<S> {
                             match aead.decrypt(GenericArray::from_slice(&nonce), &m[..]) {
                                 Ok(m) => {
                                     send.send(m).await;
-                                    Ok(progress.send(()).await)
+                                    progress.store(true, Ordering::Relaxed);
                                 }
                                 Err(e) => {
                                     error!("decrypt: {:?}", e);
-                                    Ok(())
                                 }
                             }
+                            Ok(())
                         }
                         _ => Err(Status::aborted("malformed data")),
                     }
@@ -168,14 +169,14 @@ impl<S: Spawn> BridgeServer<S> {
             }))
             .fuse();
         let mut up = Box::new(Box::pin(up));
-        let progress = self.progress.clone();
+        let progress = Arc::clone(&self.progress);
         let down = self
             .spawn
             .spawn(
                 recv.map(move |m| {
                     let aead = Pin::clone(&aead);
                     let nonce = Pin::clone(&nonce);
-                    let progress = progress.clone();
+                    let progress = Arc::clone(&progress);
                     async move {
                         trace!("bridge: outgoing data");
                         let m = aead
@@ -187,7 +188,7 @@ impl<S: Spawn> BridgeServer<S> {
                         let m = wire::RawBridgeMessage {
                             variant: Some(wire::raw_bridge_message::Variant::Raw(m)),
                         };
-                        progress.send(()).await;
+                        progress.store(true, Ordering::Relaxed);
                         Ok::<_, Status>(m)
                     }
                 })
@@ -313,7 +314,7 @@ where
     let addr = stream.local_addr()?;
     let addr = vec![addr];
 
-    let (server, mut progress) = BridgeServer::new(spawn.clone());
+    let (server, progress) = BridgeServer::new(spawn.clone());
     let up_key = server.up.key;
     let down_key = server.down.key;
     let up = server.up_id.clone();
@@ -356,9 +357,11 @@ where
     };
     let progress = async move {
         loop {
-            select_biased! {
-                r = progress.next().fuse() => if let None = r { break },
-                _ = sleep(Duration::new(300, 0)).fuse() => break,
+            sleep(Duration::new(300, 0)).await;
+            if progress.load(Ordering::Relaxed) {
+                progress.store(false, Ordering::Relaxed);
+            } else {
+                break;
             }
         }
     };
@@ -405,7 +408,7 @@ where
     let mut socket = PathBuf::from(tempdir.path());
     socket.push("socket");
     let stream = UnixListener::bind(&socket).await?;
-    let (server, mut progress) = BridgeServer::new(spawn.clone());
+    let (server, progress) = BridgeServer::new(spawn.clone());
     let up_key = server.up.key;
     let down_key = server.down.key;
     let up = server.up_id.clone();
@@ -446,9 +449,11 @@ where
     };
     let progress = async move {
         loop {
-            select_biased! {
-                _ = progress.next().fuse() => (),
-                _ = sleep(Duration::new(300, 0)).fuse() => break,
+            sleep(Duration::new(300, 0)).await;
+            if progress.load(Ordering::Relaxed) {
+                progress.store(false, Ordering::Relaxed);
+            } else {
+                break;
             }
         }
     }

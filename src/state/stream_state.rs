@@ -1,5 +1,6 @@
 use super::*;
-use futures::channel::oneshot::channel as oneshot_channel;
+
+use futures::{channel::oneshot::channel as oneshot_channel, future::pending};
 
 mod admit;
 mod feedback;
@@ -20,7 +21,7 @@ impl StreamState {
             recv_timeout,
         }: StreamTimeouts,
         stream_reset_trigger: Sender<u8>,
-        session_progress: Sender<()>,
+        session_progress: Arc<AtomicBool>,
         bridge_outward: Sender<BridgeMessage>,
         codec: Arc<RSCodec>,
         error_reports: Sender<(u8, u64, HashSet<u8>)>,
@@ -65,31 +66,48 @@ impl StreamState {
     {
         let mut rng = StdRng::from_entropy();
         let mut polls = FuturesUnordered::new();
+        let mut nr_active = 0;
         loop {
-            if polls.is_empty() {
+            // TODO: parameterize this value
+            if nr_active < 2 {
                 // try to get a new stream
                 if let Err(_) = reset_trigger.send(rng.next_u32() as u8).await {
                     break;
                 }
                 let timeout = timeout_generator(stream_reset_timeout);
-                select! {
+                let next = if polls.is_empty() {
+                    pending().boxed()
+                } else {
+                    polls.next().boxed()
+                };
+                if let Some(poll) = select! {
                     poll = new_poll.next() => {
-                        if let Some(poll) = poll {
-                            polls.push(poll);
-                        } else {
-                            break;
-                        }
+                        poll
+                    }
+                    _ = next.fuse() => {
+                        nr_active -= 1;
+                        continue;
                     }
                     _ = timeout.fuse() => {
                         // TODO: adjust timeout
+                        continue;
                     }
+                } {
+                    polls.push(poll);
+                    nr_active += 1;
+                } else {
+                    // broken pipe
+                    break;
                 }
             } else {
                 select! {
-                    id = polls.next().fuse() => (),
+                    id = polls.next().fuse() => {
+                        nr_active -= 1;
+                    }
                     poll = new_poll.next().fuse() => {
                         if let Some(poll) = poll {
                             polls.push(poll);
+                            nr_active += 1;
                         } else {
                             break;
                         }
@@ -114,9 +132,9 @@ impl StreamState {
         let shard_state = Arc::new(shard_state);
         let (terminate_tx, terminate) = oneshot_channel();
         let terminate = terminate.unwrap_or_else(|_| ()).shared();
-        let (progress_tx, progress) = channel(4096);
         let (task_notifiers_tx, task_notifiers_rx) = channel(window);
         let task_notifiers_tx = task_notifiers_tx.sink_map_err(|e| Box::new(e) as GenericError);
+        let progress = <_>::default();
 
         let send_queue = Arc::new(SendQueue::new(
             stream,
@@ -128,8 +146,8 @@ impl StreamState {
             send_queue: Arc::clone(&send_queue),
             terminate: Box::new(terminate.clone()) as _,
             bridge_outward: self.bridge_outward.clone(),
-            progress: progress_tx.clone(),
-            session_progress: self.session_progress.clone(),
+            progress: Arc::clone(&progress),
+            session_progress: Arc::clone(&self.session_progress),
         }
         .send_all_out()
         .fuse();
@@ -155,8 +173,8 @@ impl StreamState {
 
         let feedback_process = FeedbackProcess {
             task_notifiers: Arc::clone(&task_notifiers),
-            progress: progress_tx.clone(),
-            session_progress: self.session_progress.clone(),
+            progress: Arc::clone(&progress),
+            session_progress: Arc::clone(&self.session_progress),
             send_queue: Arc::clone(&send_queue),
             window,
             send_cooldown: self.send_cooldown,
@@ -172,8 +190,8 @@ impl StreamState {
             recv_queue: Arc::clone(&receive_queue),
             codec: Arc::clone(&self.codec),
             bridge_outward: self.bridge_outward.clone(),
-            progress: progress_tx,
-            session_progress: self.session_progress.clone(),
+            progress: Arc::clone(&progress),
+            session_progress: Arc::clone(&self.session_progress),
             output: self.output.clone(),
             recv_timeout: self.recv_timeout,
             timeout: timeout_generator.clone(),
@@ -335,22 +353,20 @@ impl StreamState {
 
     async fn timeout<T>(
         stream_timeout: Duration,
-        mut progress: Receiver<()>,
+        progress: Arc<AtomicBool>,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
     ) where
         T: 'static + Send + Future<Output = ()>,
     {
         loop {
-            select_biased! {
-                r = progress.next().fuse() => {
-                    if let None = r {
-                        break
-                    }
-                },
-                _ = timeout_generator(stream_timeout).fuse() => break,
+            timeout_generator(stream_timeout).await;
+            if progress.load(Ordering::Relaxed) {
+                progress.store(false, Ordering::Relaxed);
+            } else {
+                break;
             }
         }
-        warn!("stream: killing progress");
+        warn!("stream: no progress");
     }
 }
 
@@ -362,9 +378,9 @@ struct SendOutProcess {
     // bridge outward send entry point
     bridge_outward: Sender<BridgeMessage>,
     // progress indicator
-    progress: Sender<()>,
+    progress: Arc<AtomicBool>,
     // session progress indicator
-    session_progress: Sender<()>,
+    session_progress: Arc<AtomicBool>,
 }
 
 impl SendOutProcess {
@@ -381,14 +397,8 @@ impl SendOutProcess {
                 })
                 .await
                 .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))?;
-            self.progress
-                .send(())
-                .await
-                .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))?;
-            self.session_progress
-                .send(())
-                .await
-                .map_err(|e| SessionError::BrokenPipe(Box::new(e) as _, <_>::default()))?;
+            self.progress.store(true, Ordering::Relaxed);
+            self.session_progress.store(true, Ordering::Relaxed);
         }
     }
 }

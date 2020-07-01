@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, fmt::Debug, pin::Pin, time::Duration};
+use std::{convert::TryFrom, fmt::Debug, pin::Pin, sync::atomic::{AtomicBool, Ordering}, time::Duration};
 
 use backtrace::Backtrace as Bt;
 use digest::Digest;
@@ -175,7 +175,7 @@ where
         poll,
         input: session_input,
         output: session_output,
-        mut progress,
+        progress,
     } = Session::<SafeGuard>::new(
         session_bootstrap,
         timeout_params,
@@ -214,33 +214,25 @@ where
                 }
                 Err(e) => return Err(e),
             };
-            let (progress_tx, mut progress_rx) = channel(4096);
-            let mut progress = progress_tx.clone();
+            let progress = AtomicBool::default();
             let poll_send = async {
                 while let Some(msg) = master_in.as_mut().next().await {
                     client_send
                         .send(msg)
                         .await
                         .map_err(|_| ClientError::Pipe(<_>::default()))?;
-                    progress
-                        .send(())
-                        .await
-                        .map_err(|_| ClientError::Pipe(<_>::default()))?;
+                    progress.store(true, Ordering::Relaxed);
                 }
                 Ok::<_, ClientError>(())
             }
             .fuse();
-            let mut progress = progress_tx;
             let poll_recv = async {
                 while let Some(msg) = client_recv.next().await {
                     master_out
                         .send(msg?)
                         .await
                         .map_err(|_| ClientError::Pipe(<_>::default()))?;
-                    progress
-                        .send(())
-                        .await
-                        .map_err(|_| ClientError::Pipe(<_>::default()))?;
+                    progress.store(true, Ordering::Relaxed);
                 }
                 Ok::<_, ClientError>(())
             }
@@ -248,13 +240,11 @@ where
             let progress = async {
                 loop {
                     // TODO: configurable timeout
-                    let timeout = timeout_generator(Duration::new(3000000, 0));
-                    select_biased! {
-                        r = progress_rx.next().fuse() => if let None = r { break },
-                        () = timeout.fuse() => {
-                            error!("client: master pipe: close connection due to inactivity");
-                            break
-                        }
+                    timeout_generator(Duration::new(3000000, 0)).await;
+                    if progress.load(Ordering::Relaxed) {
+                        progress.store(false, Ordering::Relaxed);
+                    } else {
+                        break;
                     }
                 }
             }
@@ -278,12 +268,11 @@ where
         .fuse();
     let progress = async move {
         loop {
-            select_biased! {
-                () = progress.select_next_some().fuse() => (),
-                () = timeout_generator(Duration::new(300, 0)).fuse() => {
-                    error!("client: stopping due to inactivity");
-                    break
-                }
+            timeout_generator(Duration::new(300, 0)).await;
+            if progress.load(Ordering::Relaxed) {
+                progress.store(false, Ordering::Relaxed);
+            } else {
+                break;
             }
         }
     }

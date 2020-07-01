@@ -17,9 +17,7 @@ use async_std::sync::{
 };
 use backtrace::Backtrace as Bt;
 use chacha20poly1305::ChaCha20Poly1305;
-use futures::{
-    channel::mpsc::channel, future::BoxFuture, pin_mut, prelude::*, select_biased,
-};
+use futures::{channel::mpsc::channel, future::BoxFuture, pin_mut, prelude::*, select_biased};
 use generic_array::GenericArray;
 use lazy_static::lazy_static;
 use log::{debug, trace, warn};

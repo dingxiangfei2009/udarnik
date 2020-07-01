@@ -12,6 +12,12 @@ impl BridgeState {
         T: 'static + Send + Future<Output = ()>,
     {
         let mut polls = FuturesUnordered::new();
+        bridge_invitation_trigger
+            .send(())
+            .await
+            .map_err(|e| {
+                SessionError::BrokenPipe(Box::new(e) as GenericError, Bt::new())
+            })?;
         loop {
             info!("poll_bridges: polling");
             select_biased! {
