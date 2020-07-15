@@ -337,7 +337,7 @@ where
     async fn process_session<T>(
         self: Pin<Arc<Self>>,
         input: Receiver<Vec<u8>>,
-        error_reports: Receiver<(u8, u64, HashSet<u8>)>,
+        error_reports: Receiver<StreamErrorReport>,
         master_messages: Receiver<Message<G>>,
         bridge_inward: Receiver<(BridgeId, BridgeMessage)>,
         progress: Arc<AtomicBool>,

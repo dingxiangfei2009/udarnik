@@ -581,6 +581,12 @@ pub struct SessionStream {
 
 type StreamPoll = Box<dyn Sync + ClonableSendableFuture<()> + Unpin>;
 
+struct StreamErrorReport {
+    pub stream: u8,
+    pub serial: u64,
+    pub errors: Vec<u8>,
+}
+
 struct StreamState {
     streams: RwLock<HashMap<u8, Arc<SessionStream>>>,
     new_stream_poll: Sender<StreamPoll>,
@@ -590,7 +596,7 @@ struct StreamState {
     session_progress: Arc<AtomicBool>,
     bridge_outward: Sender<BridgeMessage>,
     codec: Arc<RSCodec>,
-    error_reports: Sender<(u8, u64, HashSet<u8>)>,
+    error_reports: Sender<StreamErrorReport>,
     output: Sender<Vec<u8>>,
 
     stream_timeout: Duration,

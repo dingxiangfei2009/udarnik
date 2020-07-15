@@ -252,8 +252,8 @@ async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
             timeout_params: TimeoutParams {
                 stream_timeout: Duration::new(3600, 0),
                 stream_reset_timeout: Duration::new(60, 0),
-                send_cooldown: Duration::new(0, 5_000_000),
-                recv_timeout: Duration::new(5, 0),
+                send_cooldown: Duration::new(0, 150_000_000),
+                recv_timeout: Duration::new(1, 0),
                 invite_cooldown: Duration::new(30, 0),
             },
             bridge_constructor_params: BridgeConstructorParams {

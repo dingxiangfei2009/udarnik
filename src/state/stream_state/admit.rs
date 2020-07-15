@@ -5,6 +5,7 @@ pub struct AdmitProcess {
     pub recv_queue: Arc<ReceiveQueue>,
     pub shard_state: Arc<ShardState>,
     pub bridge_outward: Sender<BridgeMessage>,
+    pub codec: Arc<RSCodec>,
 }
 
 impl AdmitProcess {
@@ -13,21 +14,24 @@ impl AdmitProcess {
         raw_shard: RawShard,
         raw_shard_id: RawShardId,
     ) -> Result<(), SessionError> {
-        let serial = raw_shard_id.serial;
+        let RawShardId { serial, id, .. } = raw_shard_id;
         let feedback = match self
             .recv_queue
-            .admit(raw_shard, raw_shard_id, &self.shard_state)
+            .admit(raw_shard, raw_shard_id, &self.shard_state, &self.codec)
             .await
         {
-            Ok((id, quorum_size)) => {
+            Ok(_) | Err(ReceiveError::Quorum(QuorumError::Absent { .. })) => {
                 debug!(
                     "poll_admit: admitted, stream {} serial {} id {} quorum_size {}",
-                    self.stream, serial, id, quorum_size
+                    self.stream,
+                    serial,
+                    id,
+                    self.codec.threshold()
                 );
                 PayloadFeedback::Ok {
                     serial,
                     id,
-                    quorum: quorum_size,
+                    quorum: self.codec.threshold() as u8,
                 }
             }
             Err(ReceiveError::Full(queue_len)) => {

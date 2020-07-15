@@ -1,7 +1,12 @@
 use std::{
-    collections::HashMap, convert::TryFrom, fmt::Debug, marker::PhantomData, net::SocketAddr,
-    pin::Pin, time::Duration,
+    collections::HashMap,
+    convert::TryFrom,
+    fmt::Debug,
+    marker::PhantomData,
+    net::SocketAddr,
+    pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
 use async_std::sync::{Arc, Mutex, RwLock};

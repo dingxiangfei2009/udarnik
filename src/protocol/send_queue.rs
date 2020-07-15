@@ -6,29 +6,31 @@ pub struct SendQueue {
     stream: u8,
     serial: AtomicU64,
     task_notifiers: TaskProgressNotifierSink,
-    block_sending: AsyncMutex<Option<BoxFuture<'static, ()>>>,
+    block_sending_tx: MPMCSender<BoxFuture<'static, ()>>,
+    block_sending_rx: MPMCReceiver<BoxFuture<'static, ()>>,
 }
 
 impl SendQueue {
     pub fn new(stream: u8, window: usize, task_notifiers: TaskProgressNotifierSink) -> Self {
         let (q_send, q_recv) = mpmc_channel(window);
+        let (block_sending_tx, block_sending_rx) = mpmc_channel(window);
         Self {
             stream,
             task_notifiers,
             serial: AtomicU64::default(),
             q_send,
             q_recv,
-            block_sending: <_>::default(),
+            block_sending_tx,
+            block_sending_rx,
         }
     }
 
-    pub async fn block_sending(&self, condition: impl 'static + Future<Output = ()> + Send) {
-        *self.block_sending.lock().await = Some(condition.boxed())
+    pub fn block_sending(&self, condition: impl 'static + Future<Output = ()> + Send) {
+        let _ = self.block_sending_tx.try_send(condition.boxed());
     }
 
     pub async fn enqueue(&self, data: (RawShard, RawShardId)) {
-        let block_sending = { self.block_sending.lock().await.take() };
-        if let Some(block_sending) = block_sending {
+        if let Ok(block_sending) = self.block_sending_rx.try_recv() {
             debug!("send queue: back pressure");
             block_sending.await
         }

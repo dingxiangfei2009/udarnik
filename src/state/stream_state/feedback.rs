@@ -66,8 +66,7 @@ where
             PayloadFeedback::Full { serial, queue_len } => {
                 trace!("feedback: full");
                 self.send_queue
-                    .block_sending((self.timeout_generator)(self.send_cooldown))
-                    .await;
+                    .block_sending((self.timeout_generator)(self.send_cooldown));
                 debug!("feedback: full, serial={}, queue={}", serial, queue_len);
             }
             PayloadFeedback::OutOfBound {

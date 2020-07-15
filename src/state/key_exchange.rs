@@ -3,8 +3,6 @@ use super::*;
 use bitvec::prelude::*;
 use rand::rngs::OsRng;
 
-use crate::utils::Peekable;
-
 pub async fn key_exchange_anke<R, H, G, S, MsgStream, MsgSink, MsgStreamErr>(
     ident: &KeyExchangeAnkeIdentity<R, H>,
     message_stream: MsgStream,
@@ -206,9 +204,9 @@ where
     Ident: AsRef<KeyExchangeBorisIdentity<R, H>>,
 {
     let ident = ident.as_ref();
-    let mut message_stream = Peekable::new(
-        message_stream.map_err(|e| KeyExchangeError::Message(e.into(), <_>::default())),
-    );
+    let mut message_stream = message_stream
+        .map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()))
+        .peekable();
     let message_sink =
         message_sink.sink_map_err(|e| KeyExchangeError::Message(e.into(), <_>::default()));
     match Pin::new(&mut message_stream)

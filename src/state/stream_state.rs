@@ -24,7 +24,7 @@ impl StreamState {
         session_progress: Arc<AtomicBool>,
         bridge_outward: Sender<BridgeMessage>,
         codec: Arc<RSCodec>,
-        error_reports: Sender<(u8, u64, HashSet<u8>)>,
+        error_reports: Sender<StreamErrorReport>,
         output: Sender<Vec<u8>>,
         timeout_generator: impl 'static + Send + Sync + Fn(Duration) -> T,
     ) -> (Pin<Arc<Self>>, impl Future<Output = ()>)
@@ -152,7 +152,7 @@ impl StreamState {
         .send_all_out()
         .fuse();
 
-        let receive_queue = Arc::new(ReceiveQueue::new());
+        let receive_queue = Arc::new(ReceiveQueue::new(Some(window as _)));
 
         let (inbound, inbound_rx) = channel(4096);
         let (send_enqueue, send_enqueue_rx) = channel(4096);
@@ -167,6 +167,7 @@ impl StreamState {
             recv_queue: Arc::clone(&receive_queue),
             shard_state: Arc::clone(&shard_state),
             bridge_outward: self.bridge_outward.clone(),
+            codec: Arc::clone(&self.codec),
         };
 
         let task_notifiers = <_>::default();
@@ -232,6 +233,7 @@ impl StreamState {
                 r = process_task_notifiers => r,
                 r = send_out_process => r?,
             }
+            warn!("stream {}: poll end", stream);
             Ok::<_, SessionError>(())
         };
 
@@ -332,6 +334,7 @@ impl StreamState {
                 let feedback_process = Arc::clone(&feedback_process);
                 let admit_process = Arc::clone(&admit_process);
                 async move {
+                    trace!("sort_inbound: hi, stream {}", stream);
                     match message {
                         BridgeMessage::Payload {
                             raw_shard,
@@ -345,10 +348,13 @@ impl StreamState {
                         }
                         _ => error!("poll_bridges_in: unknown message"),
                     }
-                    Ok(())
+                    trace!("sort_inbound: stream {} done", stream);
+                    Ok::<_, SessionError>(())
                 }
             })
-            .await
+            .await?;
+        warn!("stream {}: poll_bridges_in: terminated", stream);
+        Ok(())
     }
 
     async fn timeout<T>(

@@ -1,11 +1,10 @@
 use core::{
     mem::{transmute, MaybeUninit},
-    num::Wrapping,
     ops::{Deref, DerefMut},
     time::Duration,
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Weak},
 };
@@ -13,7 +12,7 @@ use std::{
 use aead::{Aead, NewAead, Payload};
 use async_std::sync::{
     channel as mpmc_channel, Condvar, Mutex as AsyncMutex, Receiver as MPMCReceiver,
-    RwLock as AsyncRwLock, Sender as MPMCSender,
+    Sender as MPMCSender,
 };
 use backtrace::Backtrace as Bt;
 use chacha20poly1305::ChaCha20Poly1305;
@@ -38,9 +37,12 @@ use crate::{
     GenericError,
 };
 
+mod quorum;
 mod recv_queue;
 mod send_queue;
-pub use self::{recv_queue::ReceiveQueue, send_queue::SendQueue};
+
+use self::quorum::QuorumState;
+pub use self::{quorum::QuorumResolve, recv_queue::ReceiveQueue, send_queue::SendQueue};
 
 lazy_static! {
     static ref RS_255_223: ReedSolomon<GF2561D> =
@@ -252,13 +254,6 @@ impl Shard {
     }
 }
 
-#[derive(Default)]
-pub struct Quorum {
-    serial: Option<u64>,
-    quorum: HashSet<u8>,
-    data: Option<Vec<PartialCode>>,
-}
-
 #[derive(Error, Debug)]
 pub enum QuorumError {
     #[error("duplicate shard")]
@@ -279,88 +274,6 @@ pub enum QuorumError {
     RS(#[from] CodecError),
     #[error("completely lost")]
     Lost,
-}
-
-impl Quorum {
-    /// ###Panic###
-    /// Panics if `id` is out of range, ie. `id > 254`
-    pub fn insert(&mut self, serial: u64, shard: Verified<Shard>) -> Result<(u8, u8), QuorumError> {
-        let Shard { id, data } = shard.into_inner();
-        if let Some(serial_) = &self.serial {
-            if *serial_ != serial {
-                return Err(QuorumError::Mismatch(id));
-            }
-        } else {
-            self.serial = Some(serial)
-        }
-        if self.quorum.insert(id) {
-            for (code, data) in self
-                .data
-                .get_or_insert_with(|| vec![<_>::default(); data.len()])
-                .iter_mut()
-                .zip(data)
-            {
-                code[id as usize] = Some(data)
-            }
-            Ok((id, self.quorum.len() as u8))
-        } else {
-            let quorum_data = self.data.as_ref().expect("to be initialized");
-            if data.len() != quorum_data.len() {
-                return Err(QuorumError::Mismatch(id));
-            }
-            for (code, data) in quorum_data.iter().zip(data) {
-                if code[id as usize].expect("to be filled at this moment") != data {
-                    return Err(QuorumError::MismatchContent(id));
-                }
-            }
-            Err(QuorumError::Duplicate(id, quorum_data.len() as u8))
-        }
-    }
-
-    pub fn poll(&self, codec: &RSCodec) -> Result<(u64, Vec<u8>, HashSet<u8>), QuorumError> {
-        if self.quorum.len() < codec.data as usize {
-            return Err(QuorumError::Absent {
-                threshold: codec.data as u8,
-                current: self.quorum.len() as u8,
-                block: None,
-            });
-        }
-        let data = self.data.as_ref().ok_or_else(|| QuorumError::Absent {
-            threshold: codec.data as u8,
-            current: 0,
-            block: None,
-        })?;
-        let mut all_errors: HashSet<_> = <_>::default();
-        let mut result = vec![];
-        for (block, report) in codec
-            .decode(&data)
-            .map_err(QuorumError::RS)?
-            .into_iter()
-            .enumerate()
-        {
-            match report {
-                DecodeReport::Malformed { data, errors } => {
-                    return Err(QuorumError::Malformed { data, errors })
-                }
-                DecodeReport::Decode { data, errors } => {
-                    result.extend(data);
-                    all_errors.extend(errors);
-                }
-                DecodeReport::TooManyError => {
-                    if self.quorum.len() == 255 {
-                        return Err(QuorumError::Lost);
-                    } else {
-                        return Err(QuorumError::Absent {
-                            threshold: codec.data as u8,
-                            current: self.quorum.len() as u8,
-                            block: Some(block),
-                        });
-                    }
-                }
-            }
-        }
-        Ok((self.serial.expect("should be set"), result, all_errors))
-    }
 }
 
 #[derive(Error, Debug)]
@@ -589,74 +502,4 @@ pub type TaskProgressNotifierSink =
 
 pub fn signature_hasher(input: Vec<u8>) -> Vec<u8> {
     sha3::Sha3_512::digest(&input).to_vec()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let codec = RSCodec::new(16).unwrap();
-        let input_data = &[33, 55, 23, 251];
-        let send = codec.encode(input_data).unwrap();
-        let mut recvs = vec![];
-        for send in send.iter() {
-            let mut recv = PartialCode::new();
-            for (recv, send) in recv.iter_mut().zip(send.iter()) {
-                *recv = Some(*send)
-            }
-            recvs.push(recv)
-        }
-        recvs[0][0] = None;
-        for recv in codec.decode(&recvs).unwrap() {
-            match recv {
-                DecodeReport::Decode { data, errors } => {
-                    assert_eq!(data, input_data);
-                    assert_eq!(&[0], &*errors)
-                }
-                _ => panic!(),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn send_receive() -> Result<(), ReceiveError> {
-        let _guard = slog_envlogger::init();
-        let codec = RSCodec::new(31).unwrap();
-        let recv_q = Arc::new(ReceiveQueue::new());
-        let input_data = &[33, 55, 23, 251];
-        let shards = Shard::from_codes(codec.encode(input_data).unwrap());
-        let mut key = [0; 32];
-        let mut stream_key = [0; 32];
-        for i in 0..32 {
-            key[i as usize] = i;
-            stream_key[i as usize] = 32 - i;
-        }
-        let state = ShardState { key, stream_key };
-        let stream = 0;
-        let serial = 0;
-        let handle = async_std::task::spawn({
-            let recv_q = Arc::clone(&recv_q);
-            async move {
-                let (serial_, result, _) = recv_q.poll(&codec).await;
-                assert_eq!(serial, serial_);
-                assert_eq!(result, input_data);
-            }
-        });
-        async_std::task::sleep(Duration::new(1, 0)).await;
-        futures::stream::iter(shards.iter().take(193))
-            .map(|shard| {
-                let recv_q = Arc::clone(&recv_q);
-                async move {
-                    let (raw_shard, raw_shard_id) = shard.encode_shard(stream, serial, &state);
-                    recv_q.admit(raw_shard, raw_shard_id, &state).await
-                }
-            })
-            .buffer_unordered(20)
-            .try_collect::<Vec<_>>()
-            .await?;
-        handle.await;
-        Ok(())
-    }
 }

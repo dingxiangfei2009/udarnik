@@ -1,4 +1,10 @@
-use std::{convert::TryFrom, fmt::Debug, pin::Pin, sync::atomic::{AtomicBool, Ordering}, time::Duration};
+use std::{
+    convert::TryFrom,
+    fmt::Debug,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use backtrace::Backtrace as Bt;
 use digest::Digest;

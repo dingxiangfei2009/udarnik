@@ -15,9 +15,7 @@ impl BridgeState {
         bridge_invitation_trigger
             .send(())
             .await
-            .map_err(|e| {
-                SessionError::BrokenPipe(Box::new(e) as GenericError, Bt::new())
-            })?;
+            .map_err(|e| SessionError::BrokenPipe(Box::new(e) as GenericError, Bt::new()))?;
         loop {
             info!("poll_bridges: polling");
             select_biased! {
