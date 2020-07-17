@@ -40,7 +40,7 @@ where
                 _ = ClonableSendableFuture::clone_pin_box(&*self.terminate).fuse() => return Ok(()),
                 _ = (self.timeout)(self.recv_timeout).fuse() => {
                     // timeout
-                    trace!("stream {}: poll_recv: next is timeout", self.stream);
+                    warn!("stream {}: poll_recv: next is timeout", self.stream);
                     continue
                 }
             };

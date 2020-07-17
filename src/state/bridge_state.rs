@@ -124,6 +124,7 @@ impl BridgeState {
         // NOTE: order matters
         let mut bridge_sinks = self.bridge_sinks.write().await;
         bridge_sinks.insert(id, (sink, cancel_bridge));
+        info!("bridge_state: new bridge sink");
         let _mutex = self.bridge_avail_mutex.lock().await;
         drop(bridge_sinks);
         self.bridge_avail_cv.notify_all();

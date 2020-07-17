@@ -7,12 +7,14 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::*},
 };
 
+use crossbeam::utils::CachePadded;
+
 use crate::utils::make_arc_clone;
 
 pub struct ReceiveQueue {
-    q: Box<[AtomicPtr<QuorumState>]>,
-    readiness: Box<[Readiness]>,
-    dead: Box<[Arc<AtomicBool>]>,
+    q: Box<[CachePadded<AtomicPtr<QuorumState>>]>,
+    readiness: Box<[CachePadded<Readiness>]>,
+    dead: Box<[Arc<CachePadded<AtomicBool>>]>,
     window_mask: u64,
     window_size: usize,
     head: AtomicU64,
@@ -55,11 +57,11 @@ impl Readiness {
 }
 
 struct Alive {
-    dead_flag: Arc<AtomicBool>,
+    dead_flag: Arc<CachePadded<AtomicBool>>,
 }
 
 impl Alive {
-    fn birth(dead_flag: &Arc<AtomicBool>) -> Self {
+    fn birth(dead_flag: &Arc<CachePadded<AtomicBool>>) -> Self {
         Self {
             dead_flag: Arc::clone(dead_flag),
         }

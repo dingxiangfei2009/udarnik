@@ -12,7 +12,9 @@ impl BridgeState {
                 // NOTE: this order matters!
                 let mutex = self.bridge_avail_mutex.lock().await;
                 drop(bridge_sinks);
+                warn!("bridges_out: no bridge, sleeping");
                 self.bridge_avail_cv.wait(mutex).await;
+                warn!("bridges_out: no bridge but woken");
             }
         };
         if let BridgeMessage::Payload {
@@ -20,9 +22,11 @@ impl BridgeState {
             ..
         } = &outbound
         {
-            info!(
+            trace!(
                 "bridge out: payload: stream {} serial {} id {}",
-                stream, serial, id
+                stream,
+                serial,
+                id
             )
         }
         match sink.send(outbound).await {

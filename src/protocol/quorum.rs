@@ -5,27 +5,27 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering::*},
 };
 
-use rand::{prelude::*, rngs::OsRng};
+use crossbeam::utils::CachePadded;
 
 use crate::utils::make_arc_clone;
 
 struct Quorum {
-    vote: [AtomicPtr<Box<[u8]>>; 256],
-    incoherent: [AtomicBool; 256],
+    vote: [CachePadded<AtomicPtr<Box<[u8]>>>; 256],
+    incoherent: [CachePadded<AtomicBool>; 256],
     quorum_size: AtomicU8,
 }
 
 impl Quorum {
     fn new() -> Self {
-        let mut vote: [MaybeUninit<AtomicPtr<Vec<u8>>>; 256] =
+        let mut vote: [MaybeUninit<CachePadded<AtomicPtr<Vec<u8>>>>; 256] =
             unsafe { MaybeUninit::uninit().assume_init() };
-        let mut incoherent: [MaybeUninit<AtomicBool>; 256] =
+        let mut incoherent: [MaybeUninit<CachePadded<AtomicBool>>; 256] =
             unsafe { MaybeUninit::uninit().assume_init() };
         for v in &mut vote[..] {
-            *v = MaybeUninit::new(AtomicPtr::default());
+            *v = MaybeUninit::new(CachePadded::default());
         }
         for ic in &mut incoherent[..] {
-            *ic = MaybeUninit::new(AtomicBool::default());
+            *ic = MaybeUninit::new(CachePadded::default());
         }
         Self {
             vote: unsafe { transmute(vote) },
