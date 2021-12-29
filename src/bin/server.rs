@@ -9,6 +9,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     time::Duration,
+    net::IpAddr,
 };
 
 use blake2::Blake2b;
@@ -131,6 +132,10 @@ struct Config {
     init: Vec<PathBuf>,
     #[structopt(short)]
     addr: SocketAddr,
+    #[structopt(long)]
+    bridge_addr: IpAddr,
+    #[structopt(long)]
+    bridge_addr_subnet: usize,
 }
 
 #[derive(Error, Debug)]
@@ -155,6 +160,8 @@ async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
         secretkey,
         init,
         addr,
+        bridge_addr,
+        bridge_addr_subnet,
     } = cfg;
     let init: Vec<_> = init.into_iter().map(File::open).collect::<Result<_, _>>()?;
     let init: Vec<RawInit> = init
@@ -257,8 +264,8 @@ async fn entry(cfg: Config, handle: Handle) -> Result<(), Error> {
                 invite_cooldown: Duration::new(30, 0),
             },
             bridge_constructor_params: BridgeConstructorParams {
-                ip_listener_address: "127.0.0.1".parse().unwrap(),
-                ip_listener_mask: 32,
+                ip_listener_address: bridge_addr,
+                ip_listener_mask: bridge_addr_subnet,
             },
         },
         new_channel_tx,

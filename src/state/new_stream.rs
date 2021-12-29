@@ -39,7 +39,7 @@ where
             }
         }
         self.stream_state
-            .new_stream(stream, window, shard_state, timeout_generator, spawn)
+            .new_stream(stream, window, shard_state, timeout_generator)
             .await
     }
 }

@@ -117,17 +117,15 @@ impl StreamState {
         }
     }
 
-    pub async fn new_stream<T, S>(
+    pub async fn new_stream<T>(
         &self,
         stream: u8,
         window: usize,
         shard_state: ShardState,
         timeout_generator: impl 'static + Clone + Send + Sync + Fn(Duration) -> T,
-        spawn: S,
     ) -> Result<(), SessionError>
     where
         T: 'static + Send + Future<Output = ()>,
-        S: Spawn + Clone + Send + Sync + 'static,
     {
         let shard_state = Arc::new(shard_state);
         let (terminate_tx, terminate) = oneshot_channel();
